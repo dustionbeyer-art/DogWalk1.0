@@ -140,6 +140,33 @@ def edge_label(d):
     return (str(n) if n else ""), KIND_DE.get(hw, "")
 
 
+# Straßenbreite je Kante (0 = schmale Gasse / Fußweg, 1 = breite Hauptstraße): aus Straßenklasse,
+# Spurenzahl (lanes) und Breitenangabe (width), soweit OpenStreetMap sie kennt
+WIDE_CLASS = {"motorway": 1.0, "motorway_link": 1.0, "trunk": 1.0, "trunk_link": 1.0, "primary": 1.0,
+              "primary_link": 0.95, "secondary": 0.85, "secondary_link": 0.8, "tertiary": 0.6,
+              "tertiary_link": 0.55, "unclassified": 0.35, "residential": 0.25, "service": 0.1,
+              "living_street": 0.05, "track": 0.05, "pedestrian": 0.0, "footway": 0.0, "path": 0.0,
+              "cycleway": 0.0, "steps": 0.0, "bridleway": 0.0, "corridor": 0.0}
+NARROW = 0.3  # bis hierher zählt eine Kante als kleine Gasse / Nebenweg
+
+
+def _num(x):
+    if isinstance(x, (list, tuple)):
+        x = x[0] if x else None
+    m = re.match(r"\s*(\d+(?:[.,]\d+)?)", str(x)) if x is not None else None
+    return float(m.group(1).replace(",", ".")) if m else None
+
+
+def edge_wide(d, hw):
+    w = WIDE_CLASS.get(hw, 0.25)
+    lanes, width = _num(d.get("lanes")), _num(d.get("width"))
+    if lanes and lanes > 1:
+        w = max(w, min(1.0, 0.25 + 0.15 * (lanes - 1)))
+    if width:
+        w = 0.5 * w + 0.5 * min(max((width - 3.0) / 9.0, 0.0), 1.0)
+    return float(min(max(w, 0.0), 1.0))
+
+
 SAMPLES = 8
 MAX_BUF = 400
 MAX_SPAN_M = 9000
@@ -147,13 +174,23 @@ M_PER_MIN = 80
 
 LEVELS = {"Schnellste": 0.0, "Leicht grün": 1.0, "Ausgewogen": 3.0,
           "Sehr grün": 6.0, "Maximal grün": 12.0, "Grünster Umweg": 40.0}
+# Hauptstraßen-Gewicht und Breiten-Gewicht je Stufe. „Maximal grün“ und „Grünster Umweg“ meiden
+# Hauptstraßen und breite Straßen stark: bevorzugt kleine Gassen und Nebenstraßen.
+LEVEL_QUIET = {"Maximal grün": (4.0, 6.0), "Grünster Umweg": (6.0, 10.0)}
+
+
+def level_quiet(name):
+    lam = LEVELS[name]
+    return LEVEL_QUIET.get(name, (1.5 if lam > 0 else 0.0, 0.0))
+
+
 LEVEL_HINT = {
     "Schnellste": "Nur die Distanz zählt.",
     "Leicht grün": "Kleine Umwege für spürbar mehr Grün.",
     "Ausgewogen": "Guter Mittelweg aus Weg und Grün.",
     "Sehr grün": "Deutliche Umwege sind okay, wenn es grüner wird.",
-    "Maximal grün": "Grün hat klar Vorrang vor der Länge.",
-    "Grünster Umweg": "Auch große Umwege, solange der Grünanteil steigt.",
+    "Maximal grün": "Grün zuerst, Hauptstraßen und breite Straßen meiden: kleine Gassen und Nebenstraßen.",
+    "Grünster Umweg": "Auch große Umwege, solange der Grünanteil steigt; ruhige Gassen bevorzugt.",
 }
 
 
@@ -473,7 +510,8 @@ def load_area(bbox):
         if (u, v) not in best or d["length"] < best[(u, v)][0]:
             hw = d.get("highway")
             hw = (hw[0] if hw else "") if isinstance(hw, (list, tuple)) else (hw or "")
-            best[(u, v)] = (d["length"], d.get("geometry") or LineString([pos[u], pos[v]]), *edge_label(d), hw)
+            best[(u, v)] = (d["length"], d.get("geometry") or LineString([pos[u], pos[v]]), *edge_label(d), hw,
+                            edge_wide(d, hw))
     keys = list(best)
     lengths = np.array([best[k][0] for k in keys], dtype=float)
     names = [best[k][2] for k in keys]
@@ -498,6 +536,8 @@ def load_area(bbox):
             acc[idx[0]] += wts[main][idx[1]]
         noise = acc / SAMPLES
 
+    wide = np.array([best[k][5] for k in keys], dtype=np.float32)
+
     D = np.full((SAMPLES, len(keys)), MAX_BUF, dtype=np.float32)
     parks_json, n_parks = None, 0
     if parks is not None:
@@ -519,7 +559,7 @@ def load_area(bbox):
     return {"crs": crs, "pos": pos, "H": H, "lengths": lengths, "lines": lines, "D": D,
             "node_list": node_list, "xy": np.array([pos[n] for n in node_list]),
             "eu": np.array([nidx[u] for u, v in keys]), "ev": np.array([nidx[v] for u, v in keys]),
-            "names": names, "kinds": kinds, "noise": noise,
+            "names": names, "kinds": kinds, "noise": noise, "wide": wide,
             "parks_json": parks_json, "n_parks": n_parks, "n_edges": len(keys)}
 
 
@@ -588,13 +628,15 @@ def pick_waypoint(area, ng, x, y, tol):
     return area["node_list"][int(cand[score.argmax()])]
 
 
-def build_loop_path(area, g, ng, lam, o, t, theta, rho):
+def build_loop_path(area, g, ng, lam, o, t, theta, rho, mu=None, wq=0.0):
     """Runde A -> 3 Wegpunkte auf einem Kreis -> B. Jede Teilstrecke wird grün-optimal geroutet;
     schon genutzte Wegstücke werden teurer, damit möglichst keine Doppelstrecken entstehen."""
     H, L = area["H"], area["lengths"]
     nz = area.get("noise")
     nz = np.zeros(len(L)) if nz is None else nz
-    mu = QUIET if lam > 0 else 0.0
+    wd = area.get("wide")
+    wd = np.zeros(len(L)) if wd is None else wd
+    mu = (QUIET if lam > 0 else 0.0) if mu is None else mu
     ax, ay = area["pos"][o]
     cx, cy = ax + rho * math.cos(theta), ay + rho * math.sin(theta)
     wps = []
@@ -609,7 +651,7 @@ def build_loop_path(area, g, ng, lam, o, t, theta, rho):
 
         def w(u, v, d, used=used):
             i = d["i"]
-            c = L[i] * (1 + lam * (1 - g[i]) + mu * nz[i])
+            c = L[i] * (1 + lam * (1 - g[i]) + mu * nz[i] + wq * wd[i])
             return c * LOOP_REUSE_PENALTY if ((u, v) in used or (v, u) in used) else c
 
         p = nx.shortest_path(H, s, e, weight=w)
@@ -644,7 +686,7 @@ def loop_stats(area, g, path):
     return dist, float((l * g[idx]).sum() / dist), float(rep / dist), noise
 
 
-def find_loops(area, o, t, target, lam, buf, progress=None):
+def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None):
     """Probiert mehrere Richtungen, passt den Kreisradius an die Wunschlänge an und
     liefert bis zu 3 deutlich verschiedene Varianten (beste zuerst)."""
     g = np.clip(1 - area["D"] / buf, 0, 1).mean(axis=0)
@@ -655,7 +697,7 @@ def find_loops(area, o, t, target, lam, buf, progress=None):
         rho = target / (2 * math.pi * 1.35)
         for _ in range(3):
             try:
-                path = build_loop_path(area, g, ng, lam, o, t, theta, rho)
+                path = build_loop_path(area, g, ng, lam, o, t, theta, rho, *(quiet or (None, 0.0)))
             except (nx.NetworkXNoPath, nx.NodeNotFound):
                 break
             st_ = loop_stats(area, g, path)
@@ -670,7 +712,7 @@ def find_loops(area, o, t, target, lam, buf, progress=None):
         if progress:
             progress((k + 1) / LOOP_BEARINGS)
     for c in cands:
-        c["score"] = (c["green"] - 0.8 * c["rep"] - 0.4 * (QUIET if lam > 0 else 0) * c["noise"]
+        c["score"] = (c["green"] - 0.8 * c["rep"] - 0.4 * ((quiet[0] if quiet else QUIET) if lam > 0 else 0) * c["noise"]
                       - 2.0 * abs(c["dist"] / target - 1))
     cands.sort(key=lambda c: -c["score"])
     picked = []
@@ -781,7 +823,7 @@ def maneuvers(area, path, coords, node_idx, cum, loop=False):
     return steps
 
 
-def build_nav(area, path, title, loop=False):
+def build_nav(area, path, title, loop=False, waypoints=None):
     if len(path) < 2:
         return None
     coords, node_idx = route_geom(area, path)
@@ -792,6 +834,10 @@ def build_nav(area, path, title, loop=False):
         return None
     ll = to_latlon(area, coords)
     steps = maneuvers(area, path, coords, node_idx, cum, loop)
+    for pi, name in (waypoints or []):
+        steps.append({"idx": node_idx[min(pi, len(node_idx) - 1)], "i": "📍",
+                      "t": f"Zwischenziel erreicht: {name}"})
+    steps.sort(key=lambda z: (z["idx"], z["i"] == "🏁"))
     return {
         "title": title, "total": round(cum[-1]),
         "coords": [[round(la, 6), round(lo, 6)] for la, lo in ll],
@@ -874,7 +920,7 @@ const D = __DATA__;
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const WALK = D.speed || 80, TOP = D.topPad || 0, ky = 110540;
-const GO = D.mode === 'loop' ? '▶ Ründchen starten' : '▶ Route starten';
+const GO = D.mode === 'ab' ? '▶ Route starten' : '▶ Ründchen starten';
 document.documentElement.style.setProperty('--top', TOP + 'px');
 
 // Übergang: Wolkendecke, die aufbricht und zur Seite zieht, dahinter zoomt die Karte heran
@@ -949,6 +995,7 @@ const pin = e => L.divIcon({html: '<div style="font-size:30px;line-height:30px;f
   className: '', iconSize: [32, 32], iconAnchor: [16, 28]});
 L.marker(D.p1, {icon: pin('🚶')}).addTo(map);
 if (D.p1[0] !== D.p2[0] || D.p1[1] !== D.p2[1]) L.marker(D.p2, {icon: pin('🏁')}).addTo(map);
+(D.stops || []).forEach(s => L.marker([s[0], s[1]], {icon: pin('📍')}).addTo(map).bindTooltip(s[2], {direction: 'top'}));
 const userDot = L.circleMarker([0, 0], {radius: 9, color: '#fff', weight: 3, fillColor: '#2F6F8F', fillOpacity: 1});
 const userAcc = L.circle([0, 0], {radius: 10, color: '#2F6F8F', weight: 1, fillColor: '#2F6F8F', fillOpacity: .12});
 
@@ -1182,6 +1229,8 @@ def solve_levels(area, o, t, buf):
     L, H = area["lengths"], area["H"]
     nz = area.get("noise")
     nz = np.zeros(len(L)) if nz is None else nz
+    wd = area.get("wide")
+    wd = np.zeros(len(L)) if wd is None else wd
 
     def run(w):
         path = nx.shortest_path(H, o, t, weight=w)
@@ -1189,18 +1238,22 @@ def solve_levels(area, o, t, buf):
         dist = float(L[idx].sum()) if idx else 0.0
         share = float((L[idx] * g[idx]).sum() / dist) if dist > 0 else 0.0
         noise = float((L[idx] * nz[idx]).sum() / dist) if dist > 0 else 0.0
-        return {"path": path, "dist": dist, "green": share, "noise": noise}
+        narrow = float((L[idx] * (wd[idx] <= NARROW)).sum() / dist) if dist > 0 else 0.0
+        return {"path": path, "dist": dist, "green": share, "noise": noise, "narrow": narrow}
+
+    def cost(lam, mu, wq):
+        return lambda u, v, d: L[d["i"]] * (1 + lam * (1 - g[d["i"]]) + mu * nz[d["i"]] + wq * wd[d["i"]])
 
     short = run(lambda u, v, d: L[d["i"]])
     out = []
     for name, lam in LEVELS.items():
+        mu, wq = level_quiet(name)
         if lam >= 30:
             # „Grünster Umweg“: darf deutlich länger sein, aber nicht ausufern und muss wirklich grüner sein
             best = max((r_ for _, r_ in out), key=lambda r_: r_["green"])
             r = None
-            for lam_try in (lam, lam / 2, lam / 4):
-                cand = run(lambda u, v, d, lam=lam_try: L[d["i"]] * (
-                    1 + lam_try * (1 - g[d["i"]]) + QUIET * nz[d["i"]]))
+            for f in (1.0, 0.5, 0.25):
+                cand = run(cost(lam * f, mu, wq))
                 if cand["dist"] <= 3.0 * short["dist"] + 600:
                     r = cand
                     break
@@ -1208,9 +1261,7 @@ def solve_levels(area, o, t, buf):
                 continue
             out.append((name, r))
             continue
-        r = short if lam == 0 else run(lambda u, v, d, lam=lam: L[d["i"]] * (
-            1 + lam * (1 - g[d["i"]]) + QUIET * nz[d["i"]]))
-        out.append((name, r))
+        out.append((name, short if lam == 0 else run(cost(lam, mu, wq))))
     return short, out
 
 
@@ -1274,7 +1325,8 @@ def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: 
         mins = max(1, round(r["dist"] / M_PER_MIN))
         options.append(_option(
             nav, name, f"{fmt_km(r['dist'])} · {r['green']:.0%} grün",
-            f"{LEVEL_HINT[name]} · Umweg {detour:+.0%}",
+            f"{LEVEL_HINT[name]} · Umweg {detour:+.0%}"
+            + (f" · {r['narrow']:.0%} kleine Wege" if LEVELS[name] >= 12 else ""),
             [["Länge", fmt_km(r["dist"])], ["Dauer", f"{mins} min"],
              ["Grünanteil", f"{r['green']:.0%}"], ["Hauptstraße", f"{r['noise']:.0%}"]]))
     if not options:
@@ -1306,7 +1358,7 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
         bbox_km = km
         log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
     o, t = nearest_node(area, *p1), nearest_node(area, *p2)
-    variants = find_loops(area, o, t, target, LEVELS[level], buf, progress=progress)
+    variants = find_loops(area, o, t, target, LEVELS[level], buf, progress=progress, quiet=level_quiet(level))
     t1, t2 = lab1.split(" · ")[0], lab2.split(" · ")[0]
     options = []
     for i, v in enumerate(variants):
@@ -1933,7 +1985,7 @@ def _dedupe(routes):
     return out
 
 
-def scan_ab_candidates(sa, p1, p2, log=lambda *_: None):
+def scan_ab_candidates(sa, p1, p2, log=lambda *_: None, wide=True):
     A, B = _to_xy(sa, p1[0], p1[1]), _to_xy(sa, p2[0], p2[1])
     A, B = (float(A[0]), float(A[1])), (float(B[0]), float(B[1]))
     D = math.hypot(B[0] - A[0], B[1] - A[1])
@@ -1946,9 +1998,9 @@ def scan_ab_candidates(sa, p1, p2, log=lambda *_: None):
             x, y = _snap_green(sa, mx + sgn * 0.3 * D * nx_, my + sgn * 0.3 * D * ny_, 0.2 * D + 80)
             vias.append([_to_ll(sa, x, y)])
     # große Umwege für „Grünster Umweg“: weiter entfernte Parks und breitere Ausschläge zur Seite
-    for via in _green_targets(sa, A, B, k=3, slack=3.0):
+    for via in (_green_targets(sa, A, B, k=3, slack=3.0) if wide else []):
         vias.append([_to_ll(sa, x, y) for x, y in via])
-    if D > 150:
+    if D > 150 and wide:
         for sgn in (1, -1):
             x, y = _snap_green(sa, mx + sgn * 0.7 * D * nx_, my + sgn * 0.7 * D * ny_, 0.35 * D + 120)
             vias.append([_to_ll(sa, x, y)])
@@ -2050,7 +2102,7 @@ def scan_ab_view(start_v, dest_v, buf=150, log=lambda *_: None):
     t1, t2 = lab1.split(" · ")[0], lab2.split(" · ")[0]
     options, used = [], set()
     for name, lam in LEVELS.items():
-        mu = QUIET if lam > 0 else 0.0
+        mu = level_quiet(name)[0]
         pool = [i for i in range(len(scored)) if lam < 30 or scored[i][1]["dist"] <= 3.0 * short + 600]
         j = min(pool, key=lambda i: scored[i][1]["dist"] * (
             1 + lam * (1 - scored[i][1]["green"]) + mu * scored[i][1]["noise"]))
@@ -2096,7 +2148,7 @@ def scan_loop_view(start_v, end_v, km, level, buf=150, log=lambda *_: None, prog
     if not cands:
         raise ValueError("Für diesen Startpunkt habe ich keine Runde gefunden.")
     lam = LEVELS[level]
-    mu = QUIET if lam > 0 else 0.0
+    mu = level_quiet(level)[0]
     w_green = 0.15 + lam / 12.0
     for c in cands:
         c["score"] = (w_green * c["green"] - 0.8 * c["rep"] - 0.25 * mu * c["noise"]
@@ -2150,6 +2202,215 @@ def make_loop_view_safe(start_v, end_v, km, level, buf=150, area=None, bbox_km=N
             raise e
 
 
+# ------------------------------------------------------- Ründchen mit Zwischenziel
+TOUR_LEVELS = ["Ausgewogen", "Sehr grün", "Maximal grün"]
+TOUR_MAX_STOPS = 3
+
+
+def _short(lab):
+    """Name ohne Symbol am Anfang und ohne Adresszusatz."""
+    return re.sub(r"^[^\w]+", "", lab.split(" · ")[0]).strip() or lab
+
+
+def tour_points(start_v, stops_v, end_v):
+    """Start, Zwischenziele (Reihenfolge nach kürzestem Weg), Ende. Rückgabe: Punkte, Namen, Zwischenziel-Namen."""
+    import itertools
+    lat1, lon1, lab1 = _unpack(start_v)
+    p1 = (lat1, lon1)
+    if end_v:
+        lat2, lon2, lab2 = _unpack(end_v)
+        pe = (lat2, lon2)
+    else:
+        pe, lab2 = p1, lab1
+    stops = [(lat, lon, lab) for lat, lon, lab in (_unpack(v) for v in stops_v)]
+    if len(stops) > 1:
+        def length(perm):
+            seq = [p1] + [(a, b) for a, b, _ in perm] + [pe]
+            return sum(dist_m(x, y) for x, y in zip(seq[:-1], seq[1:]))
+        stops = list(min(itertools.permutations(stops), key=length))
+    pts = [p1] + [(a, b) for a, b, _ in stops] + [pe]
+    return pts, [_short(lab1)] + [_short(lab) for _, _, lab in stops] + [_short(lab2)], stops
+
+
+def points_bbox(pts):
+    ky = 111_320.0
+    lats, lons = [p[0] for p in pts], [p[1] for p in pts]
+    kx = ky * math.cos(math.radians(sum(lats) / len(lats)))
+    span = max((max(lons) - min(lons)) * kx, (max(lats) - min(lats)) * ky)
+    pad = max(700.0, 0.4 * span)
+    return (round(min(lons) - pad / kx, 4), round(min(lats) - pad / ky, 4),
+            round(max(lons) + pad / kx, 4), round(max(lats) + pad / ky, 4)), span
+
+
+def tour_path(area, g, lam, mu, wq, nodes):
+    """Teilstrecken Start -> Zwischenziele -> Ende, jede grün-optimal; schon gelaufene Wegstücke werden
+    teurer, damit der Rückweg möglichst ein anderer ist. marks: Index der Zwischenziele im Pfad."""
+    H, L = area["H"], area["lengths"]
+    nz = area.get("noise")
+    nz = np.zeros(len(L)) if nz is None else nz
+    wd = area.get("wide")
+    wd = np.zeros(len(L)) if wd is None else wd
+    used, full, marks = set(), [nodes[0]], []
+    for s_, e in zip(nodes[:-1], nodes[1:]):
+        if s_ != e:
+            def w(u, v, d, used=used):
+                i = d["i"]
+                c = L[i] * (1 + lam * (1 - g[i]) + mu * nz[i] + wq * wd[i])
+                return c * LOOP_REUSE_PENALTY if ((u, v) in used or (v, u) in used) else c
+            p = nx.shortest_path(H, s_, e, weight=w)
+            full += p[1:]
+            used.update(zip(p[:-1], p[1:]))
+        marks.append(len(full) - 1)
+    return full, marks[:-1]
+
+
+def _tour_payload(mode_extra, p1, pe, t1, t2, stops, options, parks, default, attrib=None):
+    payload = dict(mode="tour", p1=list(p1), p2=list(pe), t1=t1, t2=t2, parks=parks, options=options,
+                   default=default, speed=M_PER_MIN, topPad=TOP_PAD,
+                   stops=[[a, b, _short(lab)] for a, b, lab in stops])
+    if attrib:
+        payload["attrib"] = attrib
+    return payload
+
+
+def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None):
+    pts, names, stops = tour_points(start_v, stops_v, end_v)
+    bbox, span = points_bbox(pts)
+    if span > MAX_SPAN_M:
+        raise ValueError(f"Die Punkte liegen {span / 1000:.1f} km auseinander. "
+                         f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
+    log("🗺️ Wegenetz und Grünflächen laden")
+    t0 = time.time()
+    area = load_area(bbox)
+    log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
+    nodes = [nearest_node(area, *p) for p in pts]
+    if len(set(nodes)) < 2:
+        raise ValueError("Start und Zwischenziele liegen zu nah beieinander.")
+    g = np.clip(1 - area["D"] / buf, 0, 1).mean(axis=0)
+    log("🧭 Runde mit Zwischenzielen berechnen")
+    loop = pts[0] == pts[-1]
+    title = " → ".join(names)
+    options, seen = [], set()
+    for name in TOUR_LEVELS:
+        mu, wq = level_quiet(name)
+        try:
+            path, marks = tour_path(area, g, LEVELS[name], mu, wq, nodes)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            raise ValueError("Zwischen den Punkten gibt es keinen Fußweg im geladenen Gebiet.")
+        key = tuple(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        st_ = loop_stats(area, g, path)
+        nav = build_nav(area, path, title, loop=loop, waypoints=list(zip(marks, names[1:-1])))
+        if not st_ or not nav:
+            continue
+        dist, green, rep, noise = st_
+        idx = [area["H"][a][b]["i"] for a, b in zip(path[:-1], path[1:])]
+        Ls, wd = area["lengths"][idx], area["wide"][idx]
+        narrow = float((Ls * (wd <= NARROW)).sum() / max(Ls.sum(), 1))
+        mins = max(1, round(dist / M_PER_MIN))
+        options.append(_option(
+            nav, name, f"{fmt_km(dist)} · {green:.0%} grün",
+            f"{LEVEL_HINT[name]} · {1 - rep:.0%} ohne Doppelweg" + (f" · {narrow:.0%} kleine Wege" if LEVELS[name] >= 12 else ""),
+            [["Länge", fmt_km(dist)], ["Dauer", f"{mins} min"], ["Grünanteil", f"{green:.0%}"],
+             ["Hauptstraße", f"{noise:.0%}"]]))
+    if not options:
+        raise ValueError("Ich konnte keine Runde mit diesen Zwischenzielen finden.")
+    default = next((i for i, o_ in enumerate(options) if o_["label"] == level), 0)
+    payload = _tour_payload(None, pts[0], pts[-1], names[0], names[-1], stops, options, parks_geo(area), default)
+    return {"mode": "tour", "html": map_html(payload), "p1": pts[0], "p2": pts[-1], "t1": names[0],
+            "t2": names[-1], "stops": names[1:-1], "start": start_v, "buf": buf}
+
+
+def _merge_routes(routes):
+    coords, legs, marks, dist = [], [], [], 0.0
+    for rt in routes:
+        c = rt["geometry"]["coordinates"]
+        coords += c if not coords else c[1:]
+        legs += (rt.get("legs") or [{"steps": []}])[:1]
+        marks.append(len(coords) - 1)
+        dist += float(rt.get("distance", 0))
+    return {"distance": dist, "geometry": {"type": "LineString", "coordinates": coords}, "legs": legs}, marks
+
+
+def _add_waypoint_steps(nav, marks, names):
+    for m, name in zip(marks, names):
+        la, lo = nav["coords"][min(m, len(nav["coords"]) - 1)]
+        nav["steps"].append({"d": round(nav["cum"][min(m, len(nav["cum"]) - 1)]), "lat": la, "lon": lo,
+                             "t": f"Zwischenziel erreicht: {name}", "i": "📍"})
+    nav["steps"].sort(key=lambda z: (z["d"], z["i"] == "🏁"))
+    return nav
+
+
+def scan_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None):
+    """Ründchen mit Zwischenzielen ohne Overpass: je Teilstrecke Varianten vom Routenserver, per Grün-Scan bewertet."""
+    pts, names, stops = tour_points(start_v, stops_v, end_v)
+    bbox, span = points_bbox(pts)
+    if span > MAX_SPAN_M:
+        raise ValueError(f"Die Punkte liegen {span / 1000:.1f} km auseinander. "
+                         f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
+    log("🛰️ Grün-Scan: Grünflächen und Hauptstraßen aus Kartenkacheln laden")
+    sa = scan_area(bbox)
+    legs = []
+    for k, (a, b) in enumerate(zip(pts[:-1], pts[1:])):
+        log(f"🧭 Teilstrecke {k + 1} von {len(pts) - 1} prüfen")
+        routes = scan_ab_candidates(sa, a, b, lambda *_: None, wide=False)
+        sc = [(rt, scan_score(sa, _route_ll(rt), buf)) for rt in routes]
+        sc = [(rt, x) for rt, x in sc if x["dist"] > 0]
+        if not sc:
+            raise ValueError("Für diese Punkte habe ich keinen Fußweg gefunden.")
+        legs.append([(rt, x, _grid_keys(_route_ll(rt))) for rt, x in sc])
+    loop = pts[0] == pts[-1]
+    title = " → ".join(names)
+    options, seen = [], set()
+    for name in TOUR_LEVELS:
+        lam, mu = LEVELS[name], level_quiet(name)[0]
+        chosen, used = [], set()
+        for cands in legs:
+            def cost(c):
+                rt, x, ks = c
+                ov = len(ks & used) / max(len(ks), 1) if used else 0.0
+                return x["dist"] * (1 + lam * (1 - x["green"]) + mu * x["noise"]) * (1 + 1.5 * ov)
+            best = min(cands, key=cost)
+            chosen.append(best)
+            used |= best[2]
+        key = tuple(id(c[0]) for c in chosen)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged, marks = _merge_routes([c[0] for c in chosen])
+        sc = scan_score(sa, _route_ll(merged), buf)
+        nav = osrm_nav(merged, title)
+        if not nav or sc["dist"] <= 0:
+            continue
+        nav = _add_waypoint_steps(nav, marks[:-1], names[1:-1])
+        options.append(_scan_option(nav, name, f"{fmt_km(sc['dist'])} · {sc['green']:.0%} grün",
+                                    f"{LEVEL_HINT[name]} · {1 - sc['rep']:.0%} ohne Doppelweg · {SCAN_NOTE}", sc))
+    if not options:
+        raise ValueError("Ich konnte keine Runde mit diesen Zwischenzielen finden.")
+    default = next((i for i, o_ in enumerate(options) if o_["label"] == level), 0)
+    payload = _tour_payload(None, pts[0], pts[-1], names[0], names[-1], stops, options, sa["geo"], default,
+                            attrib=SCAN_ATTRIB)
+    return {"mode": "tour", "html": map_html(payload), "p1": pts[0], "p2": pts[-1], "t1": names[0],
+            "t2": names[-1], "stops": names[1:-1], "start": start_v, "buf": buf, "fallback": "scan"}
+
+
+def make_tour_view_safe(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None):
+    try:
+        return make_tour_view(start_v, stops_v, end_v, level, buf, log)
+    except ValueError:
+        raise
+    except Exception as e:
+        log("⚠️ OSM-Server überlastet: ich nutze den Grün-Scan")
+        try:
+            return scan_tour_view(start_v, stops_v, end_v, level, buf, log)
+        except ValueError:
+            raise
+        except Exception:
+            raise e
+
+
 # ------------------------------------------------------- UI
 st.set_page_config(page_title="Green-Walker", page_icon="🌳", layout="centered",
                    initial_sidebar_state="collapsed")
@@ -2165,9 +2426,9 @@ html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp 
 .hero .ico{font-size:36px;line-height:1;width:46px;text-align:center;flex:none}
 .hero h1{margin:0;padding:0;font-size:1.5rem;font-weight:700;line-height:1.1;color:#FBF7EE;letter-spacing:0}
 .hero p{margin:2px 0 0;font-size:1rem;color:#FBF7EE;opacity:.92}
-.st-key-card_route,.st-key-card_loop{background:rgba(251,248,241,.98);border:1px solid var(--line);border-radius:20px;
+.st-key-card_route,.st-key-card_loop,.st-key-card_tour{background:rgba(251,248,241,.98);border:1px solid var(--line);border-radius:20px;
  padding:14px 14px 12px;box-shadow:0 8px 28px rgba(60,50,30,.18);margin-top:12px}
-.st-key-card_route label p,.st-key-card_loop label p{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;
+.st-key-card_route label p,.st-key-card_loop label p,.st-key-card_tour label p{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;
  opacity:.7;font-weight:600}
 .hint{opacity:.7;font-size:.8rem;margin:-4px 0 8px}
 .fld{display:flex;align-items:center;gap:8px;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;font-weight:700;
@@ -2184,8 +2445,8 @@ html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp 
 .stButton>button[kind="primary"]{background:#5E7F52;border-color:#5E7F52;color:#FBF7EE;height:3rem;font-size:1rem;font-weight:700}
 .stButton>button[kind="primary"]:hover{background:var(--moss);border-color:var(--moss);color:#FBF7EE}
 [data-baseweb="input"],[data-baseweb="select"]>div,[data-baseweb="base-input"]{border-radius:14px!important}
-.stTabs [data-baseweb="tab-list"]{gap:8px;background:transparent;padding:0}
-.stTabs [data-baseweb="tab"]{flex:1;justify-content:center;height:46px;border-radius:14px;font-weight:700;
+.stTabs [data-baseweb="tab-list"]{gap:8px;background:transparent;padding:0;overflow-x:auto}
+.stTabs [data-baseweb="tab"]{flex:1 0 auto;white-space:nowrap;padding:0 14px;justify-content:center;height:46px;border-radius:14px;font-weight:700;
  color:var(--text);background:#fff;border:1px solid var(--line)}
 .stTabs [aria-selected="true"]{background:#E7EDDB;border-color:var(--sage);color:var(--text);box-shadow:none}
 .stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"]{display:none}
@@ -2377,6 +2638,12 @@ def render_map_view():
             with c2:
                 dest_new = st_searchbox(search_places, key=f"gw_dest_{gw['sid']}",
                                         placeholder=f"🏁 {gw['t2']} · Ziel ändern …", clear_on_submit=False)
+        elif gw["mode"] == "tour":
+            c1, c2 = st.columns([1, 6])
+            c1.button("←", key="gw_back", use_container_width=True, on_click=close_map, help="Zurück zur Suche")
+            n_ = len(gw.get("stops", []))
+            c2.markdown(f'<div class="looptitle">🛍️ Ründchen · <b>{n_} Zwischenziel{"e" if n_ != 1 else ""}</b></div>',
+                        unsafe_allow_html=True)
         else:
             c1, c2, c3, c4 = st.columns([1, 4, 1, 1])
             c1.button("←", key="gw_back", use_container_width=True, on_click=close_map, help="Zurück zur Suche")
@@ -2497,15 +2764,58 @@ def home_loop():
         st.rerun()
 
 
+def _more_stops(d):
+    st.session_state["n_stops"] = min(max(st.session_state.get("n_stops", 1) + d, 1), TOUR_MAX_STOPS)
+
+
+def home_tour():
+    with st.container(key="card_tour"):
+        st.markdown("Grüne Runde mit Stopp unterwegs: Kiosk, Bäcker, Paket abgeben oder jemanden besuchen. "
+                    "Die Reihenfolge wähle ich so, dass der Weg kurz bleibt.")
+        a_v = start_input("Startpunkt", "tour_a_sb")
+        n = st.session_state.setdefault("n_stops", 1)
+        stops = [place_input(f"Zwischenziel {i + 1}", f"tour_s{i}_sb") for i in range(n)]
+        c1, c2 = st.columns(2)
+        if n < TOUR_MAX_STOPS:
+            c1.button("＋ Weiteres Zwischenziel", key="tour_more", on_click=_more_stops, args=(1,),
+                      use_container_width=True)
+        if n > 1:
+            c2.button("− Letztes entfernen", key="tour_less", on_click=_more_stops, args=(-1,),
+                      use_container_width=True)
+        same = st.checkbox("Runde endet wieder am Startpunkt", value=True, key="tour_same")
+        b_v = None if same else place_input("Endpunkt", "tour_b_sb")
+        st.caption(SEARCH_TIP)
+        level = st.select_slider("Wie grün soll es sein?", options=TOUR_LEVELS, value="Sehr grün", key="level_tour")
+        go = st.button("Ründchen mit Zwischenziel finden", type="primary", use_container_width=True, key="go_tour")
+    if not go:
+        return
+    if not a_v or not all(stops) or (not same and not b_v):
+        st.warning("Bitte Start, alle Zwischenziele" + ("" if same else " und Endpunkt") + " aus den Vorschlägen auswählen.")
+        return
+    view = None
+    with st.status("Runde mit Zwischenzielen wird berechnet …", expanded=True) as status:
+        try:
+            view = make_tour_view_safe(a_v, stops, None if same else b_v, level, log=st.write)
+            status.update(label="Fertig", state="complete", expanded=False)
+        except Exception as e:
+            status.update(label="Fehler", state="error")
+            show_error(e)
+    if view:
+        open_map(view)
+        st.rerun()
+
+
 def render_home():
     st.markdown('<div class="hero"><div class="ico">🌳</div><div><h1>Green-Walker</h1>'
                 '<p>Der grüne Weg statt nur der kürzeste.</p></div></div>',
                 unsafe_allow_html=True)
-    tab_route, tab_loop = st.tabs(["🧭 Route", "🔄 Ründchen"])
+    tab_route, tab_loop, tab_tour = st.tabs(["🧭 Route", "🔄 Ründchen", "🛍️ Ründchen mit Zwischenziel"])
     with tab_route:
         home_route()
     with tab_loop:
         home_loop()
+    with tab_tour:
+        home_tour()
     with st.expander("Datenquellen und Gewichtung"):
         st.markdown(sources_text(150, LEVELS["Ausgewogen"]))
 
