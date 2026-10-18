@@ -16,6 +16,7 @@ import json
 import math
 import os
 import random
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from html import escape
@@ -35,7 +36,7 @@ from streamlit_searchbox import st_searchbox
 
 ox.settings.use_cache = True
 ox.settings.log_console = False
-ox.settings.requests_timeout = 30
+ox.settings.requests_timeout = 25
 ox.settings.overpass_rate_limit = False
 
 # Mehrere Overpass-Server: der Hauptserver ist oft überlastet (502/504).
@@ -47,7 +48,7 @@ OVERPASS_MIRRORS = [
     "https://overpass.private.coffee/api",
     "https://maps.mail.ru/osm/tools/overpass/api",
 ]
-LOAD_DEADLINE_S = 150  # nach dieser Zeit gibt die App auf und zeigt eine verständliche Meldung
+LOAD_DEADLINE_S = 45  # danach weicht die App auf eine einfache Fußroute aus
 try:
     from osmnx import errors as ox_errors
 except Exception:  # pragma: no cover
@@ -60,6 +61,30 @@ _OV_SUFFIX = "/interpreter" if str(getattr(ox.settings, _OV_ATTR, "")).rstrip("/
 
 def use_mirror(base):
     setattr(ox.settings, _OV_ATTR, base + _OV_SUFFIX)
+
+
+def rank_mirrors():
+    """Fragt den Status aller Overpass-Server kurz und parallel ab: Server mit freien Plätzen zuerst,
+    nicht erreichbare Server werden übersprungen. Spart das lange Warten auf überlastete Server."""
+    def probe(base):
+        try:
+            r = requests.get(base + "/status", headers=UA, timeout=4)
+            if r.status_code != 200:
+                return base, 9.0
+            t = r.text
+            m = re.search(r"(\d+)\s+slots?\s+available\s+now", t)
+            if (m and int(m.group(1)) > 0) or "Rate limit: 0" in t:
+                return base, 0.0
+            m = re.search(r"available after.*?in\s+(\d+)\s+seconds", t)
+            return base, (1.0 + min(int(m.group(1)), 60) / 60.0) if m else 1.5
+        except Exception:
+            return base, 9.0
+
+    with ThreadPoolExecutor(max_workers=len(OVERPASS_MIRRORS)) as ex:
+        res = list(ex.map(probe, random.sample(OVERPASS_MIRRORS, len(OVERPASS_MIRRORS))))
+    res.sort(key=lambda x: x[1])
+    ok = [b for b, s in res if s < 9]
+    return ok or list(OVERPASS_MIRRORS)
 
 
 UA = {"User-Agent": "green-walker-app/1.0 (privates Hobbyprojekt)"}
@@ -288,8 +313,8 @@ def load_area(bbox):
     # und werden bei einem erneuten Versuch nicht noch einmal abgerufen.
     G0 = parks = last = None
     t_end = time.time() + LOAD_DEADLINE_S
-    for rnd in range(3):
-        for base in random.sample(OVERPASS_MIRRORS, len(OVERPASS_MIRRORS)):
+    for rnd in range(2):
+        for base in rank_mirrors():
             if time.time() > t_end:
                 break
             use_mirror(base)
@@ -303,7 +328,7 @@ def load_area(bbox):
                 G0 = parks = None
         if G0 is not None or time.time() > t_end:
             break
-        time.sleep(5 * (rnd + 1))
+        time.sleep(3)
     if G0 is None:
         raise RuntimeError(f"Alle Kartenserver sind gerade überlastet. ({last})")
 
@@ -653,6 +678,7 @@ body.nav #side{top:calc(var(--top) + 92px)}
 #stats span{display:block;font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;opacity:.65;white-space:nowrap}
 #stats b{font-size:1.05rem}
 #hint{font-size:.8rem;opacity:.7;min-height:1em}
+#hint.warn{opacity:1;color:#8A5A1E;font-weight:600}
 #navbox{display:none}
 body.nav #navbox{display:block}body.nav #pre{display:none}
 #rem{font-weight:600;font-size:.98rem}
@@ -683,6 +709,7 @@ const D = __DATA__;
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const WALK = D.speed || 80, TOP = D.topPad || 0, ky = 110540;
+const GO = D.mode === 'loop' ? '▶ Ründchen starten' : '▶ Route starten';
 document.documentElement.style.setProperty('--top', TOP + 'px');
 
 const map = L.map('map', {zoomControl: false, zoomAnimation: false, fadeAnimation: false, markerZoomAnimation: false}).setView(D.p1, 15);
@@ -762,6 +789,7 @@ function showOption(i, fit) {
   document.querySelectorAll('.chip').forEach((c, k) => c.classList.toggle('on', k === i));
   $('stats').innerHTML = o.stats.map(s => '<div><span>' + esc(s[0]) + '</span><b>' + esc(s[1]) + '</b></div>').join('');
   $('hint').textContent = (o.hint || '') + (showShort ? ' · gestrichelt: kürzeste Route' : '');
+  $('hint').className = o.warn ? 'warn' : '';
   $('rem').textContent = 'Gesamt ' + fmt(total) + ' · ca. ' + Math.max(1, Math.round(total / WALK)) + ' min';
   buildList();
   if (fit) fitRoute();
@@ -839,7 +867,7 @@ function enterNav() {
 }
 function exitNav() {
   stopWatch(); navOn = false; finished = false;
-  document.body.classList.remove('nav'); $('go').textContent = '▶ Navigation starten';
+  document.body.classList.remove('nav'); $('go').textContent = GO;
   [userDot, userAcc].forEach(l => { if (map.hasLayer(l)) map.removeLayer(l); });
   if (done) done.setLatLngs([]);
   showOption(cur, true);
@@ -872,6 +900,7 @@ function startDemo() {
 $('chips').innerHTML = D.options.map((o, i) => '<button class="chip" data-i="' + i + '"><b>' + esc(o.label) + '</b><span>' + esc(o.sub) + '</span></button>').join('');
 $('chips').addEventListener('click', e => { const b = e.target.closest('.chip'); if (b && !navOn) showOption(+b.dataset.i, true); });
 $('ttl').textContent = (D.p1[0] === D.p2[0] && D.p1[1] === D.p2[1]) ? '🔄 Ründchen ab ' + D.t1 : '🚶 ' + D.t1 + '  →  🏁 ' + D.t2;
+$('go').textContent = GO;
 $('go').addEventListener('click', () => { if (navOn) exitNav(); else startGps(); });
 $('demo').addEventListener('click', () => { if (navOn && sim) exitNav(); else { if (navOn) exitNav(); startDemo(); } });
 $('lbtn').addEventListener('click', () => { $('list').style.display = 'block'; });
@@ -1046,6 +1075,125 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
             "area": area, "bbox_km": bbox_km}
 
 
+# ------------------------------------------------------- Auffangnetz ohne Overpass
+OSRM_FOOT = "https://routing.openstreetmap.de/routed-foot/route/v1/foot/"
+STEP_DE = {
+    "left": ("↰", "Links abbiegen"), "right": ("↱", "Rechts abbiegen"),
+    "slight left": ("↖", "Halb links halten"), "slight right": ("↗", "Halb rechts halten"),
+    "sharp left": ("↰", "Scharf links abbiegen"), "sharp right": ("↱", "Scharf rechts abbiegen"),
+    "uturn": ("↩", "Wenden"),
+}
+
+
+def _hav(p, q):
+    la1, lo1, la2, lo2 = map(math.radians, (p[0], p[1], q[0], q[1]))
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 12_742_000 * math.asin(math.sqrt(h))
+
+
+def osrm_route(p1, p2):
+    url = f"{OSRM_FOOT}{p1[1]:.6f},{p1[0]:.6f};{p2[1]:.6f},{p2[0]:.6f}"
+    r = requests.get(url, headers=UA, timeout=12,
+                     params={"overview": "full", "geometries": "geojson", "steps": "true"})
+    r.raise_for_status()
+    js = r.json()
+    if js.get("code") != "Ok" or not js.get("routes"):
+        raise ValueError("Für diese Punkte habe ich keinen Fußweg gefunden.")
+    return js["routes"][0]
+
+
+def osrm_nav(route, title):
+    """OSRM-Antwort -> dasselbe Format wie build_nav (Linie, Entfernungen, Wegehinweise auf Deutsch)."""
+    coords = [[round(y, 6), round(x, 6)] for x, y in route["geometry"]["coordinates"]]
+    if len(coords) < 2:
+        return None
+    cum = [0.0]
+    for a, b in zip(coords[:-1], coords[1:]):
+        cum.append(cum[-1] + _hav(a, b))
+    total = cum[-1]
+    if total < 5:
+        return None
+    raw = [s for leg in route["legs"] for s in leg["steps"]]
+    sum_raw = sum(float(s.get("distance", 0)) for s in raw) or 1.0
+    scale = total / sum_raw
+    steps, acc = [], 0.0
+    for s in raw:
+        start_d = acc
+        acc += float(s.get("distance", 0))
+        m = s.get("maneuver", {})
+        typ, mod = m.get("type", ""), m.get("modifier", "")
+        name = (s.get("name") or "").strip()
+        loc = m.get("location") or [coords[0][1], coords[0][0]]
+        on = f" auf {name}" if name else ""
+        if typ == "depart":
+            b = m.get("bearing_after")
+            where = f" Richtung {COMPASS[int(round(b / 45)) % 8]}" if b is not None else ""
+            icon, text = "🚶", f"Los geht’s{where}{on}"
+        elif typ == "arrive":
+            icon, text, start_d = "🏁", "Du hast dein Ziel erreicht", sum_raw
+        elif typ in ("roundabout", "rotary", "roundabout turn"):
+            ex = m.get("exit")
+            icon = "🔄"
+            text = (f"Im Kreisverkehr die {ex}. Ausfahrt nehmen" if ex else "In den Kreisverkehr einfahren") + on
+        elif mod in ("straight", ""):
+            if not name:
+                continue
+            icon, text = "⬆", f"Weiter geradeaus{on}"
+        else:
+            icon, text = STEP_DE.get(mod, ("⬆", "Weiter"))
+            if typ == "fork" and mod in ("slight left", "slight right"):
+                text = "Links halten" if mod == "slight left" else "Rechts halten"
+            text += on
+        steps.append({"d": round(start_d * scale), "lat": round(loc[1], 6), "lon": round(loc[0], 6),
+                      "t": text, "i": icon})
+    if not steps or steps[0]["d"] != 0:
+        steps.insert(0, {"d": 0, "lat": coords[0][0], "lon": coords[0][1], "t": "Los geht’s", "i": "🚶"})
+    if steps[-1]["i"] != "🏁":
+        steps.append({"d": round(total), "lat": coords[-1][0], "lon": coords[-1][1],
+                      "t": "Du hast dein Ziel erreicht", "i": "🏁"})
+    return {"title": title, "total": round(total), "coords": coords,
+            "cum": [round(c, 1) for c in cum], "steps": steps}
+
+
+def osrm_view(start_v, dest_v):
+    """Einfache Fußroute (ohne Grün-Daten), wenn die Overpass-Server nicht erreichbar sind."""
+    lat1, lon1, lab1 = _unpack(start_v)
+    lat2, lon2, lab2 = _unpack(dest_v)
+    p1, p2 = (lat1, lon1), (lat2, lon2)
+    if dist_m(p1, p2) > 15000:
+        raise ValueError("Start und Ziel sind mehr als 15 km auseinander. Bitte näher beieinander wählen.")
+    t1, t2 = lab1.split(" · ")[0], lab2.split(" · ")[0]
+    nav = osrm_nav(osrm_route(p1, p2), f"{t1} → {t2}")
+    if not nav:
+        raise ValueError("Start und Ziel liegen zu nah beieinander.")
+    mins = max(1, round(nav["total"] / M_PER_MIN))
+    opt = _option(nav, "Schnellste", f"{fmt_km(nav['total'])} · ohne Grün",
+                  "⚠️ Grün-Server überlastet: einfache Fußroute. Mit 🌿 oben erneut versuchen.",
+                  [["Länge", fmt_km(nav["total"])], ["Dauer", f"{mins} min"],
+                   ["Grünanteil", "–"], ["Umweg", "–"]])
+    opt["warn"] = True
+    payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=None,
+                   options=[opt], default=0, speed=M_PER_MIN, topPad=TOP_PAD)
+    return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
+            "start": start_v, "dest": dest_v, "area": None, "bbox": None, "buf": 150, "fallback": True}
+
+
+def make_ab_view_safe(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: None):
+    """Grüne Route; wenn die Kartenserver überlastet sind, automatisch die einfache Fußroute."""
+    try:
+        return make_ab_view(start_v, dest_v, buf, area, bbox, log)
+    except ValueError:
+        raise
+    except Exception as e:
+        log("⚠️ Grünflächen-Server überlastet: ich berechne stattdessen eine einfache Fußroute")
+        try:
+            return osrm_view(start_v, dest_v)
+        except ValueError:
+            raise
+        except Exception:
+            raise e
+
+
 # ------------------------------------------------------- UI
 st.set_page_config(page_title="Green-Walker", page_icon="🌳", layout="centered",
                    initial_sidebar_state="collapsed")
@@ -1202,6 +1350,12 @@ def close_map():
     st.session_state.pop("gw", None)
 
 
+def set_retry():
+    gw = st.session_state.get("gw")
+    if gw:
+        gw["retry"] = True
+
+
 def bump_km(delta):
     gw = st.session_state.get("gw")
     if gw:
@@ -1217,7 +1371,12 @@ def render_map_view():
     dest_new = None
     with st.container(key="gwtop"):
         if gw["mode"] == "ab":
-            c1, c2 = st.columns([1, 6])
+            if gw.get("fallback"):
+                c1, c2, c3 = st.columns([1, 5, 1])
+                c3.button("🌿", key="gw_retry", use_container_width=True, on_click=set_retry,
+                          help="Grüne Route erneut versuchen")
+            else:
+                c1, c2 = st.columns([1, 6])
             c1.button("←", key="gw_back", use_container_width=True, on_click=close_map, help="Zurück zur Suche")
             with c2:
                 dest_new = st_searchbox(search_places, key=f"gw_dest_{gw['sid']}",
@@ -1233,10 +1392,23 @@ def render_map_view():
                       help="Länger")
 
     new = None
-    if gw["mode"] == "ab" and dest_new and dest_new != gw["dest"] and dest_new != gw.get("failed"):
+    if gw["mode"] == "ab" and gw.get("retry"):
+        gw["retry"] = False
+        st.toast("🌿 Versuche die grüne Route erneut …")
+        try:
+            new = make_ab_view_safe(gw["start"], gw["dest"], gw["buf"])
+            if new.get("fallback"):
+                st.toast("Die Server sind noch überlastet. Bitte später noch einmal.")
+                new = None
+        except Exception as e:
+            st.toast(f"⚠️ {e}"[:220])
+    elif gw["mode"] == "ab" and dest_new and dest_new != gw["dest"] and dest_new != gw.get("failed"):
         st.toast("🧭 Berechne neue Route …")
         try:
-            new = make_ab_view(gw["start"], dest_new, gw["buf"], gw["area"], gw["bbox"])
+            if gw.get("fallback"):
+                new = osrm_view(gw["start"], dest_new)
+            else:
+                new = make_ab_view_safe(gw["start"], dest_new, gw["buf"], gw["area"], gw["bbox"])
         except Exception as e:
             gw["failed"] = dest_new
             st.toast(f"⚠️ {e}"[:220])
@@ -1273,7 +1445,7 @@ def home_route():
     view = None
     with st.status("Route wird vorbereitet …", expanded=True) as status:
         try:
-            view = make_ab_view(start_v, ziel_v, log=st.write)
+            view = make_ab_view_safe(start_v, ziel_v, log=st.write)
             status.update(label="Fertig", state="complete", expanded=False)
         except Exception as e:
             status.update(label="Fehler", state="error")
