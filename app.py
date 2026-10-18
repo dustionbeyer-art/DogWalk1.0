@@ -1,4 +1,4 @@
-"""Green-Walker: Fußwege mit möglichst viel Park- und Grünflächen-Nähe.
+"""GreenWalker: Fußwege mit möglichst viel Park- und Grünflächen-Nähe.
 
 Zwei Modi: Route von A nach B und "Ründchen" (grüne Runde mit Wunschlänge).
 
@@ -116,7 +116,8 @@ def rank_mirrors():
 
 UA = {"User-Agent": "green-walker-app/1.0 (privates Hobbyprojekt)"}
 WATER_WAYS = ["river", "canal", "stream", "riverbank"]
-WATER_BUF = 60  # Meter: bis hierher zählt "am Wasser"
+WATER_BUF = 120  # Meter: bis hierher zählt „am Wasser“ (Uferweg, Blick über den See)
+WATER_NEAR = 0.4  # Wasser-Score ab dem eine Kante als „am Wasser“ gilt (= ca. 70 m Abstand)
 GREEN_TAGS = {
     "leisure": ["park", "garden", "nature_reserve", "recreation_ground"],
     "landuse": ["grass", "forest", "village_green"],
@@ -586,6 +587,7 @@ def overpass_query(bbox):
         parts += [f'way["{k}"~"^({rx})$"]{b};', f'relation["{k}"~"^({rx})$"]{b};']
     # Gewässer: Seen/Teiche (natural=water) und Flüsse/Bäche/Kanäle
     parts += [f'way["natural"="water"]{b};', f'relation["natural"="water"]{b};',
+              f'way["landuse"~"^(reservoir|basin)$"]{b};', f'relation["landuse"~"^(reservoir|basin)$"]{b};',
               f'way["waterway"~"^({"|".join(WATER_WAYS)})$"]{b};']
     return "[out:xml][timeout:25];\n(\n  " + "\n  ".join(parts) + "\n);\n(._;>;);\nout body qt;"
 
@@ -719,12 +721,27 @@ def load_area(bbox):
 
     parks, waters = None, None
     try:
-        tags_all = {"leisure": GREEN_TAGS["leisure"], "landuse": GREEN_TAGS["landuse"],
+        tags_all = {"leisure": GREEN_TAGS["leisure"], "landuse": GREEN_TAGS["landuse"] + ["reservoir", "basin"],
                     "natural": GREEN_TAGS["natural"] + ["water"], "waterway": WATER_WAYS}
-        gall = ox.features_from_xml(path, tags=tags_all)
+        try:
+            gall = ox.features_from_xml(path, tags=tags_all)
+        except Exception:
+            # Einzelne fehlerhafte Wasser-Geometrien dürfen die Grünflächen nicht mitreißen: getrennt laden
+            parts_ = []
+            for tg in ({k: v for k, v in tags_all.items() if k != "waterway" and "water" not in v and "reservoir" not in v},
+                       {"natural": ["water"], "waterway": WATER_WAYS, "landuse": ["reservoir", "basin"]}):
+                try:
+                    parts_.append(ox.features_from_xml(path, tags=tg))
+                except Exception:
+                    pass
+            if not parts_:
+                raise
+            gall = parts_[0] if len(parts_) == 1 else __import__("pandas").concat(parts_)
         isw = np.zeros(len(gall), dtype=bool)
         if "natural" in gall:
             isw |= (gall["natural"] == "water").to_numpy()
+        if "landuse" in gall:
+            isw |= gall["landuse"].isin(["reservoir", "basin"]).to_numpy()
         if "waterway" in gall:
             isw |= gall["waterway"].notna().to_numpy()
         gdf = gall[~isw]
@@ -816,7 +833,7 @@ def load_area(bbox):
 
     node_list = list(pos)
     nidx = {n: i for i, n in enumerate(node_list)}
-    return {"crs": crs, "pos": pos, "H": H, "lengths": lengths, "lines": lines, "D": D, "DW": DW,
+    return {"bbox": bbox, "crs": crs, "pos": pos, "H": H, "lengths": lengths, "lines": lines, "D": D, "DW": DW,
             "water_json": water_json,
             "node_list": node_list, "xy": np.array([pos[n] for n in node_list]),
             "eu": np.array([nidx[u] for u, v in keys]), "ev": np.array([nidx[v] for u, v in keys]),
@@ -853,7 +870,8 @@ def edge_green(area, buf, water=None):
     if _water() if water is None else water:
         w = edge_water(area)
         if w is not None:
-            g = np.maximum(g, w)
+            # Ufer vor Parkmitte: Wege am Wasser gelten als bestes „Grün“, Park ohne Wasser etwas weniger
+            g = np.maximum(0.9 * g, w)
     return g
 
 
@@ -863,7 +881,52 @@ def water_share(area, path):
         return 0.0
     idx = [area["H"][a][b]["i"] for a, b in zip(path[:-1], path[1:])]
     L = area["lengths"][idx]
-    return float((L * (w[idx] > 0.5)).sum() / max(L.sum(), 1.0))
+    return float((L * (w[idx] > WATER_NEAR)).sum() / max(L.sum(), 1.0))
+
+
+def water_note(area, path):
+    """Hinweistext: Anteil am Wasser, bei 0 % mit Begründung (ehrlich statt nur eine Zahl)."""
+    share = water_share(area, path)
+    if share >= 0.005:
+        return f" · {share:.0%} am Wasser"
+    dw = area.get("DW")
+    if dw is None or float(dw.min()) >= MAX_BUF - 1:
+        return " · kein Gewässer im Gebiet gefunden"
+    idx = [area["H"][a][b]["i"] for a, b in zip(path[:-1], path[1:])]
+    near = float(dw[:, idx].min()) if idx else MAX_BUF
+    return f" · 0 % am Wasser (nächstes Ufer ca. {near:.0f} m entfernt)" if near < MAX_BUF - 1 else \
+        " · 0 % am Wasser (Ufer weiter als 400 m)"
+
+
+def ensure_water(area, log=None):
+    """Zweite, unabhängige Gewässerquelle: Seen und Flüsse aus den Karten-Vektorkacheln. Ergänzt die OSM-Daten,
+    falls dort ein großer See (z. B. als Multipolygon) fehlt oder unvollständig ankam. Nur bei aktiver Wassernähe."""
+    if not _water() or area.get("_wt") or not area.get("bbox"):
+        return
+    area["_wt"] = True
+    try:
+        if log:
+            log("💧 Gewässer prüfen und ergänzen")
+        sa = scan_area(area["bbox"], True)
+        feats = (sa.get("wgeo") or {}).get("features", [])
+        if not feats:
+            return
+        gs = gpd.GeoDataFrame(geometry=[shapely.geometry.shape(f["geometry"]) for f in feats], crs=4326).to_crs(area["crs"])
+        gs = gs[gs.geometry.notna() & ~gs.geometry.is_empty].reset_index(drop=True)
+        if not len(gs):
+            return
+        tree = STRtree(list(gs.geometry))
+        DW = area["DW"]
+        for r, f in enumerate((np.arange(SAMPLES) + 0.5) / SAMPLES):
+            pts = shapely.line_interpolate_point(area["lines"], f, normalized=True)
+            idx, dist = tree.query_nearest(pts, max_distance=MAX_BUF, return_distance=True, all_matches=False)
+            DW[r, idx[0]] = np.minimum(DW[r, idx[0]], dist)
+        area.pop("_w", None)
+        base = water_geo(area) or {"type": "FeatureCollection", "features": []}
+        base["features"] = (base["features"] + feats)[:1200]
+        area["_wgeo"] = base
+    except Exception:
+        pass
 
 
 def water_geo(area):
@@ -1651,6 +1714,7 @@ def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: 
         t0 = time.time()
         area = load_area(bbox)
         log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
+    ensure_water(area, log)
     o, t = nearest_node(area, *p1), nearest_node(area, *p2)
     log("🧭 Routen und Wegehinweise berechnen")
     try:
@@ -1669,7 +1733,7 @@ def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: 
             nav, name, f"{fmt_km(r['dist'])} · {r['green']:.0%} grün",
             f"{LEVEL_HINT[name]} · Umweg {detour:+.0%}"
             + (f" · {r['narrow']:.0%} kleine Wege" if LEVELS[name] >= 12 else "")
-            + (f" · {water_share(area, r['path']):.0%} am Wasser" if _water() else ""),
+            + (water_note(area, r['path']) if _water() else ""),
             [["Länge", fmt_km(r["dist"])], ["Dauer", f"{mins} min"],
              ["Grünanteil", f"{r['green']:.0%}"], ["Hauptstraße", f"{r['noise']:.0%}"]]))
     if not options:
@@ -1700,6 +1764,7 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
         area = load_area(loop_bbox(p1, p2, target))
         bbox_km = km
         log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
+    ensure_water(area, log)
     o, t = nearest_node(area, *p1), nearest_node(area, *p2)
     variants = find_loops(area, o, t, target, LEVELS[level], buf, progress=progress, quiet=level_quiet(level))
     t1, t2 = lab1.split(" · ")[0], lab2.split(" · ")[0]
@@ -1713,7 +1778,7 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
         options.append(_option(
             nav, f"Variante {i + 1}", f"{fmt_km(v['dist'])} · {v['green']:.0%} grün",
             f"Wunschlänge {fmt_km(target)} ({diff:+.0%}) · {1 - v['rep']:.0%} ohne Doppelweg"
-            + (f" · {water_share(area, v['path']):.0%} am Wasser" if _water() else ""),
+            + (water_note(area, v['path']) if _water() else ""),
             [["Länge", fmt_km(v["dist"])], ["Dauer", f"{mins} min"],
              ["Grünanteil", f"{v['green']:.0%}"], ["Hauptstraße", f"{v.get('noise', 0):.0%}"]]))
     if not options:
@@ -2164,7 +2229,7 @@ def scan_area(bbox, water=False):
                         X, Y = (lon - lon0) * kx, (lat - lat0) * ky
                         _fill_ring(wmask, (X - xmin) / cell, (Y - ymin) / cell)
                         if 0.5 * abs(np.dot(X[:-1], Y[1:]) - np.dot(X[1:], Y[:-1])) >= 400 and len(wgeo) < 600:
-                            step = max(1, len(lon) // 50)
+                            step = max(1, len(lon) // 140)
                             ring_ll = [[round(float(a), 5), round(float(b), 5)] for a, b in zip(lon[::step], lat[::step])]
                             ring_ll.append(ring_ll[0])
                             wgeo.append({"type": "Feature", "properties": {},
@@ -2706,6 +2771,7 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
     t0 = time.time()
     area = load_area(bbox)
     log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
+    ensure_water(area, log)
     nodes = [nearest_node(area, *p) for p in pts]
     if len(set(nodes)) < 2:
         raise ValueError("Start und Zwischenziele liegen zu nah beieinander.")
@@ -2750,7 +2816,7 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
         options.append(_option(
             nav, name, f"{fmt_km(dist)} · {green:.0%} grün",
             f"{pre}{1 - rep:.0%} ohne Doppelweg" + (f" · {narrow:.0%} kleine Wege" if LEVELS[level if extra_m > 0 else name] >= 12 else "")
-            + (f" · {water_share(area, path):.0%} am Wasser" if _water() else ""),
+            + (water_note(area, path) if _water() else ""),
             [["Länge", fmt_km(dist)], ["Dauer", f"{mins} min"], ["Grünanteil", f"{green:.0%}"],
              ["Hauptstraße", f"{noise:.0%}"]]))
     if not options:
@@ -2935,7 +3001,7 @@ def make_tour_view_safe(start_v, stops_v, end_v, level, buf=150, log=lambda *_: 
 # ------------------------------------------------------- Logo / App-Ikon (eingebettet, keine Zusatzdateien nötig)
 # Blatt mit Zielpunkt: Kleinform fürs Ikon (Browser-Tab 64 px, Home-Bildschirm 180 px)
 ICON_FAV_B64 = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAALg0lEQVR4nNRbe3AV1Rn/7WYhb0LIJMQAEYEESkTAGZGK1ldHfNDagUaxKloKI9gZR8A+BrQTWxnGUrHTsZ0iRXmWN/pHgYaHPA1xWkiCGggPKa+QIPJICCGQ7Pbb3XvvnrP37OveC+I3udk95/v2u+ec3/ke55y9CnzQSzPHPqxK2uOSJA2DqhVoQHdoWjokQFOpJElU1PQisfWrWQ7zpRBfJ/Makie+KuDbn3fVH9JHNy1000jleqr5TIO2buUf12316pvkxCgre0A5nZw/gZS9QcoLzNYZf/qXhYuhOrMcuYT4lqjG3PN8rszqlwTykYtAntVv8evp35uN6S0fbCvb1g4/A1BWViY3pBx8StPU31OxyC8yLLJ+kOfkRfpZeYiR18uq4PuNmcXKAwdVFa+vnrNutTWMJiXZB6D/yPynSOZDEuvOIyvxyDOdC/M5ZCXJhoyNz3U+pB+MfvD6jc6AnRnmjcTqD/Ej8pb+HEnGEwPvKfqituJQHdtfmS1MmvXMGHr4n3SbqoFFDsy0ZBHjyywfGv88j3y0HjjUi+SF+uEibzLSJE1aWzr1safBwRCiyTOfuUOVtUrSk+poY5E6Fvlv0eY92qPx/8KPtZL8iDVzNlTpBWMGlK4sTVIldRn8IA8BYizyECMPNyS9ZpZdHv7kJViDw9Sn0hcuKi0tTYoMQLcjSROpcqCTTWseZUNe8pAX8eEsL7J5oX6JkWeRB+ug7e3Vbld7tkw0ase//eNMRU07QpW51sgFiMM3Ls7z+iGQD/MlgTyr3/y+M6kdUpHcWU0bE+68H+QlOHt/obxTtJDEM0OyeXO+89EzR4Q8nNoDTj6vNUkbLRMAD1gjhcTZvKBeqF9zt3lH23byEfCQZ/kahit03xt+bTaIzSMxNi+K81HIO80UMfIMHwNkquzNtALf2TgfBHmrv/kKjUM+/503kc0j9HxibD56pqhavkL3yZw3hntuz480k9sz3txCQLLNLO/cnkNecsztkZGWgcL8QvTI64FeeT2xZ/8eVNXVIMrbi9pr6c9SnJC8meJ8XnZ39OvZF73ye1Gn6dP9VnTNzAJLp87Uk3y1J/IWhCZfiYw03OM8hwwCxHkWSfiL85npXTCobwlK+pifnKycSEcv1tfh3JebcTkzB3n97oKSnG7UZ2VkeSMvmOnKzWTzuV1z8fBdD+P+O3+A9NR02Ong9sU4tGNJpJyc0Q3ff/EdpGcXID0lzRt5QfuVmG2elUfsNq9f+/Xoix/dNwp3DrgTTqSpHfiqcg1X13bpHE7t24Li+5+HoighDPj2qLzNR810oQ+4UXF+cNFgjLp3FIoLi+BFrU1fo+Nqa3T9hUbjKjm0127zXHvCPuBG23y3Ljl44YlxGFo8BH4prWs+MnNvRfPXx7j67MISsx2hMudTBDZvb49yo21+5PCRKH3op+jcqTOC0rXew5HUdBYdbS1GWXeCPQc9FOFrNp/iZ+YqNyrOpyWnYfLoSbij6A7EQvsOf46/bS1Hr9xCvDnhl0jJyEFyZjdrcK5dZdrlbPP2mRH2HN42H0ec75HbE9N+NoULZ0Epu0s2mU428inxybol2mdcaL4ojPNce2z9QcQHXEebLy4sxpSxryKNwlQ8pGd782b83ZF/vvmCL5sP88P9la+nzQ8tHooZL06Pq/OXr1zGxsrNuHT5kqvcpZZmXzZv9xEyrtN6vk9BH7w8ZjLipaXlyzH3o3lYvmmlq9zZC2fN77etGqPaa+uXHJZJZJzP7ZqHqWTzsXh6OxX16mdcB972PUcZlU49jp0+4W7zEGeEyvWI8889+iwy0zKRCHqA0mL940anv2lA27U2V5sXZbx6f+VEx/n7htyHIcWDEQ+VV27ChJmT8J/aPb7kDx47FGkPfCIf5ssRm9fis3n92jWzK555ZCzipSMnj+B803nUHq31JV9TV+3b5jUb31oLJGA9P2zgMGSkZiAotV29gm17duCewfeQ6WQYafKgfoNwL5W9SG/T3gPVjnFehDyYmS6LkJQiWvwhr5NMCh8f8RhioVVb1uL9j+fjffL2OqWnppEpjQhlpu5Ue3Q/hcrWKGSF7ZeE7Y7P5sOC+sImOzMbsVBetzyjs8NKhiEo7aquENo8W7bPjOi1ACxvz9uQv/W8zr/79uEISifOnDQyvEfu/qHxCUrtHe2o3PeZp7eHyyqXzwPi2LcfHHCRs+Bfi/HqO9OMLC9W2ly5BU2Xmjy9vdNaR2fIsdo8K9+XNixTk1MRhMKZW0pyMmKhq7T6W7Fptau3lzx8gk5KrDaPcJHKhbcUIii98vTL5DQfdc3w3Gjdrg24SOh7xXkh8oy8zNt8MOTD174Ft8EP6bLb9+40bL9zp+SYO3/m3Bms2mTuD3rFeSHyDN9xLRBk396v9/903278ZcV7eHfpnxEPzfvoQ1y52uYrzrPtBRh5UR4QCHnG26b7XO52z85FJ6UTBseRKq/YuIpOgfb6jvNuV739SiLO57tQCuxG4XBXRLu/y2cuQaxUvnsTVpRbb7r5tXk2Wtn5shfyTiMXNUMcaOm/lxnhbuG6xYiHyis2Yu6af8Rk824zI7IWiOd8PrwhqVMz7dw0kpPq17OPUZYl80281OQUxEIdtNaft3Y+Nu7W84XgcV6EPJj+Rp8LmNK2kXTYYwvxr7Zbb6H+bm4ZjjecwK+fn0bZ4TCMfvBJDO0/BP1vLUZQOt90AbM+eBuHT37luJ5XPc4xzH45Z7RKIs7n25gTm5TOKQbq7XSUpVMylQf07o+g9OWRWsxe/C6ampvghLzmI8477naHuqmwyAc5nzfr6eyNGtdwrpEQNjv5+vjpJKsay9qgpD9XUVOJleTpTzaeiim3jyDv8xxD8RPnnZDXy73yCghx65VjfSkblOr+dxC7aiqw/b870NLaEpqIUkLifFjePpPDHVNisfnQFpKx9fXac9MgyzKq6qqo8ZeNDZEMGoRMOq/PSs+kXJ9fI9SfPY1ThO6JxpOoO1aHLw7Xkgm18T4o4DmFH5uPIA9GHqG1AOzIe9i8zhjQewCmPjvF6LxOO/buwu7PKw0hfqTB+xSGb94j6vshmolwt2m/Ns/5CJh5QJs1kmCUsSNsXfXH9NdVfjPuV1CSzJO1in2VZucB8OfzAj0Itm8fb5yP0s9fL+o7WQ0c8iKbZ0ZOf0dn+s9/S97dXMZW0Ybkeyv+aqLphAysstUmD++NxMR5D/0N+gxoECFjR0CXyM/JJy8/I2LX+2k/7k+L5xje2+9b5k7Ixrqe95y5cJWnAVClaj82n9OlG974xQzj9TSdjlByMmvBbHR0dAiRBKKRdCo7Ie9k0who85rmkNFCqyYX1vGx5DaioWGYOHqCcUSt07HTx/HW/Jm0K9PmOsJhBBJt8who887905bLy2avL6eqKq/37dvbzczuNIWxP8x/C61XrjgjwzxvtSkaWWjXP86LkDfENNRsXvBppZHBlIzo30hSY60RtroRjrN7DlShqaUJizcsRbN+FG3jR8VhBnnR2SKPLP98kDgf1h9B3hbn2efBZLySLE0+Wn38gGQOIaSnXxu1h1zZ0EiwjowcM71CrJjjPP9PqJ+TZ/gWJOCQj8hLgdpT88miXcYbWuFfjZEvVMcTtxUibwyxzX4H4rzo2kr4jwv12/rZ3KrZ66tJ5gWrDbxPkOCSgcEmr900cd6yebOskp7ntyzauS9qAHRaPWfdKhL5Cd1edkMeopG/CeO87UrI48mtC3dyr5tKENCYqY/pvmA53RZ/GzbPPQ9vm9c45IXtOUjAPrV1ya4a2EiGgPQfFX6T1VpCil+i1VQ924gbYfOJivNE9bR8nKweV0pEnddJOAPsNPqVkQ+S5BOk826atwWkvDv1K50daX5QYOscz7fYNuRDkDkib+Pb9LdQexqpS7STolZomrz+k4U7dsCD/g8AAP//uy5qcwAAAAZJREFUAwDfGrshkryDKgAAAABJRU5ErkJggg=="
-ICON_TOUCH_B64 = "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"
+ICON_TOUCH_B64 = "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"
 LOGO_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="60 60 380 390" width="46" height="46">'
     '<g transform="translate(256 256) scale(1.08) translate(-256 -250)">'
@@ -2946,7 +3012,7 @@ LOGO_SVG = (
     '<circle cx="358" cy="156" r="21" fill="#B07A35"/></g></svg>'
 )
 ICON_JS = """<script>(function(){
-var FAV='data:image/png;base64,__FAV__',TOUCH='data:image/png;base64,__TOUCH__',TITLE='Green-Walker';
+var FAV='data:image/png;base64,__FAV__',TOUCH='data:image/png;base64,__TOUCH__',TITLE='GreenWalker';
 function docs(){var r=[],w=window;for(var k=0;k<6;k++){try{r.push(w.document)}catch(e){break}
  if(w.parent===w)break;w=w.parent}return r}
 function patch(fav,touch){docs().forEach(function(d){try{var h=d.head;
@@ -2989,7 +3055,7 @@ def install_icons():
 
 
 # ------------------------------------------------------- UI
-st.set_page_config(page_title="Green-Walker", page_icon=page_icon(), layout="centered",
+st.set_page_config(page_title="GreenWalker", page_icon=page_icon(), layout="centered",
                    initial_sidebar_state="collapsed")
 install_icons()
 
@@ -3051,7 +3117,7 @@ html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp 
 OVERLAY_HTML = """
 <style>
 #gwload{position:fixed;inset:0;z-index:99999;background:#F4EFE6;display:flex;flex-direction:column;align-items:center;
- justify-content:center;gap:18px;animation:gwfade .35s ease both;overflow:hidden;font-family:system-ui,-apple-system,sans-serif}
+ justify-content:center;gap:16px;animation:gwfade .35s ease both;overflow:hidden;font-family:system-ui,-apple-system,sans-serif;padding:0 22px}
 @keyframes gwfade{from{opacity:0}to{opacity:1}}
 #gwload .b{position:absolute;border-radius:50%;filter:blur(34px);background:radial-gradient(closest-side,rgba(255,255,255,.95),rgba(255,255,255,.5) 55%,rgba(255,255,255,0));
  animation:gwdrift 9s ease-in-out infinite alternate}
@@ -3066,31 +3132,175 @@ OVERLAY_HTML = """
 #gwload .logo:before{content:"";position:absolute;inset:-10px;border-radius:32px;border:2px solid rgba(78,110,69,.35);animation:gwring 2.2s ease-out infinite}
 @keyframes gwbreath{50%{transform:scale(1.07)}}
 @keyframes gwring{from{opacity:.9;transform:scale(.92)}to{opacity:0;transform:scale(1.35)}}
-#gwload .t{position:relative;height:1.5em;width:min(86vw,360px);text-align:center;color:#3B3A33;font-weight:600;font-size:1.02rem}
-#gwload .t span{position:absolute;left:0;right:0;opacity:0;animation:gwtxt 10s infinite}
-#gwload .t span:nth-child(2){animation-delay:2.5s}#gwload .t span:nth-child(3){animation-delay:5s}#gwload .t span:nth-child(4){animation-delay:7.5s}
-@keyframes gwtxt{0%{opacity:0;transform:translateY(8px)}4%,22%{opacity:1;transform:none}26%,100%{opacity:0;transform:translateY(-8px)}}
+#gwload .st{position:relative;text-align:center;color:#3B3A33;font-weight:650;font-size:1.02rem;max-width:min(88vw,380px);min-height:1.4em}
 #gwload .bar{position:relative;width:min(60vw,220px);height:4px;border-radius:4px;background:rgba(78,110,69,.18);overflow:hidden}
 #gwload .bar:after{content:"";position:absolute;inset:0;width:40%;border-radius:4px;background:#4E6E45;animation:gwslide 1.5s ease-in-out infinite}
 @keyframes gwslide{from{transform:translateX(-110%)}to{transform:translateX(280%)}}
-@media (prefers-reduced-motion:reduce){#gwload *{animation-duration:0s!important}#gwload .t span:first-child{opacity:1}}
+#gwload .fact{position:relative;width:min(88vw,380px);min-height:7.2em;margin-top:6px;padding:12px 16px 10px;border-radius:16px;
+ background:rgba(251,248,241,.8);border:1px solid #D9CFBC;box-shadow:0 6px 20px rgba(60,50,30,.12);text-align:center}
+#gwload .fact small{display:block;font-size:.68rem;letter-spacing:.07em;text-transform:uppercase;font-weight:700;color:#4E6E45;margin-bottom:6px}
+#gwload .fact p{position:absolute;left:16px;right:16px;top:34px;margin:0;opacity:0;color:#3B3A33;font-size:.95rem;line-height:1.38}
+@media (prefers-reduced-motion:reduce){#gwload *{animation-duration:0s!important}#gwload .fact p:first-of-type{opacity:1}}
+__FACTCSS__
 </style>
 <div id="gwload"><i class="b"></i><i class="b"></i><i class="b"></i><i class="b"></i>
 <div class="logo"><img src="data:image/svg+xml;base64,__LOGO__" alt=""></div>
-<div class="t"><span>Ich suche den grünsten Weg …</span><span>Parks und Grünflächen werden geprüft …</span><span>Hauptstraßen werden umgangen …</span><span>Gleich geht es los …</span></div>
-<div class="bar"></div></div>
+<div class="st">__STAGE__</div><div class="bar"></div>
+<div class="fact"><small>__LABEL__</small>__FACTS__</div></div>
 """
 
+# ---- Natur- und Umweltfakten für die Ladeansicht (Ort aus dem Startpunkt, Jahreszeit, allgemein)
+# (Stadt: Breite, Länge, Radius km, Fakten)
+CITY_FACTS = [
+    ("Köln", 50.94, 6.96, 16, [
+        "Köln ist Papageien-Stadt: Halsbandsittiche leben hier seit rund 60 Jahren frei, gern in Platanen am Rhein und in Parks.",
+        "Der Kölner Grüngürtel entstand in den 1920er-Jahren unter Oberbürgermeister Konrad Adenauer und ist bis heute die grüne Lunge der Stadt."]),
+    ("Düsseldorf", 51.23, 6.78, 14, [
+        "Auch in Düsseldorf leben wilde Halsbandsittiche, unter anderem in Parks wie dem Hofgarten.",
+        "Der Düsseldorfer Hofgarten gehört zu den ältesten öffentlichen Parks Deutschlands."]),
+    ("Bonn", 50.73, 7.10, 12, [
+        "Im Frühjahr blühen in der Bonner Altstadt Zierkirschen so dicht, dass ganze Straßen rosa leuchten.",
+        "In Bonn und am Rhein sind Halsbandsittiche zu Hause: grüne Papageien mitten im Rheinland."]),
+    ("Essen", 51.46, 7.01, 12, [
+        "Essen war 2017 Grüne Hauptstadt Europas: Aus Zechengelände wurden Parks und Wege, und die Stadt ist deutlich grüner, als ihr Ruf vermuten lässt."]),
+    ("Berlin", 52.52, 13.40, 30, [
+        "Berlin gilt als Hauptstadt der Nachtigallen: Im Mai singen sie nachts in Parks und Gebüschen.",
+        "In Berlins Wäldern leben Wildschweine, besonders im Grunewald. Sie sind meist scheu, aber nachts durchaus in der Stadt unterwegs.",
+        "Auf dem Tempelhofer Feld, dem alten Flughafen, brüten Feldlerchen mitten in der Großstadt."]),
+    ("Hamburg", 53.55, 9.99, 22, [
+        "Die Alster ist ein aufgestauter Fluss: Der Stau reicht bis ins 13. Jahrhundert zurück.",
+        "An der Hamburger Elbe sind noch Ebbe und Flut zu spüren, das Tidewasser reicht flussaufwärts bis Geesthacht."]),
+    ("München", 48.14, 11.58, 22, [
+        "Die Isar wurde zwischen 2000 und 2011 in München wieder naturnah umgebaut. Heute baden die Münchner dort im Sommer.",
+        "Der Englische Garten wurde 1789 angelegt und zählt zu den größten Stadtparks der Welt."]),
+    ("Frankfurt", 50.11, 8.68, 18, [
+        "Der Frankfurter Stadtwald gehört zu den größten Stadtwäldern Deutschlands.",
+        "Wilde Halsbandsittiche gibt es auch im Rhein-Main-Gebiet, in Frankfurt, Mainz und Wiesbaden."]),
+    ("Stuttgart", 48.78, 9.18, 16, [
+        "Mitten in Stuttgart wachsen Reben: Weinberge und Streuobstwiesen ziehen sich bis in den Talkessel."]),
+    ("Leipzig", 51.34, 12.37, 16, [
+        "Der Leipziger Auwald ist einer der größten erhaltenen Auenwälder mitten in einer europäischen Großstadt."]),
+    ("Hannover", 52.37, 9.74, 16, [
+        "Die Eilenriede in Hannover zählt zu den größten Stadtwäldern Europas."]),
+    ("Dresden", 51.05, 13.74, 18, [
+        "Die Dresdner Heide ist ein großes Waldgebiet direkt am Stadtrand, und die Elbwiesen bleiben bewusst unbebaut."]),
+    ("Bremen", 53.08, 8.80, 14, [
+        "Der Bremer Bürgerpark wurde 1866 von Bürgern gegründet und wird bis heute von einem Verein getragen."]),
+    ("Münster", 51.96, 7.63, 12, [
+        "Die Promenade rund um die Münsteraner Altstadt liegt auf der früheren Stadtbefestigung. Heute ist sie eine Baumallee."]),
+    ("Nürnberg", 49.45, 11.08, 18, [
+        "Der Nürnberger Reichswald hieß im Mittelalter „Bienengarten des Reiches“. Hier wurde Honig im großen Stil gewonnen."]),
+]
+SEASON_FACTS = {
+    "winter": ["Im Winter lassen sich Vögel leichter beobachten: Ohne Laub sieht man Nester, Misteln und Spechthöhlen.",
+               "Rotkehlchen singen auch im Winter, denn sie verteidigen ihr Revier das ganze Jahr."],
+    "spring": ["Im April und Mai singen die Vögel am lautesten: Der Morgenchor beginnt schon vor Sonnenaufgang.",
+               "Bärlauch und Buschwindröschen färben im Frühjahr Auwälder und Parkränder weiß."],
+    "summer": ["Linden blühen im Juni und Juli, und ihr Duft lockt Bienen und Hummeln an.",
+               "An Hitzetagen sind Parks und Wälder oft mehrere Grad kühler als versiegelte Straßen."],
+    "autumn": ["Das Herbstlaub wird nicht „bunt“: Blattgrün wird abgebaut, darunter kommen Gelb und Orange zum Vorschein.",
+               "Eichelhäher vergraben im Herbst Tausende Eicheln. Viele vergessen sie, und so entstehen neue Eichen."],
+}
+GENERAL_FACTS = [
+    "Schon etwa 20 Minuten im Grünen können das Stresshormon Cortisol messbar senken.",
+    "Große Laubbäume verdunsten an heißen Tagen viele Liter Wasser und kühlen so ihre Umgebung.",
+    "Stadtamseln singen oft höher und lauter als Waldamseln, um den Verkehrslärm zu übertönen.",
+    "Bäume tauschen über Pilzfäden im Boden Nährstoffe aus, ein Netz unter dem Waldboden.",
+    "Der Buntspecht trommelt bis zu 20-mal pro Sekunde, und sein Schädel federt jeden Schlag ab.",
+    "Fledermäuse jagen in der Dämmerung gern über Wegen und Gewässern, ein einzelnes Tier frisst viele Mücken pro Nacht.",
+    "Auf Nebenstraßen und Gassen ist die Luft meist spürbar besser als an Hauptverkehrsstraßen.",
+    "Ein Eichhörnchen findet viele seiner Verstecke wieder, und die vergessenen werden zu Bäumen.",
+]
+WATER_FACTS = [
+    "„Blaue Räume“: Wasser in Sichtweite macht Spaziergänge nach Studien erholsamer als reines Grün.",
+    "Libellen gibt es seit über 300 Millionen Jahren. Ihre Larven leben im Wasser und zeigen saubere Gewässer an.",
+    "Flüsse und Seen kühlen ihre Umgebung im Sommer spürbar. Am Ufer ist es oft ein paar Grad angenehmer.",
+]
 
-def loading_overlay():
-    """Vollbild-Ladeansicht; gibt den Platzhalter zurück (mit .empty() entfernen, z. B. bei Fehlern)."""
-    ph = st.empty()
-    try:
-        logo = base64.b64encode(LOGO_SVG.encode()).decode()
-        ph.markdown(OVERLAY_HTML.replace("__LOGO__", logo), unsafe_allow_html=True)
-    except Exception:
-        pass
-    return ph
+
+def region_facts(lat, lon):
+    """Fakten zum Ort (nächstgelegene bekannte Stadt im Umkreis); leer, wenn keine passt."""
+    best, bd = None, 1e9
+    for name, la, lo, rad, facts in CITY_FACTS:
+        d = dist_m((lat, lon), (la, lo)) / 1000
+        if d <= rad and d < bd:
+            best, bd = (name, facts), d
+    return best
+
+
+def pick_facts(lat=None, lon=None, water=False, month=None):
+    month = month or time.localtime().tm_mon
+    season = ("winter", "winter", "spring", "spring", "spring", "summer", "summer", "summer", "autumn", "autumn", "autumn", "winter")[month - 1]
+    rnd = random.Random()
+    out = []
+    if lat is not None:
+        reg = region_facts(lat, lon)
+        if reg:
+            local = list(reg[1])
+            rnd.shuffle(local)
+            out += local[:3]
+    if water:
+        out += rnd.sample(WATER_FACTS, 2)
+    out += rnd.sample(SEASON_FACTS[season], 1)
+    gen = list(GENERAL_FACTS)
+    rnd.shuffle(gen)
+    out += gen[: max(2, 6 - len(out))]
+    return out[:7]
+
+
+class Overlay:
+    """Vollbild-Ladeansicht mit Arbeitsstand (aktueller Schritt) und wechselnden Natur-/Ortsfakten."""
+    PER = 7.0  # Sekunden je Fakt
+
+    def __init__(self, start=None, water=False):
+        lat = lon = None
+        try:
+            lat, lon, _ = _unpack(start)
+        except Exception:
+            pass
+        self.facts = pick_facts(lat, lon, water)
+        self.stage = "Ich suche den grünsten Weg" + (" am Wasser entlang" if water else "") + " …"
+        self.ph = st.empty()
+        self.render()
+
+    def render(self):
+        try:
+            n = len(self.facts)
+            total = n * self.PER
+            vis = (self.PER - 0.6) / total * 100
+            fade = self.PER / total * 100
+            css = (f"@keyframes gwfact{{0%{{opacity:0;transform:translateY(8px)}}{0.5 / total * 100:.2f}%,{vis:.2f}%{{opacity:1;transform:none}}"
+                   f"{fade:.2f}%,100%{{opacity:0;transform:translateY(-8px)}}}}"
+                   + "".join(f"#gwload .fact p:nth-of-type({k + 1}){{animation:gwfact {total:.1f}s {k * self.PER:.1f}s infinite}}" for k in range(n)))
+            facts = "".join(f"<p>{escape(f)}</p>" for f in self.facts)
+            logo = base64.b64encode(LOGO_SVG.encode()).decode()
+            html = (OVERLAY_HTML.replace("__FACTCSS__", css).replace("__LOGO__", logo)
+                    .replace("__STAGE__", escape(self.stage)).replace("__FACTS__", facts)
+                    .replace("__LABEL__", "Wusstest du?"))
+            self.ph.markdown(html, unsafe_allow_html=True)
+        except Exception:
+            pass
+
+    def log(self, msg):
+        """Schritt anzeigen (und weiter ins versteckte Statusfeld schreiben)."""
+        try:
+            st.write(msg)
+        except Exception:
+            pass
+        txt = re.sub(r"\s*\([^)]*\)\s*$", "", str(msg)).strip()
+        if txt and txt != self.stage and len(txt) < 140:
+            self.stage = txt
+            self.render()
+
+    def empty(self):
+        try:
+            self.ph.empty()
+        except Exception:
+            pass
+
+
+def loading_overlay(start=None, water=False):
+    return Overlay(start, water)
 
 
 # Nur in der Kartenansicht: Karte füllt den ganzen Bildschirm, Suchleiste schwebt darüber.
@@ -3375,10 +3585,10 @@ def home_route():
         return
     view = None
     st.session_state["_water"] = bool(water_on)
-    ov = loading_overlay()
+    ov = loading_overlay(start_v, water_on)
     with st.status("Route wird vorbereitet …", expanded=True) as status:
         try:
-            view = make_ab_view_safe(start_v, ziel_v, log=st.write)
+            view = make_ab_view_safe(start_v, ziel_v, log=ov.log)
             status.update(label="Fertig", state="complete", expanded=False)
         except Exception as e:
             status.update(label="Fehler", state="error")
@@ -3419,10 +3629,10 @@ def home_loop():
             holder["bar"] = st.progress(0.0, text=txt)
         holder["bar"].progress(min(f, 1.0), text=txt)
 
-    ov = loading_overlay()
+    ov = loading_overlay(a_v, water_on)
     with st.status("Ründchen wird gesucht …", expanded=True) as status:
         try:
-            view = make_loop_view_safe(a_v, None if same else b_v, km, level, log=st.write, progress=prog)
+            view = make_loop_view_safe(a_v, None if same else b_v, km, level, log=ov.log, progress=prog)
             if "bar" in holder:
                 holder["bar"].empty()
             status.update(label="Fertig", state="complete", expanded=False)
@@ -3470,10 +3680,10 @@ def home_tour():
         return
     view = None
     st.session_state["_water"] = bool(water_on)
-    ov = loading_overlay()
+    ov = loading_overlay(a_v, water_on)
     with st.status("Runde mit Zwischenzielen wird berechnet …", expanded=True) as status:
         try:
-            view = make_tour_view_safe(a_v, stops, None if same else b_v, level, log=st.write, extra_km=extra_km)
+            view = make_tour_view_safe(a_v, stops, None if same else b_v, level, log=ov.log, extra_km=extra_km)
             status.update(label="Fertig", state="complete", expanded=False)
         except Exception as e:
             status.update(label="Fehler", state="error")
@@ -3487,7 +3697,7 @@ def home_tour():
 def render_home():
     logo = base64.b64encode(LOGO_SVG.encode()).decode()
     st.markdown('<div class="hero"><div class="ico"><img src="data:image/svg+xml;base64,' + logo +
-                '" width="46" height="46" alt=""></div><div><h1>Green-Walker</h1>'
+                '" width="46" height="46" alt=""></div><div><h1>GreenWalker</h1>'
                 '<p>Der grüne Weg statt nur der kürzeste.</p></div></div>',
                 unsafe_allow_html=True)
     # Nur der gewählte Reiter wird aufgebaut (st.tabs würde alle drei samt Suchfeldern laden = langsam)
