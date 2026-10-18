@@ -492,14 +492,101 @@ def keyword_places(term, bias):
     return out
 
 
+# ------------------------------------------------------- Fehlertolerante Adresssuche
+_PLZ = re.compile(r"\b\d{5}\b")
+_COORD = re.compile(r"(-?\d{1,2}[.,]\d{3,})\s*[,;/ ]\s*(-?\d{1,3}[.,]\d{3,})")
+
+
+def normalize_query(term):
+    """Eingefügte Texte säubern: Zeilenumbrüche, doppelte Leerzeichen, „Str.“/„strasse“, Land am Ende."""
+    t = re.sub(r"[\r\n\t]+", " ", term or "")
+    t = re.sub(r"(?i)str\.", "straße", t)
+    t = re.sub(r"(?i)(?<=\w)strasse\b", "straße", t)
+    t = re.sub(r"(?i)[ ,]+(deutschland|germany)\s*$", "", t)
+    return re.sub(r"\s+", " ", t).strip(" ,;")
+
+
+def _umlaut_variant(t):
+    """Schreibweisen ohne Umlaute <-> mit Umlauten (Muenchen/München, Strasse/Straße)."""
+    if re.search("[äöüßÄÖÜ]", t):
+        v = t.translate(str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue"}))
+    else:
+        v = re.sub("ae", "ä", t)
+        v = re.sub("oe", "ö", v)
+        v = re.sub("ue", "ü", v)
+        v = re.sub("ss", "ß", v)
+    return v if v != t else None
+
+
+def query_variants(term):
+    """Suchvarianten, vom genauen bis zum toleranten Text: mit PLZ, ohne PLZ (kleine PLZ-Abweichungen),
+    Straße+Nr+Ort, nur Straße+Ort, Umlaut-Schreibweisen und gekürzte Wörter (Tippfehler am Wortende)."""
+    t = normalize_query(term)
+    out = [t]
+    no_plz = re.sub(r"\s+", " ", _PLZ.sub(" ", t)).strip(" ,")
+    no_plz = re.sub(r"\s*,\s*,+", ",", no_plz)
+    if no_plz and no_plz != t:
+        out.append(no_plz)
+    flat = no_plz.replace(",", " ")
+    m = re.match(r"^(\D+?)\s+(\d+\s?[a-zA-Z]?)\b[ ,]*(.*)$", flat.strip())
+    if m:
+        street, nr, city = m.group(1).strip(), m.group(2).replace(" ", ""), m.group(3).strip()
+        out += [f"{street} {nr} {city}".strip(), f"{street} {city}".strip(), street]
+    for v in list(out[:3]):
+        u = _umlaut_variant(v)
+        if u:
+            out.append(u)
+    words = flat.split()
+    # verschriebene Straßenendung („Strase“, „Alee“) auf die richtige Endung zurückführen
+    import difflib
+    fixed = []
+    for w_ in words:
+        low = w_.lower()
+        best = difflib.get_close_matches(low, ["straße", "allee", "weg", "platz", "gasse", "ufer", "damm", "chaussee"], n=1, cutoff=0.78)
+        fixed.append(best[0].capitalize() if (best and len(low) >= 4 and low != best[0]) else w_)
+    if fixed != words:
+        out.insert(1, " ".join(fixed))
+    if words:
+        long_i = max(range(len(words)), key=lambda i: len(words[i]))
+        w = words[long_i]
+        for cut in (1, 2):
+            if len(w) - cut >= 4:
+                out.append(" ".join(words[:long_i] + [w[:-cut]] + words[long_i + 1:]))
+    seen, res = set(), []
+    for v in out:
+        v = v.strip(" ,")
+        if len(v) >= 3 and v.lower() not in seen:
+            seen.add(v.lower())
+            res.append(v)
+    return res
+
+
+def coord_from_text(term):
+    """Koordinaten oder Kartenlinks (Google/Apple/OSM: @lat,lon oder lat, lon) direkt als Ort."""
+    m = re.search(r"@(-?\d{1,2}\.\d+),(-?\d{1,3}\.\d+)", term) or _COORD.search(term)
+    if not m:
+        return None
+    try:
+        la, lo = float(m.group(1).replace(",", ".")), float(m.group(2).replace(",", "."))
+    except ValueError:
+        return None
+    if -90 <= la <= 90 and -180 <= lo <= 180 and abs(la) > 0.5:
+        return la, lo
+    return None
+
+
 def search_places(term):
     """Vorschläge während der Eingabe.
     - "Bahnhof Ehrenfeld" findet Bahnhöfe/Haltestellen mit "Ehrenfeld" im Namen
       (OSM nennt sie oft "Köln-Ehrenfeld", ohne das Wort Bahnhof).
     - Ohne Treffer wird die Eingabe gekürzt (ohne letztes/erstes Wort), danach Nominatim."""
-    term = (term or "").strip().replace("str.", "straße").replace("Str.", "Straße")
+    term = normalize_query((term or "").strip())
     if len(term) < 3:
         return []
+    ll = coord_from_text(term)
+    if ll:
+        lab = f"📍 Koordinaten · {ll[0]:.5f}, {ll[1]:.5f}"
+        return [(lab, _pack(ll[0], ll[1], lab))]
     bias = st.session_state.get("bias")
     blat, blon = (round(bias[0], 2), round(bias[1], 2)) if bias else (None, None)
 
@@ -520,23 +607,39 @@ def search_places(term):
     if core and len(core) < len(words):
         for tag in STATION_TAGS:
             _add(ask(" ".join(core), tag), seen, out)
-    _add(ask(term), seen, out)
+    variants = query_variants(term)
+    plz_in = _PLZ.search(term)
+    addr_like = bool(plz_in) or bool(re.search(r"\d", term))
+    for k, q in enumerate(variants[:7]):
+        _add(ask(q), seen, out)
+        if len(out) >= 5 or (k >= 3 and out):
+            break
     if not out and len(words) > 1:
         for q in (" ".join(words[:-1]), " ".join(words[1:])):
             _add(ask(q), seen, out)
             if out:
                 break
     if not out:
-        try:
-            out = _nominatim(term)
-        except Exception:
-            out = []
+        for q in variants[:3]:
+            try:
+                out = _nominatim(q)
+            except Exception:
+                out = []
+            if out:
+                break
     if bias and out:
-        # nahe Treffer zuerst: aufsteigend nach Entfernung vom Standort bzw. Startpunkt
         def dist_of(item):
             la, lo, _ = _unpack(item[1])
             return dist_m((bias[0], bias[1]), (la, lo))
-        out.sort(key=dist_of)
+        if addr_like:
+            # eingefügte/genaue Adresse: Treffer mit gleicher bzw. ähnlicher PLZ zuerst, sonst Reihenfolge der Relevanz
+            def plz_gap(item):
+                m_ = _PLZ.search(item[0])
+                return abs(int(m_.group()) - int(plz_in.group())) if (m_ and plz_in) else 99999
+            out = [x for _, x in sorted(enumerate(out), key=lambda t_: (plz_gap(t_[1]) // 50, t_[0]))]
+        else:
+            # nahe Treffer zuerst: aufsteigend nach Entfernung vom Standort bzw. Startpunkt
+            out.sort(key=dist_of)
         out = [(f"{lab}  ·  {_fmt_dist(dist_of((lab, val)))}", val) for lab, val in out]
     if kwhits:
         def dist_k(item):
@@ -960,6 +1063,139 @@ def solve(area, o, t, lam, buf):
     return out
 
 
+# ------------------------------------------------------- Doppelwege
+# Ein Weg gilt als doppelt gelaufen, wenn er nah (DUP_REACH) und parallel zu einem früheren Wegstück verläuft,
+# auch auf der anderen Straßenseite oder auf der anderen Seite eines Baumstreifens. Eine Parallelstraße
+# (mindestens ein Häuserblock entfernt) zählt nicht.
+DUP_REACH = 35.0       # m: Abstand, bis zu dem „gleiche Straße“ angenommen wird
+DUP_MIN_ARC = 80.0     # m Wegstrecke zwischen beiden Besuchen (sonst nur eine Kurve)
+DUP_ANGLE = 35.0       # Grad: Parallelität
+DUP_STEP = 10.0
+TWIN_REACH = 32.0
+TWIN_LATERAL = 3.5     # m seitlicher Versatz: Wegstücke nebeneinander (nicht hintereinander)
+
+
+def dup_analysis(X, Y):
+    """Polylinie (m) -> (Anteil doppelt, Maske je Abtastpunkt, s, px, py)."""
+    X, Y = np.asarray(X, float), np.asarray(Y, float)
+    if len(X) < 2:
+        return 0.0, np.zeros(0, bool), np.zeros(0), np.zeros(0), np.zeros(0)
+    cum = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(X), np.diff(Y)))])
+    total = float(cum[-1])
+    if total < 2 * DUP_MIN_ARC:
+        return 0.0, np.zeros(0, bool), np.zeros(0), np.zeros(0), np.zeros(0)
+    s = np.arange(DUP_STEP / 2, total, DUP_STEP)
+    px, py = np.interp(s, cum, X), np.interp(s, cum, Y)
+    s2a, s2b = np.clip(s - 8, 0, total), np.clip(s + 8, 0, total)
+    dx = np.interp(s2b, cum, X) - np.interp(s2a, cum, X)
+    dy = np.interp(s2b, cum, Y) - np.interp(s2a, cum, Y)
+    ang = np.degrees(np.arctan2(dy, dx)) % 180.0
+    from scipy.spatial import cKDTree
+    pairs = cKDTree(np.c_[px, py]).query_pairs(DUP_REACH, output_type="ndarray")
+    dup = np.zeros(len(s), dtype=bool)
+    if len(pairs):
+        i, j = pairs[:, 0], pairs[:, 1]
+        i, j = np.minimum(i, j), np.maximum(i, j)
+        d = np.abs(ang[i] - ang[j])
+        d = np.minimum(d, 180.0 - d)
+        ok = ((s[j] - s[i]) > DUP_MIN_ARC) & (d < DUP_ANGLE)
+        ok &= ~((s[i] < 25) & (s[j] > total - 25))  # Start und Ziel am selben Punkt zählen nicht
+        dup[j[ok]] = True
+    return float(dup.mean()), dup, s, px, py
+
+
+def dup_from_coords(coords):
+    """[[lat, lon], ...] -> (Anteil doppelt, Liste von Teilstrecken [[lat, lon], ...] für die Karte)."""
+    try:
+        a = np.asarray(coords, float)
+        if len(a) < 2:
+            return 0.0, []
+        lat0, lon0 = float(a[:, 0].mean()), float(a[:, 1].mean())
+        ky, kx = 110540.0, 111320.0 * math.cos(math.radians(lat0))
+        X, Y = (a[:, 1] - lon0) * kx, (a[:, 0] - lat0) * ky
+        share, mask, s, px, py = dup_analysis(X, Y)
+        if not mask.any():
+            return share, []
+        idx = np.nonzero(mask)[0]
+        runs, start, prev = [], idx[0], idx[0]
+        for v in idx[1:]:
+            if v - prev > 3:
+                runs.append((start, prev)); start = v
+            prev = v
+        runs.append((start, prev))
+        segs = []
+        for r0, r1 in runs:
+            if r1 - r0 < 2:
+                continue
+            seg = [[round(float(lat0 + py[k] / ky), 5), round(float(lon0 + px[k] / kx), 5)] for k in range(r0, r1 + 1)]
+            segs.append(seg)
+            if len(segs) >= 60:
+                break
+        return share, segs
+    except Exception:
+        return 0.0, []
+
+
+def area_twins(area):
+    """Je Kante die Nachbarkanten, die parallel daneben liegen (andere Straßenseite, Gehweg, Baumstreifen).
+    Wird beim Routing wie ein bereits gelaufenes Wegstück bestraft."""
+    tw = area.get("_twins")
+    if tw is not None:
+        return tw
+    n = len(area["lengths"])
+    ptr, idx = np.zeros(n + 1, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    try:
+        from scipy.spatial import cKDTree
+        fr = (0.2, 0.5, 0.8)
+        pts = [shapely.line_interpolate_point(area["lines"], f, normalized=True) for f in fr]
+        xy = np.concatenate([np.c_[shapely.get_x(p), shapely.get_y(p)] for p in pts])
+        owner = np.tile(np.arange(n), len(fr))
+        pairs = cKDTree(xy).query_pairs(TWIN_REACH, output_type="ndarray")
+        a, b = owner[pairs[:, 0]], owner[pairs[:, 1]]
+        pa, pb = xy[pairs[:, 0]], xy[pairs[:, 1]]
+        eu, ev, P = area["eu"], area["ev"], area["xy"]
+        vec = P[ev] - P[eu]
+        ang = np.degrees(np.arctan2(vec[:, 1], vec[:, 0])) % 180.0
+        d = np.abs(ang[a] - ang[b])
+        d = np.minimum(d, 180.0 - d)
+        th = np.radians(ang[a])
+        lat = np.abs(-(pb[:, 0] - pa[:, 0]) * np.sin(th) + (pb[:, 1] - pa[:, 1]) * np.cos(th))
+        shared = (eu[a] == eu[b]) | (eu[a] == ev[b]) | (ev[a] == eu[b]) | (ev[a] == ev[b])
+        ok = (a != b) & (d < DUP_ANGLE) & (lat >= TWIN_LATERAL) & ~shared
+        a, b = a[ok], b[ok]
+        both = np.unique(np.concatenate([a * n + b, b * n + a]))
+        src, dst = both // n, both % n
+        order = np.argsort(src, kind="stable")
+        src, dst = src[order], dst[order]
+        ptr = np.concatenate([[0], np.cumsum(np.bincount(src, minlength=n))])
+        idx = dst
+    except Exception:
+        pass
+    area["_twins"] = (ptr, idx)
+    return area["_twins"]
+
+
+def mark_used(area, usedm, path):
+    """Kanten eines Teilwegs samt paralleler Nachbarkanten als „schon gelaufen“ markieren."""
+    ptr, tw = area_twins(area)
+    H = area["H"]
+    for a_, b_ in zip(path[:-1], path[1:]):
+        i = H[a_][b_]["i"]
+        usedm[i] = True
+        if ptr[i + 1] > ptr[i]:
+            usedm[tw[ptr[i]:ptr[i + 1]]] = True
+
+
+def path_dup_share(area, path):
+    pos = area["pos"]
+    try:
+        xs = [pos[n_][0] for n_ in path]
+        ys = [pos[n_][1] for n_ in path]
+        return dup_analysis(xs, ys)[0]
+    except Exception:
+        return 0.0
+
+
 # ------------------------------------------------------- Ründchen
 LOOP_BEARINGS = 8      # Richtungen, in die Runden probiert werden
 LOOP_TOLERANCE = 0.07  # akzeptierte Längenabweichung beim Anpassen (±7 %)
@@ -1020,6 +1256,7 @@ def build_loop_path(area, g, ng, lam, o, t, theta, rho, mu=None, wq=0.0):
         wps.append(pick_waypoint(area, ng, cx + rho * math.cos(ang), cy + rho * math.sin(ang), 0.3 * rho))
     seq = [o] + wps + [t]
     used, full = set(), [o]
+    usedm = np.zeros(len(L), dtype=bool)
     for s, e in zip(seq[:-1], seq[1:]):
         if s == e:
             continue
@@ -1027,11 +1264,12 @@ def build_loop_path(area, g, ng, lam, o, t, theta, rho, mu=None, wq=0.0):
         def w(u, v, d, used=used):
             i = d["i"]
             c = L[i] * (1 + lam * (1 - g[i]) + mu * nz[i] + wq * wd[i])
-            return c * LOOP_REUSE_PENALTY if ((u, v) in used or (v, u) in used) else c
+            return c * LOOP_REUSE_PENALTY if (usedm[i] or (u, v) in used or (v, u) in used) else c
 
         p = nx.shortest_path(H, s, e, weight=w)
         full += p[1:]
         used.update(zip(p[:-1], p[1:]))
+        mark_used(area, usedm, p)
     return full
 
 
@@ -1049,16 +1287,17 @@ def loop_stats(area, g, path):
     dist = float(l.sum())
     if dist <= 0:
         return None
-    seen, rep = set(), 0.0
+    seen, rep_edges = set(), 0.0
     for (a, b), li in zip(pairs, l):
         k = (min(a, b), max(a, b))
         if k in seen:
-            rep += li
+            rep_edges += li
         else:
             seen.add(k)
+    rep = max(rep_edges / dist, path_dup_share(area, path))  # auch die andere Straßenseite zählt als Doppelweg
     nz = area.get("noise")
     noise = float((l * nz[idx]).sum() / dist) if nz is not None else 0.0
-    return dist, float((l * g[idx]).sum() / dist), float(rep / dist), noise
+    return dist, float((l * g[idx]).sum() / dist), float(rep), noise
 
 
 def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None):
@@ -1267,6 +1506,7 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
 .sq{width:48px;height:48px;border-radius:14px;border:1px solid var(--line);background:#fff;font-size:20px}
 .sq.on{background:#E7EDDB;border-color:var(--sage)}
 #vbtn,#fbtn{display:none}body.nav #vbtn,body.nav #fbtn{display:block}
+#map .cone{background:none;border:none;pointer-events:none}.coneIn{width:120px;height:120px;transition:transform .35s ease-out;transform-origin:60px 60px;filter:drop-shadow(0 0 3px rgba(255,255,255,.7))}.cone svg{overflow:visible}
 #styletip{position:fixed;z-index:1200;left:50%;top:calc(var(--top) + 14px);transform:translateX(-50%);background:rgba(59,58,51,.88);color:#FBF7EE;padding:6px 12px;border-radius:10px;font-size:.85rem;opacity:0;transition:opacity .3s;pointer-events:none}
 #clouds{position:fixed;inset:0;z-index:3000;pointer-events:none;background:#F4EFE6;animation:cbase 1.2s .25s cubic-bezier(.4,0,.6,1) forwards;overflow:hidden}
 .cl{position:absolute;border-radius:50%;filter:blur(30px);background:radial-gradient(closest-side,rgba(255,255,255,.96),rgba(255,255,255,.55) 55%,rgba(255,255,255,0));will-change:transform,opacity;animation:cpart 1.9s .15s cubic-bezier(.45,0,.2,1) forwards}
@@ -1378,6 +1618,54 @@ L.marker(D.p1, {icon: pin('🚶')}).addTo(map);
 if (D.p1[0] !== D.p2[0] || D.p1[1] !== D.p2[1]) L.marker(D.p2, {icon: pin('🏁')}).addTo(map);
 (D.stops || []).forEach(s => L.marker([s[0], s[1]], {icon: pin('📍')}).addTo(map).bindTooltip(s[2], {direction: 'top'}));
 const userDot = L.circleMarker([0, 0], {radius: 9, color: '#fff', weight: 3, fillColor: '#2F6F8F', fillOpacity: 1});
+// Richtungskegel: zeigt, wohin man blickt/läuft; grün = richtig, gelb = leicht daneben, rot = falsche Richtung
+const userCone = L.marker([0, 0], {interactive: false, keyboard: false, zIndexOffset: 800, icon: L.divIcon({className: 'cone', iconSize: [120, 120], iconAnchor: [60, 60],
+  html: '<div class="coneIn"><svg viewBox="-60 -60 120 120" width="120" height="120"><defs><radialGradient id="cg" cx="0" cy="0" r="58" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="currentColor" stop-opacity=".85"/><stop offset="1" stop-color="currentColor" stop-opacity="0"/></radialGradient></defs><path d="M0 0 L-27 -52 A58 58 0 0 1 27 -52 Z" fill="url(#cg)"/></svg></div>'})});
+let hdg = null, hdgGps = 0, prevFix = null, compassOn = false;
+const angDiff = (a, b) => { let d = (a - b) % 360; if (d > 180) d -= 360; if (d < -180) d += 360; return d; };
+function bearingLL(a, b) {
+  const dy = (b[0] - a[0]) * 110540, dx = (b[1] - a[1]) * 111320 * Math.cos(a[0] * Math.PI / 180);
+  return (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360;
+}
+function updateCone(h) {
+  if (h === null || h === undefined || isNaN(h) || !lastPos) return;
+  hdg = hdg === null ? h : (hdg + angDiff(h, hdg) * 0.45 + 360) % 360;  // glätten
+  let col = '#2F6F8F';
+  if (navOn && coords.length > 1 && !finished) {
+    const a = pointAt(Math.max(0, along - 3)), b = pointAt(Math.min(total, along + 28));
+    const d = Math.abs(angDiff(hdg, bearingLL(a, b)));
+    col = d <= 35 ? '#3E8E41' : (d <= 80 ? '#E0A526' : '#D2452D');
+  }
+  userCone.setLatLng(lastPos); if (!map.hasLayer(userCone)) userCone.addTo(map);
+  const el = userCone.getElement();
+  if (el) { el.style.color = col; const inn = el.firstElementChild; if (inn) inn.style.transform = 'rotate(' + hdg.toFixed(0) + 'deg)'; }
+}
+function onOrient(e) {
+  if (Date.now() - hdgGps < 4000) return;  // beim Gehen gilt die Bewegungsrichtung, im Stehen der Kompass
+  let h = null;
+  if (typeof e.webkitCompassHeading === 'number') h = e.webkitCompassHeading;
+  else if (e.absolute && e.alpha !== null && e.alpha !== undefined) h = (360 - e.alpha) % 360;
+  if (h === null) return;
+  h = (h + ((screen.orientation && screen.orientation.angle) || 0) + 360) % 360;
+  updateCone(h);
+}
+function startCompass() {
+  if (compassOn) return; compassOn = true;
+  const go = () => {
+    window.addEventListener('deviceorientationabsolute', onOrient, true);
+    window.addEventListener('deviceorientation', onOrient, true);
+  };
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function')
+      DeviceOrientationEvent.requestPermission().then(r => { if (r === 'granted') go(); }).catch(() => {});
+    else go();
+  } catch (e) {}
+}
+function stopCompass() {
+  compassOn = false; hdg = null; prevFix = null;
+  window.removeEventListener('deviceorientationabsolute', onOrient, true);
+  window.removeEventListener('deviceorientation', onOrient, true);
+}
 const userAcc = L.circle([0, 0], {radius: 10, color: '#2F6F8F', weight: 1, fillColor: '#2F6F8F', fillOpacity: .12});
 
 let cur = -1, layers = [], coords = [], cum = [], steps = [], total = 1, P = [], lat0 = 0, lon0 = 0, kx = 1, done = null;
@@ -1453,6 +1741,7 @@ function showOption(i, fit) {
   const mainLine = add(L.polyline(coords, {color: '#3F6B3A', weight: 7, opacity: 1}));
   drawIn(mainLine, (window.INTRO && !INTRO_DONE) ? 1900 : 0);
   done = add(L.polyline([], {color: '#B9C9A8', weight: 7, opacity: 1}));
+  (o.dups || []).forEach(sg => add(L.polyline(sg, {color: '#E08A1E', weight: 5, opacity: .95, dashArray: '1 9', lineCap: 'round'})));
   steps.forEach((s, k) => { if (k > 0 && k < steps.length - 1)
     add(L.circleMarker([s.lat, s.lon], {radius: 5, color: '#fff', weight: 2, fillColor: '#4E6E45', fillOpacity: 1})); });
   document.querySelectorAll('.chip').forEach((c, k) => c.classList.toggle('on', k === i));
@@ -1480,7 +1769,7 @@ function finish() {
   banner('done', '🏁', 'Geschafft!', steps[steps.length - 1].t); say(steps[steps.length - 1].t);
   $('rem').textContent = 'Ziel erreicht'; $('prog').firstElementChild.style.width = '100%';
 }
-function onFix(lat, lon, acc) {
+function onFix(lat, lon, acc, gpsHeading, speed) {
   if (finished || !navOn) return;
   lastPos = [lat, lon];
   const xy = toXY(lat, lon);
@@ -1488,6 +1777,13 @@ function onFix(lat, lon, acc) {
   if (s.off > 60) { const g = snap(xy, 0, false); if (g.off < s.off) s = g; }
   lastIdx = s.i; along = s.along;
   userDot.setLatLng(lastPos); if (!map.hasLayer(userDot)) userDot.addTo(map);
+  // Richtung: GPS-Kurs (nur in Bewegung), sonst aus den letzten Positionen, sonst Kompass (onOrient)
+  let h = null;
+  if (typeof gpsHeading === 'number' && !isNaN(gpsHeading) && (speed || 0) > 0.7) h = gpsHeading;
+  else if (prevFix && Math.hypot((lat - prevFix[0]) * 110540, (lon - prevFix[1]) * 111320 * Math.cos(lat * Math.PI / 180)) >= 5) h = bearingLL(prevFix, [lat, lon]);
+  if (h !== null) { prevFix = [lat, lon]; hdgGps = Date.now(); updateCone(h); }
+  else if (!prevFix) prevFix = [lat, lon];
+  else updateCone(hdg);
   // Genauigkeitskreis nur bei brauchbarer Genauigkeit (sonst überdeckt er die ganze Karte)
   if (acc && acc <= 120) { userAcc.setLatLng(lastPos); userAcc.setRadius(acc); if (!map.hasLayer(userAcc)) userAcc.addTo(map); }
   else if (map.hasLayer(userAcc)) map.removeLayer(userAcc);
@@ -1523,6 +1819,7 @@ function onFix(lat, lon, acc) {
   if (follow && !far) map.setView(lastPos, Math.max(map.getZoom(), 17), {animate: false});
 }
 function stopWatch() {
+  stopCompass();
   if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
   if (sim) { clearInterval(sim); sim = null; $('demo').classList.remove('on'); }
   try { if (wake) wake.release(); } catch (e) {} wake = null;
@@ -1537,15 +1834,15 @@ function enterNav() {
 function exitNav() {
   stopWatch(); navOn = false; finished = false;
   document.body.classList.remove('nav'); $('go').textContent = GO;
-  [userDot, userAcc].forEach(l => { if (map.hasLayer(l)) map.removeLayer(l); });
+  [userDot, userAcc, userCone].forEach(l => { if (map.hasLayer(l)) map.removeLayer(l); });
   if (done) done.setLatLngs([]);
   showOption(cur, true);
 }
 function startGps() {
-  enterNav();
+  enterNav(); startCompass();
   if (!navigator.geolocation) { banner('off', '📡', 'Kein GPS', 'Dieses Gerät unterstützt keine Standortabfrage.'); return; }
   watchId = navigator.geolocation.watchPosition(
-    p => onFix(p.coords.latitude, p.coords.longitude, p.coords.accuracy),
+    p => onFix(p.coords.latitude, p.coords.longitude, p.coords.accuracy, p.coords.heading, p.coords.speed),
     err => {
       if (err.code === 1) banner('off', '🔒', 'Standort blockiert', 'Bitte den Standortzugriff für diese Seite erlauben und neu starten.');
       else banner('off', '📡', 'Kein GPS-Signal', 'Warte auf Standort …');
@@ -1561,7 +1858,7 @@ function startDemo() {
   enterNav(); $('demo').classList.add('on'); follow = true; $('fbtn').classList.add('on');
   let s = 0;
   sim = setInterval(() => {
-    s = Math.min(total, s + 10); const p = pointAt(s); onFix(p[0], p[1], 5);
+    s = Math.min(total, s + 10); const p = pointAt(s); onFix(p[0], p[1], 5, null, 0);
     if (s >= total || finished) { clearInterval(sim); sim = null; $('demo').classList.remove('on'); }
   }, 500);
 }
@@ -1699,7 +1996,14 @@ def map_html(payload):
 
 
 def _option(nav, label, sub, hint, stats):
-    return {**nav, "label": label, "sub": sub, "hint": hint, "stats": stats}
+    share, segs = dup_from_coords(nav.get("coords") or [])
+    if re.search(r"\d+% ohne Doppelweg", hint):
+        hint = re.sub(r"\d+% ohne Doppelweg", f"{1 - share:.0%} ohne Doppelweg", hint)
+    elif share >= 0.05:
+        hint += f" · {share:.0%} Doppelweg"
+    if segs and share >= 0.02:
+        hint += " · orange markiert = doppelt gelaufen"
+    return {**nav, "label": label, "sub": sub, "hint": hint, "stats": stats, "dups": segs}
 
 
 def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: None):
@@ -2310,13 +2614,8 @@ def scan_score(sa, coords, buf):
     wdm = sa.get("wdist")
     water = None if wdm is None else float(np.mean(np.where(ok, wdm[r, c], np.inf) <= WATER_SCAN_NEAR))
     nz = np.where(ok, sa["noise"][r, c], 0.0)
-    first, rep = {}, 0
-    for i, k in enumerate(zip(np.round(px / 8).astype(int), np.round(py / 8).astype(int))):
-        j = first.setdefault(k, i)
-        if i - j > 5:
-            rep += 1
-    n = max(len(s), 1)
-    return {"dist": total, "green": float(g.mean()), "noise": float(nz.mean()), "rep": rep / n, "water": water}
+    rep = dup_analysis(X, Y)[0]
+    return {"dist": total, "green": float(g.mean()), "noise": float(nz.mean()), "rep": float(rep), "water": water}
 
 
 def _green_targets(sa, A, B, k=4, slack=1.0):
@@ -2705,15 +3004,17 @@ def tour_path(area, g, lam, mu, wq, nodes):
     wd = area.get("wide")
     wd = np.zeros(len(L)) if wd is None else wd
     used, full, marks = set(), [nodes[0]], []
+    usedm = np.zeros(len(L), dtype=bool)
     for s_, e in zip(nodes[:-1], nodes[1:]):
         if s_ != e:
             def w(u, v, d, used=used):
                 i = d["i"]
                 c = L[i] * (1 + lam * (1 - g[i]) + mu * nz[i] + wq * wd[i])
-                return c * LOOP_REUSE_PENALTY if ((u, v) in used or (v, u) in used) else c
+                return c * LOOP_REUSE_PENALTY if (usedm[i] or (u, v) in used or (v, u) in used) else c
             p = nx.shortest_path(H, s_, e, weight=w)
             full += p[1:]
             used.update(zip(p[:-1], p[1:]))
+            mark_used(area, usedm, p)
         marks.append(len(full) - 1)
     return full, marks[:-1]
 
@@ -3343,7 +3644,8 @@ st.markdown(BASE_CSS, unsafe_allow_html=True)
 
 PLACEHOLDER = "Straße, Adresse, Café, Restaurant, Geschäft …"
 SEARCH_TIP = ("Tipp: Tippe mindestens 3 Buchstaben, dann erscheinen Vorschläge. "
-              "Tippfehler sind okay, es werden ähnliche Orte angezeigt.")
+              "Tippfehler sind okay, es werden ähnliche Orte angezeigt. "
+              "Adressen kannst du auch unten einfügen.")
 
 
 SEARCH_STYLE = {
@@ -3357,14 +3659,35 @@ SEARCH_STYLE = {
 }
 
 
+def paste_input(key):
+    """Zuverlässiges Eingabefeld zum Einfügen (Strg/Cmd+V, „Einfügen“ am Handy): normales Textfeld mit
+    gleicher fehlertoleranter Suche; die Trefferliste erscheint darunter."""
+    with st.expander("📋 Adresse einfügen oder Koordinaten eingeben"):
+        txt = st.text_input("Adresse", key=f"{key}_paste", label_visibility="collapsed",
+                            placeholder="z. B. Hauptstraße 12, 50667 Köln · oder 50.9375, 6.9603")
+        if txt and len(txt.strip()) >= 3:
+            try:
+                res = search_places(txt)
+            except Exception:
+                res = []
+            if res:
+                i = st.selectbox("Treffer", list(range(len(res))), format_func=lambda k: res[k][0],
+                                 key=f"{key}_pick", label_visibility="collapsed")
+                return res[i][1]
+            st.caption("Dazu habe ich nichts gefunden. Probiere es ohne Postleitzahl oder mit weniger Wörtern.")
+    return None
+
+
 def place_input(label, key):
     dot = "s" if label.startswith("Start") else "z"
     st.markdown(f'<div class="fld"><i class="dot {dot}"></i>{escape(label)}</div>', unsafe_allow_html=True)
     kw = dict(key=key, placeholder=PLACEHOLDER, clear_on_submit=False)
     try:
-        return st_searchbox(search_places, style_overrides=SEARCH_STYLE, **kw)
+        v = st_searchbox(search_places, style_overrides=SEARCH_STYLE, **kw)
     except TypeError:  # ältere Version ohne style_overrides
-        return st_searchbox(search_places, **kw)
+        v = st_searchbox(search_places, **kw)
+    pasted = paste_input(key)
+    return pasted or v
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
