@@ -115,6 +115,8 @@ def rank_mirrors():
 
 
 UA = {"User-Agent": "green-walker-app/1.0 (privates Hobbyprojekt)"}
+WATER_WAYS = ["river", "canal", "stream", "riverbank"]
+WATER_BUF = 60  # Meter: bis hierher zählt "am Wasser"
 GREEN_TAGS = {
     "leisure": ["park", "garden", "nature_reserve", "recreation_ground"],
     "landuse": ["grass", "forest", "village_green"],
@@ -305,6 +307,190 @@ def _add(feats, seen, out):
         out.append((lab, _pack(lat, lon, lab)))
 
 
+# ------------------------------------------------------- Schlagwortsuche
+# Wer „essen“, „Bier“ oder „Brötchen“ tippt, bekommt passende Orte in der Nähe (nach Entfernung sortiert).
+# Grundlage ist ein kuratiertes Wörterbuch; optional hilft die KI (Claude) bei unbekannten Begriffen,
+# wenn in den Streamlit-Secrets ein ANTHROPIC_API_KEY hinterlegt ist.
+CATS = {
+    "restaurant": ("🍽️", "Restaurant", ['["amenity"="restaurant"]']),
+    "imbiss": ("🌭", "Imbiss", ['["amenity"="fast_food"]']),
+    "cafe": ("☕", "Café", ['["amenity"="cafe"]']),
+    "kneipe": ("🍺", "Kneipe", ['["amenity"="pub"]', '["amenity"="bar"]']),
+    "biergarten": ("🍻", "Biergarten", ['["amenity"="biergarten"]']),
+    "kiosk": ("🥤", "Kiosk", ['["shop"="kiosk"]', '["shop"="newsagent"]', '["shop"="convenience"]']),
+    "getraenke": ("🍾", "Getränkemarkt", ['["shop"="beverages"]', '["shop"="alcohol"]']),
+    "wein": ("🍷", "Weinhandel", ['["shop"="wine"]']),
+    "baecker": ("🥐", "Bäckerei", ['["shop"="bakery"]']),
+    "eis": ("🍦", "Eisdiele", ['["amenity"="ice_cream"]', '["shop"="ice_cream"]']),
+    "supermarkt": ("🛒", "Supermarkt", ['["shop"="supermarket"]']),
+    "metzger": ("🥩", "Metzgerei", ['["shop"="butcher"]']),
+    "obst": ("🥬", "Obst & Gemüse", ['["shop"="greengrocer"]', '["shop"="farm"]']),
+    "blumen": ("💐", "Blumenladen", ['["shop"="florist"]']),
+    "apotheke": ("💊", "Apotheke", ['["amenity"="pharmacy"]']),
+    "drogerie": ("🧴", "Drogerie", ['["shop"="chemist"]']),
+    "geldautomat": ("🏧", "Geldautomat", ['["amenity"="atm"]', '["amenity"="bank"]']),
+    "post": ("📮", "Post / Paketshop", ['["amenity"="post_office"]', '["shop"="parcel_locker"]',
+                                       '["amenity"="parcel_locker"]']),
+    "toilette": ("🚻", "Toilette", ['["amenity"="toilets"]']),
+    "trinkwasser": ("🚰", "Trinkwasser", ['["amenity"="drinking_water"]']),
+    "spielplatz": ("🛝", "Spielplatz", ['["leisure"="playground"]']),
+    "aussicht": ("🌄", "Aussichtspunkt", ['["tourism"="viewpoint"]']),
+    "sehenswert": ("🏛️", "Sehenswürdigkeit", ['["tourism"="attraction"]', '["historic"="monument"]']),
+    "bahnhof": ("🚉", "Bahnhof / Haltestelle", ['["railway"="station"]', '["railway"="halt"]']),
+    "buch": ("📚", "Buchhandlung / Bibliothek", ['["shop"="books"]', '["amenity"="library"]']),
+    "tabak": ("🚬", "Tabak / Zeitung", ['["shop"="tobacco"]', '["shop"="newsagent"]']),
+}
+KEYWORDS = {
+    "essen": ["restaurant", "imbiss"], "restaurant": ["restaurant"], "mittagessen": ["restaurant", "imbiss"],
+    "abendessen": ["restaurant"], "hunger": ["imbiss", "baecker", "restaurant"], "dinner": ["restaurant"],
+    "lunch": ["restaurant", "imbiss"], "pizza": ["restaurant", "imbiss"], "burger": ["imbiss"],
+    "döner": ["imbiss"], "doener": ["imbiss"], "imbiss": ["imbiss"], "pommes": ["imbiss"],
+    "currywurst": ["imbiss"], "snack": ["imbiss", "kiosk", "baecker"], "fastfood": ["imbiss"],
+    "trinken": ["kiosk", "getraenke", "cafe"], "durst": ["kiosk", "getraenke", "trinkwasser"],
+    "getränk": ["kiosk", "getraenke"], "getränke": ["getraenke", "kiosk"], "getränkemarkt": ["getraenke"],
+    "bier": ["kneipe", "biergarten", "getraenke"], "kneipe": ["kneipe"], "pub": ["kneipe"], "bar": ["kneipe"],
+    "biergarten": ["biergarten"], "feierabendbier": ["kneipe", "biergarten", "kiosk"], "cocktail": ["kneipe"],
+    "wein": ["wein", "kneipe"], "kaffee": ["cafe", "baecker"], "café": ["cafe"], "cafe": ["cafe"],
+    "kuchen": ["cafe", "baecker"], "tee": ["cafe"], "kiosk": ["kiosk"], "büdchen": ["kiosk"],
+    "buedchen": ["kiosk"], "späti": ["kiosk"], "spaeti": ["kiosk"], "trinkhalle": ["kiosk"],
+    "wasserhäuschen": ["kiosk"], "bäcker": ["baecker"], "bäckerei": ["baecker"], "baecker": ["baecker"],
+    "brötchen": ["baecker"], "broetchen": ["baecker"], "brot": ["baecker"], "frühstück": ["cafe", "baecker"],
+    "fruehstueck": ["cafe", "baecker"], "brunch": ["cafe"], "croissant": ["baecker", "cafe"],
+    "eis": ["eis"], "eiscreme": ["eis"], "eisdiele": ["eis"], "gelato": ["eis"],
+    "einkaufen": ["supermarkt", "kiosk", "baecker"], "einkauf": ["supermarkt"], "supermarkt": ["supermarkt"],
+    "lebensmittel": ["supermarkt", "obst"], "rewe": ["supermarkt"], "edeka": ["supermarkt"],
+    "aldi": ["supermarkt"], "lidl": ["supermarkt"], "metzger": ["metzger"], "fleisch": ["metzger"],
+    "wurst": ["metzger", "imbiss"], "obst": ["obst"], "gemüse": ["obst"], "gemuese": ["obst"],
+    "hofladen": ["obst"], "blumen": ["blumen"], "strauß": ["blumen"], "strauss": ["blumen"],
+    "geschenk": ["blumen", "buch"], "apotheke": ["apotheke"], "medikament": ["apotheke"],
+    "tabletten": ["apotheke"], "drogerie": ["drogerie"], "shampoo": ["drogerie"],
+    "geld": ["geldautomat"], "geldautomat": ["geldautomat"], "atm": ["geldautomat"], "bank": ["geldautomat"],
+    "abheben": ["geldautomat"], "post": ["post"], "paket": ["post"], "päckchen": ["post"],
+    "brief": ["post"], "briefmarke": ["post"], "dhl": ["post"], "hermes": ["post"], "dpd": ["post"],
+    "toilette": ["toilette"], "wc": ["toilette"], "klo": ["toilette"], "trinkwasser": ["trinkwasser"],
+    "wasser": ["trinkwasser", "kiosk"], "spielplatz": ["spielplatz"], "kinder": ["spielplatz"],
+    "aussicht": ["aussicht"], "aussichtspunkt": ["aussicht"], "panorama": ["aussicht"],
+    "sehenswürdigkeit": ["sehenswert"], "sehenswürdigkeiten": ["sehenswert"], "denkmal": ["sehenswert"],
+    "sehenswert": ["sehenswert"], "bahnhof": ["bahnhof"], "haltestelle": ["bahnhof"], "buch": ["buch"],
+    "bücher": ["buch"], "buchhandlung": ["buch"], "bibliothek": ["buch"], "zeitung": ["tabak", "kiosk"],
+    "zigaretten": ["tabak", "kiosk"], "tabak": ["tabak"],
+}
+_SEL_OK = re.compile(r'^\["(amenity|shop|leisure|tourism|historic|natural|railway)"="[a-z_]{2,30}"\]$')
+KW_MAX_CATS = 2
+KW_RADIUS_M = 2500
+
+
+def match_categories(term):
+    """Findet Kategorien zu einer Eingabe (exakt, Wortanfang, Tippfehler). Leere Liste: kein Schlagwort."""
+    import difflib
+    words = [w for w in re.split(r"[\s,;/]+", term.lower()) if w]
+    if not words or len(words) > 3:
+        return []
+    found = []
+    for w in words:
+        hits = []
+        if w in KEYWORDS:
+            hits = KEYWORDS[w]
+        elif len(w) >= 4:
+            pref = [k for k in KEYWORDS if k.startswith(w) or (len(k) >= 4 and w.startswith(k))]
+            if pref:
+                hits = KEYWORDS[min(pref, key=len)]
+            else:
+                close = difflib.get_close_matches(w, list(KEYWORDS), n=1, cutoff=0.84)
+                if close:
+                    hits = KEYWORDS[close[0]]
+        for h in hits:
+            if h not in found:
+                found.append(h)
+    return found[:KW_MAX_CATS + 1]
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _ai_categories(term):
+    """Optional: KI übersetzt unbekannte Begriffe in OSM-Orte. Nur mit ANTHROPIC_API_KEY in den Secrets."""
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY")
+    except Exception:
+        key = None
+    if not key:
+        return []
+    prompt = (
+        "Ein Fußgänger sucht in einer Spazier-App einen Zwischenstopp und tippt: \"" + term[:60] + "\".\n"
+        "Welche OpenStreetMap-Orte passen? Antworte NUR mit JSON: "
+        '{"orte":[{"label":"Deutsch, max 3 Wörter","icon":"1 Emoji","tags":[["amenity","pub"]]}]}\n'
+        "Höchstens 2 Orte, je höchstens 3 tags. Erlaubte Schlüssel: amenity, shop, leisure, tourism, historic. "
+        "Wenn nichts passt: {\"orte\":[]}.")
+    r = requests.post("https://api.anthropic.com/v1/messages", timeout=7,
+                      headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                      json={"model": "claude-haiku-5-5", "max_tokens": 300,
+                            "messages": [{"role": "user", "content": prompt}]})
+    r.raise_for_status()
+    text = "".join(b.get("text", "") for b in r.json().get("content", []))
+    data = json.loads(text[text.index("{"): text.rindex("}") + 1])
+    out = []
+    for o in data.get("orte", [])[:2]:
+        sels = [f'["{k}"="{v}"]' for k, v in o.get("tags", [])[:3] if isinstance(k, str) and isinstance(v, str)]
+        sels = [s for s in sels if _SEL_OK.match(s)]
+        if sels:
+            out.append((str(o.get("icon", "📍"))[:4], str(o.get("label", term))[:30], sels))
+    return out
+
+
+def _cat_defs(term):
+    defs = [CATS[c] for c in match_categories(term)]
+    if not defs and len(term) >= 4:
+        try:
+            defs = _ai_categories(term)
+        except Exception:
+            defs = []
+    return defs[:KW_MAX_CATS + 1]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _nearby(selectors, lat, lon, radius=KW_RADIUS_M):
+    """Orte einer Kategorie rund um (lat, lon); Overpass mit kurzem Limit."""
+    body = "".join(f"nwr{s}(around:{radius},{lat},{lon});" for s in selectors)
+    q = f"[out:json][timeout:8];({body});out center 40;"
+    last = None
+    for base in OVERPASS_MIRRORS[:3]:
+        try:
+            r = requests.post(base + "/interpreter", data={"data": q}, headers=UA, timeout=7)
+            r.raise_for_status()
+            els = r.json().get("elements", [])
+            res = []
+            for e in els:
+                c = e.get("center") or e
+                if "lat" not in c:
+                    continue
+                t = e.get("tags", {})
+                res.append((float(c["lat"]), float(c["lon"]), t.get("name") or t.get("brand") or t.get("operator") or "",
+                            t.get("addr:street", ""), t.get("addr:housenumber", "")))
+            return res
+        except Exception as ex:
+            last = ex
+    raise last or RuntimeError("Overpass nicht erreichbar")
+
+
+def keyword_places(term, bias):
+    """Schlagwort -> nahe Orte als Vorschläge (nach Entfernung)."""
+    if not bias:
+        return []
+    defs = _cat_defs(term)
+    out = []
+    for icon, label, sels in defs:
+        try:
+            items = _nearby(tuple(sels), round(bias[0], 3), round(bias[1], 3))
+        except Exception:
+            continue
+        items = sorted((it for it in items if it[2]), key=lambda it: dist_m((bias[0], bias[1]), (it[0], it[1])))[:4]
+        for la, lo, name, street, nr in items:
+            title = name or label
+            addr = (street + (" " + nr if nr else "")) if street else ""
+            lab = f"{icon} {title} · {label}" + (f" · {addr}" if addr and name else "")
+            out.append((lab, _pack(la, lo, f"{icon} {title}")))
+    return out
+
+
 def search_places(term):
     """Vorschläge während der Eingabe.
     - "Bahnhof Ehrenfeld" findet Bahnhöfe/Haltestellen mit "Ehrenfeld" im Namen
@@ -323,6 +509,11 @@ def search_places(term):
             return []
 
     out, seen = [], set()
+    kwhits = []
+    try:
+        kwhits = keyword_places(term, bias)
+    except Exception:
+        kwhits = []
     words = term.split()
     core = [w for w in words if w.lower().strip(".,") not in STATION_WORDS]
     if core and len(core) < len(words):
@@ -346,6 +537,14 @@ def search_places(term):
             return dist_m((bias[0], bias[1]), (la, lo))
         out.sort(key=dist_of)
         out = [(f"{lab}  ·  {_fmt_dist(dist_of((lab, val)))}", val) for lab, val in out]
+    if kwhits:
+        def dist_k(item):
+            la, lo, _ = _unpack(item[1])
+            return dist_m((bias[0], bias[1]), (la, lo))
+        kwhits.sort(key=dist_k)
+        kwhits = [(f"{lab}  ·  {_fmt_dist(dist_k((lab, val)))}", val) for lab, val in kwhits][:6]
+        rest = [x for x in out if x[1] not in {v for _, v in kwhits}]
+        return (kwhits + rest)[:10]
     return out[:8]
 
 
@@ -385,6 +584,9 @@ def overpass_query(bbox):
     for k, vals in GREEN_TAGS.items():
         rx = "|".join(vals)
         parts += [f'way["{k}"~"^({rx})$"]{b};', f'relation["{k}"~"^({rx})$"]{b};']
+    # Gewässer: Seen/Teiche (natural=water) und Flüsse/Bäche/Kanäle
+    parts += [f'way["natural"="water"]{b};', f'relation["natural"="water"]{b};',
+              f'way["waterway"~"^({"|".join(WATER_WAYS)})$"]{b};']
     return "[out:xml][timeout:25];\n(\n  " + "\n  ".join(parts) + "\n);\n(._;>;);\nout body qt;"
 
 
@@ -423,7 +625,7 @@ def fetch_osm(bbox, deadline):
     """Lädt OSM-Daten mit harter Zeitgrenze. Kein endloses Warten: überlastete Server (429/50x)
     werden sofort übersprungen. Ergebnis wird einige Tage auf der Festplatte zwischengespeichert."""
     os.makedirs(OSM_CACHE_DIR, exist_ok=True)
-    path = os.path.join(OSM_CACHE_DIR, hashlib.md5(repr(bbox).encode()).hexdigest() + ".osm")
+    path = os.path.join(OSM_CACHE_DIR, hashlib.md5((repr(bbox) + "|v2-wasser").encode()).hexdigest() + ".osm")
     if os.path.exists(path) and time.time() - os.path.getmtime(path) < OSM_CACHE_DAYS * 86400:
         return path
     query, last = overpass_query(bbox), "keine Antwort"
@@ -515,9 +717,17 @@ def load_area(bbox):
     if G0.number_of_edges() == 0:
         raise ValueError("In diesem Gebiet habe ich keine Fußwege gefunden.")
 
-    parks = None
+    parks, waters = None, None
     try:
-        gdf = ox.features_from_xml(path, tags=GREEN_TAGS)
+        tags_all = {"leisure": GREEN_TAGS["leisure"], "landuse": GREEN_TAGS["landuse"],
+                    "natural": GREEN_TAGS["natural"] + ["water"], "waterway": WATER_WAYS}
+        gall = ox.features_from_xml(path, tags=tags_all)
+        isw = np.zeros(len(gall), dtype=bool)
+        if "natural" in gall:
+            isw |= (gall["natural"] == "water").to_numpy()
+        if "waterway" in gall:
+            isw |= gall["waterway"].notna().to_numpy()
+        gdf = gall[~isw]
         gdf = gdf[gdf.geometry.type.isin(["Polygon", "MultiPolygon"])]
         if len(gdf):
             gdf = gdf.reset_index(drop=True)
@@ -525,6 +735,9 @@ def load_area(bbox):
                 gdf["name"] = None
             gdf["name"] = gdf["name"].fillna("Grünfläche").astype(str)
             parks = gdf[["name", "geometry"]]
+        wdf = gall[isw]
+        if len(wdf):
+            waters = wdf[["geometry"]].reset_index(drop=True)
     except Exception:
         parks = None  # keine Grünflächen im Gebiet: Route geht trotzdem
 
@@ -581,9 +794,30 @@ def load_area(bbox):
                 D[r, idx[0]] = dist
             parks_json = pg.to_crs(4326).to_json()
 
+    # Gewässer-Nähe je Kante (Abstand zum nächsten See, Teich oder Fluss)
+    DW = np.full((SAMPLES, len(keys)), MAX_BUF, dtype=np.float32)
+    water_json = None
+    if waters is not None:
+        try:
+            wg = waters.to_crs(crs)
+            wg["geometry"] = wg.geometry.simplify(2.0)
+            wg = wg[wg.geometry.notna() & ~wg.geometry.is_empty].reset_index(drop=True)
+            if len(wg):
+                wtree = STRtree(list(wg.geometry))
+                for r, f in enumerate((np.arange(SAMPLES) + 0.5) / SAMPLES):
+                    pts = shapely.line_interpolate_point(lines, f, normalized=True)
+                    idx, dist = wtree.query_nearest(pts, max_distance=MAX_BUF, return_distance=True, all_matches=False)
+                    DW[r, idx[0]] = dist
+                wshow = wg.copy()
+                wshow["geometry"] = wshow.geometry.simplify(6.0)
+                water_json = wshow.iloc[:900].to_crs(4326).to_json()
+        except Exception:
+            water_json = None
+
     node_list = list(pos)
     nidx = {n: i for i, n in enumerate(node_list)}
-    return {"crs": crs, "pos": pos, "H": H, "lengths": lengths, "lines": lines, "D": D,
+    return {"crs": crs, "pos": pos, "H": H, "lengths": lengths, "lines": lines, "D": D, "DW": DW,
+            "water_json": water_json,
             "node_list": node_list, "xy": np.array([pos[n] for n in node_list]),
             "eu": np.array([nidx[u] for u, v in keys]), "ev": np.array([nidx[v] for u, v in keys]),
             "names": names, "kinds": kinds, "noise": noise, "wide": wide,
@@ -594,6 +828,55 @@ def nearest_node(area, lat, lon):
     x, y = gpd.GeoSeries([Point(lon, lat)], crs=4326).to_crs(area["crs"]).iloc[0].coords[0]
     d = (area["xy"][:, 0] - x) ** 2 + (area["xy"][:, 1] - y) ** 2
     return area["node_list"][int(d.argmin())]
+
+
+# ------------------------------------------------------- Wassernähe
+def _water():
+    """Ist die Option „Wassernähe bevorzugen“ aktiv? (wird beim Berechnen aus dem Formular übernommen)"""
+    try:
+        return bool(st.session_state.get("_water", False))
+    except Exception:
+        return False
+
+
+def edge_water(area):
+    """Wasser-Score je Kante: 1 direkt am See/Fluss, linear fallend auf 0 bei WATER_BUF Metern."""
+    if "_w" not in area:
+        dw = area.get("DW")
+        area["_w"] = np.clip(1 - dw / WATER_BUF, 0, 1).mean(axis=0) if dw is not None else None
+    return area["_w"]
+
+
+def edge_green(area, buf, water=None):
+    """Attraktivität je Kante: Grünscore; bei aktiver Wassernähe zählt Wasser genauso (das Bessere gilt)."""
+    g = np.clip(1 - area["D"] / buf, 0, 1).mean(axis=0)
+    if _water() if water is None else water:
+        w = edge_water(area)
+        if w is not None:
+            g = np.maximum(g, w)
+    return g
+
+
+def water_share(area, path):
+    w = edge_water(area)
+    if w is None or len(path) < 2:
+        return 0.0
+    idx = [area["H"][a][b]["i"] for a, b in zip(path[:-1], path[1:])]
+    L = area["lengths"][idx]
+    return float((L * (w[idx] > 0.5)).sum() / max(L.sum(), 1.0))
+
+
+def water_geo(area):
+    if "_wgeo" in area:
+        return area["_wgeo"]
+    geo = None
+    if area.get("water_json"):
+        try:
+            geo = json.loads(area["water_json"])
+        except Exception:
+            geo = None
+    area["_wgeo"] = geo
+    return geo
 
 
 # ------------------------------------------------------- Routing
@@ -716,7 +999,7 @@ def loop_stats(area, g, path):
 def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None):
     """Probiert mehrere Richtungen, passt den Kreisradius an die Wunschlänge an und
     liefert bis zu 3 deutlich verschiedene Varianten (beste zuerst)."""
-    g = np.clip(1 - area["D"] / buf, 0, 1).mean(axis=0)
+    g = edge_green(area, buf)
     ng = node_green(area, g)
     cands = []
     for k in range(LOOP_BEARINGS):
@@ -898,7 +1181,11 @@ body.nav #side{top:calc(var(--top) + 92px)}
 #chips{display:flex;gap:8px;overflow-x:auto;padding-bottom:8px;-webkit-overflow-scrolling:touch}
 .chip{flex:none;border:1px solid var(--line);background:#fff;border-radius:14px;padding:8px 12px;text-align:left;min-width:108px;color:var(--text)}
 .chip b{display:block;font-size:.92rem}.chip span{font-size:.78rem;opacity:.7}
-.chip.on{background:#E7EDDB;border-color:var(--sage)}
+.chip{transition:background .25s,border-color .25s,transform .18s,box-shadow .25s}.chip:active{transform:scale(.95)}
+.chip.on{background:#E7EDDB;border-color:var(--sage);box-shadow:0 3px 10px rgba(78,110,69,.25);transform:translateY(-1px)}
+#stats>div{animation:statpop .55s cubic-bezier(.2,.9,.3,1.2) both}#stats>div:nth-child(2){animation-delay:.07s}#stats>div:nth-child(3){animation-delay:.14s}#stats>div:nth-child(4){animation-delay:.21s}
+@keyframes statpop{from{opacity:0;transform:translateY(10px) scale(.94)}to{opacity:1;transform:none}}
+button{transition:transform .15s,background .25s,box-shadow .25s}button:active{transform:scale(.96)}
 #stats{display:flex;gap:8px;margin:2px 0 6px}
 #stats div{flex:1;background:#F2EDE0;border-radius:12px;padding:6px 8px;min-width:0}
 #stats span{display:block;font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;opacity:.65;white-space:nowrap}
@@ -920,8 +1207,6 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
 .cl{position:absolute;border-radius:50%;filter:blur(30px);background:radial-gradient(closest-side,rgba(255,255,255,.96),rgba(255,255,255,.55) 55%,rgba(255,255,255,0));will-change:transform,opacity;animation:cpart 1.9s .15s cubic-bezier(.45,0,.2,1) forwards}
 @keyframes cbase{to{opacity:0}}
 @keyframes cpart{0%{transform:translate(0,0) scale(1);opacity:1}60%{opacity:.9}100%{transform:translate(var(--dx),var(--dy)) scale(1.9);opacity:0}}
-#map.arrive{animation:czoom 2.2s cubic-bezier(.16,.7,.2,1) both}
-@keyframes czoom{from{transform:scale(1.22)}to{transform:scale(1)}}
 #sheet.arrive,#side.arrive,#banner.arrive{animation:crise .7s 1s cubic-bezier(.2,.8,.2,1) both}
 @keyframes crise{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:none}}
 @media (prefers-reduced-motion:reduce){#clouds{display:none}#map.arrive,.arrive{animation:none!important}}
@@ -956,17 +1241,18 @@ document.documentElement.style.setProperty('--top', TOP + 'px');
   try { seen = sessionStorage.getItem(key) === '1'; sessionStorage.setItem(key, '1'); } catch (e) {}
   const c = $('clouds');
   if (seen) { c.style.display = 'none'; return; }
-  const W = innerWidth, H = innerHeight, N = 9;
+  window.INTRO = true; setTimeout(() => { window.INTRO = false; }, 3600);
+  const W = innerWidth, H = innerHeight, N = 14;
   for (let i = 0; i < N; i++) {
     const d = document.createElement('div'); d.className = 'cl';
     const w = (0.5 + Math.random() * 0.5) * Math.max(W, H) * 0.7, h = w * (0.55 + Math.random() * 0.25);
-    const cx = (i % 3) / 2 * W, cy = Math.floor(i / 3) / 2 * H;  // 3 x 3 Raster, leicht verschoben
+    const cx = (i % 4) / 3 * W, cy = Math.floor(i / 4) / 3 * H;  // 4 x 4 Raster (14 Wolken), leicht verschoben
     d.style.cssText = 'width:' + w + 'px;height:' + h + 'px;left:' + (cx - w / 2 + (Math.random() - .5) * 80) + 'px;top:' + (cy - h / 2 + (Math.random() - .5) * 80) +
-      'px;--dx:' + ((cx - W / 2) * 1.1 + (Math.random() - .5) * 120) + 'px;--dy:' + ((cy - H / 2) * 1.1 + (Math.random() - .5) * 120) + 'px;animation-delay:' + (0.1 + Math.random() * 0.25) + 's';
+      'px;--dx:' + ((cx - W / 2) * 1.1 + (Math.random() - .5) * 120) + 'px;--dy:' + ((cy - H / 2) * 1.1 + (Math.random() - .5) * 120) + 'px;animation-delay:' + (0.05 + Math.random() * 0.5) + 's;animation-duration:' + (1.6 + Math.random() * 0.9) + 's';
     c.appendChild(d);
   }
-  ['map', 'sheet', 'side', 'banner'].forEach(id => $(id).classList.add('arrive'));
-  setTimeout(() => { c.style.display = 'none'; ['map', 'sheet', 'side', 'banner'].forEach(id => $(id).classList.remove('arrive')); }, 2600);
+  ['sheet', 'side', 'banner'].forEach(id => $(id).classList.add('arrive'));
+  setTimeout(() => { c.style.display = 'none'; ['sheet', 'side', 'banner'].forEach(id => $(id).classList.remove('arrive')); }, 3000);
 })();
 const map = L.map('map', {zoomControl: false, zoomAnimation: false, fadeAnimation: false, markerZoomAnimation: false}).setView(D.p1, 15);
 
@@ -1014,6 +1300,9 @@ function setTiles(i, auto) {
 setTiles(0);
 (D.attrib || []).forEach(a => map.attributionControl.addAttribution(a));
 
+if (D.water) {
+  L.geoJSON(D.water, {style: {color: '#7FA8B8', weight: 1.4, fillColor: '#B9D4DE', fillOpacity: .55}, interactive: false}).addTo(map);
+}
 if (D.parks) {
   L.geoJSON(D.parks, {style: {color: '#7C9F69', weight: 1, fillColor: '#B5CDA0', fillOpacity: .5},
     onEachFeature: (f, l) => { if (f.properties && f.properties.name) l.bindTooltip(f.properties.name, {sticky: true}); }}).addTo(map);
@@ -1072,6 +1361,20 @@ function buildList() {
   $('list').innerHTML = h + '<p><button class="sq" id="closelist" style="width:auto;padding:0 18px">Schließen</button></p>';
   $('closelist').addEventListener('click', () => { $('list').style.display = 'none'; });
 }
+let INTRO_DONE = false;
+// Route „zeichnet“ sich von Start bis Ziel (SVG-Strich mit normierter Pfadlänge)
+function drawIn(line, delay) {
+  try {
+    const el = line.getElement(); if (!el || !el.setAttribute) return;
+    el.setAttribute('pathLength', '1000');
+    el.style.transition = 'none'; el.style.strokeDasharray = '1000'; el.style.strokeDashoffset = '1000';
+    void el.getBoundingClientRect();
+    setTimeout(() => {
+      el.style.transition = 'stroke-dashoffset 1.5s cubic-bezier(.45,.05,.25,1)'; el.style.strokeDashoffset = '0';
+      setTimeout(() => { el.style.strokeDasharray = ''; el.style.strokeDashoffset = ''; el.style.transition = ''; }, 1700);
+    }, delay);
+  } catch (e) {}
+}
 function showOption(i, fit) {
   const o = D.options[i];
   cur = i; coords = o.coords; cum = o.cum; steps = o.steps; total = Math.max(o.total, 1);
@@ -1082,7 +1385,8 @@ function showOption(i, fit) {
   const showShort = D.mode === 'ab' && i !== 0;
   if (showShort) add(L.polyline(D.options[0].coords, {color: '#C08A47', weight: 4, opacity: .95, dashArray: '8 8'}));
   add(L.polyline(coords, {color: '#fff', weight: 11, opacity: .9}));
-  add(L.polyline(coords, {color: '#3F6B3A', weight: 7, opacity: 1}));
+  const mainLine = add(L.polyline(coords, {color: '#3F6B3A', weight: 7, opacity: 1}));
+  drawIn(mainLine, (window.INTRO && !INTRO_DONE) ? 1900 : 0);
   done = add(L.polyline([], {color: '#B9C9A8', weight: 7, opacity: 1}));
   steps.forEach((s, k) => { if (k > 0 && k < steps.length - 1)
     add(L.circleMarker([s.lat, s.lon], {radius: 5, color: '#fff', weight: 2, fillColor: '#4E6E45', fillOpacity: 1})); });
@@ -1231,8 +1535,19 @@ window.addEventListener('resize', fix);
 if (window.visualViewport) window.visualViewport.addEventListener('resize', fix);
 if (window.ResizeObserver) new ResizeObserver(fix).observe($('map'));
 showOption(D.default || 0, false);
-setTimeout(() => { fix(); if (!navOn) fitRoute(); }, 150);
-setTimeout(() => { fix(); if (!navOn) fitRoute(); }, 900);
+if (window.INTRO) {
+  // Anflug: erst weit herausgezoomt, dann sanfter Flug auf die Route, während die Wolken aufreißen
+  setTimeout(() => {
+    fix(); fitRoute();
+    const c = map.getCenter(), z = map.getZoom();
+    map.setView(c, Math.max(z - 3, 3), {animate: false});
+    setTimeout(() => { map.flyTo(c, z, {duration: 2.4, easeLinearity: .2}); INTRO_DONE = true; }, 450);
+    setTimeout(() => { fix(); }, 3200);
+  }, 120);
+} else {
+  setTimeout(() => { fix(); if (!navOn) fitRoute(); }, 150);
+  setTimeout(() => { fix(); if (!navOn) fitRoute(); }, 900);
+}
 </script></body></html>
 """
 
@@ -1252,7 +1567,7 @@ def inside(bbox, p, margin=0.002):
 
 def solve_levels(area, o, t, buf):
     """Kürzeste Route + grüne Route je Grünstufe (alle vorab, damit die Karte sofort umschalten kann)."""
-    g = np.clip(1 - area["D"] / buf, 0, 1).mean(axis=0)
+    g = edge_green(area, buf)
     L, H = area["lengths"], area["H"]
     nz = area.get("noise")
     nz = np.zeros(len(L)) if nz is None else nz
@@ -1353,16 +1668,17 @@ def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: 
         options.append(_option(
             nav, name, f"{fmt_km(r['dist'])} · {r['green']:.0%} grün",
             f"{LEVEL_HINT[name]} · Umweg {detour:+.0%}"
-            + (f" · {r['narrow']:.0%} kleine Wege" if LEVELS[name] >= 12 else ""),
+            + (f" · {r['narrow']:.0%} kleine Wege" if LEVELS[name] >= 12 else "")
+            + (f" · {water_share(area, r['path']):.0%} am Wasser" if _water() else ""),
             [["Länge", fmt_km(r["dist"])], ["Dauer", f"{mins} min"],
              ["Grünanteil", f"{r['green']:.0%}"], ["Hauptstraße", f"{r['noise']:.0%}"]]))
     if not options:
         raise ValueError("Start und Ziel liegen zu nah beieinander.")
     default = next((i for i, o_ in enumerate(options) if o_["label"] == "Ausgewogen"), 0)
-    payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=parks_geo(area),
+    payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=parks_geo(area), water=water_geo(area),
                    options=options, default=default, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
-            "start": start_v, "dest": dest_v, "area": area, "bbox": bbox, "buf": buf}
+            "start": start_v, "dest": dest_v, "area": area, "bbox": bbox, "buf": buf, "water": _water()}
 
 
 def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
@@ -1396,17 +1712,18 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
         diff = v["dist"] / target - 1
         options.append(_option(
             nav, f"Variante {i + 1}", f"{fmt_km(v['dist'])} · {v['green']:.0%} grün",
-            f"Wunschlänge {fmt_km(target)} ({diff:+.0%}) · {1 - v['rep']:.0%} ohne Doppelweg",
+            f"Wunschlänge {fmt_km(target)} ({diff:+.0%}) · {1 - v['rep']:.0%} ohne Doppelweg"
+            + (f" · {water_share(area, v['path']):.0%} am Wasser" if _water() else ""),
             [["Länge", fmt_km(v["dist"])], ["Dauer", f"{mins} min"],
              ["Grünanteil", f"{v['green']:.0%}"], ["Hauptstraße", f"{v.get('noise', 0):.0%}"]]))
     if not options:
         raise ValueError("Hier konnte ich keine passende Runde finden. Versuche eine andere Länge "
                          "oder einen anderen Startpunkt.")
-    payload = dict(mode="loop", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=parks_geo(area),
+    payload = dict(mode="loop", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=parks_geo(area), water=water_geo(area),
                    options=options, default=0, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "loop", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
             "start": start_v, "end": end_v, "km": km, "km_ok": km, "level": level, "buf": buf,
-            "area": area, "bbox_km": bbox_km}
+            "area": area, "bbox_km": bbox_km, "water": _water()}
 
 
 # ------------------------------------------------------- Auffangnetz ohne Overpass
@@ -1786,7 +2103,7 @@ def _edt(mask, cell):
 
 
 @st.cache_resource(show_spinner=False, max_entries=2, ttl=3600)
-def scan_area(bbox):
+def scan_area(bbox, water=False):
     """Lädt die Vektorkacheln für das Gebiet und baut die Abstandskarten."""
     if ndimage is None:
         raise RuntimeError("scipy fehlt (requirements.txt aktualisieren)")
@@ -1808,13 +2125,15 @@ def scan_area(bbox):
     cell = max(5.0, math.sqrt(width * height / 2.5e6))
     ncol, nrow = int(math.ceil(width / cell)) + 1, int(math.ceil(height / cell)) + 1
     green = np.zeros((nrow, ncol), dtype=bool)
+    wmask = np.zeros((nrow, ncol), dtype=bool)
+    wgeo = []
     roads = {wt: np.zeros((nrow, ncol), dtype=bool) for wt in sorted(set(ROAD_W.values()))}
     geo, n_green = [], 0
 
     for (tx, ty), data in zip(tiles, datas):
         if not data:
             continue
-        layers = mvt_decode(data, {"landcover", "landuse", "park", "transportation"})
+        layers = mvt_decode(data, {"landcover", "landuse", "park", "transportation", "water", "waterway"})
         for lname, feats in layers.items():
             for extent, gtype, parts, props in feats:
                 cls, sub = props.get("class"), props.get("subclass")
@@ -1837,6 +2156,30 @@ def scan_area(bbox):
                             name = props.get("name") or GREEN_DE.get(sub) or GREEN_DE.get(cls) or "Grünfläche"
                             geo.append({"type": "Feature", "properties": {"name": str(name)},
                                         "geometry": {"type": "Polygon", "coordinates": [ring_ll]}})
+                elif gtype == 3 and lname == "water" and cls != "ocean":
+                    for ring in parts:
+                        if len(ring) < 4:
+                            continue
+                        lon, lat = _tile_lonlat(tx, ty, VT_ZOOM, extent, ring)
+                        X, Y = (lon - lon0) * kx, (lat - lat0) * ky
+                        _fill_ring(wmask, (X - xmin) / cell, (Y - ymin) / cell)
+                        if 0.5 * abs(np.dot(X[:-1], Y[1:]) - np.dot(X[1:], Y[:-1])) >= 400 and len(wgeo) < 600:
+                            step = max(1, len(lon) // 50)
+                            ring_ll = [[round(float(a), 5), round(float(b), 5)] for a, b in zip(lon[::step], lat[::step])]
+                            ring_ll.append(ring_ll[0])
+                            wgeo.append({"type": "Feature", "properties": {},
+                                         "geometry": {"type": "Polygon", "coordinates": [ring_ll]}})
+                elif gtype == 2 and lname == "waterway":
+                    for part in parts:
+                        if len(part) < 2:
+                            continue
+                        lon, lat = _tile_lonlat(tx, ty, VT_ZOOM, extent, part)
+                        X, Y = (lon - lon0) * kx, (lat - lat0) * ky
+                        _draw_line(wmask, (X - xmin) / cell, (Y - ymin) / cell)
+                        if len(wgeo) < 600:
+                            wgeo.append({"type": "Feature", "properties": {}, "geometry": {
+                                "type": "LineString", "coordinates": [[round(float(a), 5), round(float(b), 5)]
+                                                                      for a, b in zip(lon[::2], lat[::2])]}})
                 elif gtype == 2 and lname == "transportation" and cls in ROAD_W:
                     for part in parts:
                         if len(part) < 2:
@@ -1845,6 +2188,8 @@ def scan_area(bbox):
                         X, Y = (lon - lon0) * kx, (lat - lat0) * ky
                         _draw_line(roads[ROAD_W[cls]], (X - xmin) / cell, (Y - ymin) / cell)
 
+    if water:
+        green |= wmask  # Wassernähe bevorzugt: Wasser zählt wie Grün (Abstand, Zielpunkte, Bewertung)
     gdist = _edt(green, cell)
     depth = (ndimage.distance_transform_edt(green) * cell).astype(np.float32) if green.any() \
         else np.zeros(green.shape, dtype=np.float32)
@@ -1857,6 +2202,7 @@ def scan_area(bbox):
     return {"lat0": lat0, "lon0": lon0, "kx": kx, "ky": ky, "xmin": xmin, "ymin": ymin, "cell": cell,
             "gdist": gdist, "depth": depth, "noise": noise, "lab": lab, "sizes": sizes,
             "geo": {"type": "FeatureCollection", "features": geo} if geo else None,
+            "wgeo": {"type": "FeatureCollection", "features": wgeo} if wgeo else None,
             "n_green": n_green, "green_share": float(green.mean())}
 
 
@@ -2116,7 +2462,7 @@ def scan_ab_view(start_v, dest_v, buf=150, log=lambda *_: None):
                          f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
     log("🛰️ Grün-Scan: Grünflächen und Hauptstraßen aus Kartenkacheln laden")
     t0 = time.time()
-    sa = scan_area(bbox)
+    sa = scan_area(bbox, _water())
     log(f"✅ {sa['n_green']} Grünflächen erkannt, {sa['green_share']:.0%} des Gebiets grün "
         f"({time.time() - t0:.0f} s)")
     log("🧭 Wegvarianten vergleichen (direkt, durch Parks, seitliche Umwege)")
@@ -2147,10 +2493,10 @@ def scan_ab_view(start_v, dest_v, buf=150, log=lambda *_: None):
         raise ValueError("Start und Ziel liegen zu nah beieinander.")
     order = list(LEVELS)
     default = min(range(len(options)), key=lambda i: abs(order.index(options[i]["label"]) - 2))
-    payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=sa["geo"],
+    payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=sa["geo"], water=sa.get("wgeo"),
                    options=options, default=default, speed=M_PER_MIN, topPad=TOP_PAD, attrib=SCAN_ATTRIB)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
-            "start": start_v, "dest": dest_v, "area": None, "bbox": None, "buf": buf, "fallback": "scan"}
+            "start": start_v, "dest": dest_v, "area": None, "bbox": None, "buf": buf, "fallback": "scan", "water": _water()}
 
 
 def scan_loop_view(start_v, end_v, km, level, buf=150, log=lambda *_: None, progress=None):
@@ -2167,7 +2513,7 @@ def scan_loop_view(start_v, end_v, km, level, buf=150, log=lambda *_: None, prog
         raise ValueError("Start und Ende liegen zu weit auseinander für diese Länge.")
     log("🛰️ Grün-Scan: Grünflächen und Hauptstraßen aus Kartenkacheln laden")
     t0 = time.time()
-    sa = scan_area(loop_bbox(p1, p2, target))
+    sa = scan_area(loop_bbox(p1, p2, target), _water())
     log(f"✅ {sa['n_green']} Grünflächen erkannt, {sa['green_share']:.0%} des Gebiets grün "
         f"({time.time() - t0:.0f} s)")
     log("🔄 Runden in verschiedene Richtungen probieren (ca. 10 s)")
@@ -2205,11 +2551,11 @@ def scan_loop_view(start_v, end_v, km, level, buf=150, log=lambda *_: None, prog
             f"Wunschlänge {fmt_km(target)} ({diff:+.0%}) · {1 - c['rep']:.0%} ohne Doppelweg · {SCAN_NOTE}", c))
     if not options:
         raise ValueError("Für diesen Startpunkt habe ich keine Runde gefunden.")
-    payload = dict(mode="loop", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=sa["geo"],
+    payload = dict(mode="loop", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=sa["geo"], water=sa.get("wgeo"),
                    options=options, default=0, speed=M_PER_MIN, topPad=TOP_PAD, attrib=SCAN_ATTRIB)
     return {"mode": "loop", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
             "start": start_v, "end": end_v, "km": km, "km_ok": km, "level": level, "buf": buf,
-            "area": None, "bbox_km": None, "fallback": "scan"}
+            "area": None, "bbox_km": None, "fallback": "scan", "water": _water()}
 
 
 def make_loop_view_safe(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
@@ -2338,12 +2684,14 @@ def tour_extra_variants(area, g, lam, mu, wq, nodes, extra_m):
     return picked
 
 
-def _tour_payload(mode_extra, p1, pe, t1, t2, stops, options, parks, default, attrib=None):
+def _tour_payload(mode_extra, p1, pe, t1, t2, stops, options, parks, default, attrib=None, water=None):
     payload = dict(mode="tour", p1=list(p1), p2=list(pe), t1=t1, t2=t2, parks=parks, options=options,
                    default=default, speed=M_PER_MIN, topPad=TOP_PAD,
                    stops=[[a, b, _short(lab)] for a, b, lab in stops])
     if attrib:
         payload["attrib"] = attrib
+    if water:
+        payload["water"] = water
     return payload
 
 
@@ -2361,7 +2709,7 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
     nodes = [nearest_node(area, *p) for p in pts]
     if len(set(nodes)) < 2:
         raise ValueError("Start und Zwischenziele liegen zu nah beieinander.")
-    g = np.clip(1 - area["D"] / buf, 0, 1).mean(axis=0)
+    g = edge_green(area, buf)
     log("🧭 Runde mit Zwischenzielen berechnen")
     loop = pts[0] == pts[-1]
     title = " → ".join(names)
@@ -2401,16 +2749,18 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
         mins = max(1, round(dist / M_PER_MIN))
         options.append(_option(
             nav, name, f"{fmt_km(dist)} · {green:.0%} grün",
-            f"{pre}{1 - rep:.0%} ohne Doppelweg" + (f" · {narrow:.0%} kleine Wege" if LEVELS[level if extra_m > 0 else name] >= 12 else ""),
+            f"{pre}{1 - rep:.0%} ohne Doppelweg" + (f" · {narrow:.0%} kleine Wege" if LEVELS[level if extra_m > 0 else name] >= 12 else "")
+            + (f" · {water_share(area, path):.0%} am Wasser" if _water() else ""),
             [["Länge", fmt_km(dist)], ["Dauer", f"{mins} min"], ["Grünanteil", f"{green:.0%}"],
              ["Hauptstraße", f"{noise:.0%}"]]))
     if not options:
         raise ValueError("Ich konnte keine Runde mit diesen Zwischenzielen finden.")
     default = next((i for i, o_ in enumerate(options) if o_["label"] == level), 0)
-    payload = _tour_payload(None, pts[0], pts[-1], names[0], names[-1], stops, options, parks_geo(area), default)
+    payload = _tour_payload(None, pts[0], pts[-1], names[0], names[-1], stops, options, parks_geo(area), default,
+                            water=water_geo(area))
     return {"mode": "tour", "html": map_html(payload), "p1": pts[0], "p2": pts[-1], "t1": names[0],
             "t2": names[-1], "stops": names[1:-1], "start": start_v, "buf": buf, "stops_v": list(stops_v),
-            "end_v": end_v, "level": level, "extra_km": extra_km}
+            "end_v": end_v, "level": level, "extra_km": extra_km, "water": _water()}
 
 
 def _merge_routes(routes):
@@ -2497,7 +2847,7 @@ def scan_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
         raise ValueError(f"Die Punkte liegen {span / 1000:.1f} km auseinander. "
                          f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
     log("🛰️ Grün-Scan: Grünflächen und Hauptstraßen aus Kartenkacheln laden")
-    sa = scan_area(bbox)
+    sa = scan_area(bbox, _water())
     legs = []
     for k, (a, b) in enumerate(zip(pts[:-1], pts[1:])):
         log(f"🧭 Teilstrecke {k + 1} von {len(pts) - 1} prüfen")
@@ -2561,10 +2911,10 @@ def scan_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
         raise ValueError("Ich konnte keine Runde mit diesen Zwischenzielen finden.")
     default = next((i for i, o_ in enumerate(options) if o_["label"] == level), 0)
     payload = _tour_payload(None, pts[0], pts[-1], names[0], names[-1], stops, options, sa["geo"], default,
-                            attrib=SCAN_ATTRIB)
+                            attrib=SCAN_ATTRIB, water=sa.get("wgeo"))
     return {"mode": "tour", "html": map_html(payload), "p1": pts[0], "p2": pts[-1], "t1": names[0],
             "t2": names[-1], "stops": names[1:-1], "start": start_v, "buf": buf, "fallback": "scan",
-            "stops_v": list(stops_v), "end_v": end_v, "level": level, "extra_km": extra_km}
+            "stops_v": list(stops_v), "end_v": end_v, "level": level, "extra_km": extra_km, "water": _water()}
 
 
 def make_tour_view_safe(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None, extra_km=0):
@@ -2595,21 +2945,30 @@ LOGO_SVG = (
     'stroke-width="17" stroke-linecap="round" stroke-dasharray="1 33"/>'
     '<circle cx="358" cy="156" r="21" fill="#B07A35"/></g></svg>'
 )
-ICON_JS = """<script>(function(){try{var P=window.parent,d=P.document,h=d.head;
-function put(fav,touch){
+ICON_JS = """<script>(function(){
+var FAV='data:image/png;base64,__FAV__',TOUCH='data:image/png;base64,__TOUCH__',TITLE='Green-Walker';
+function docs(){var r=[],w=window;for(var k=0;k<6;k++){try{r.push(w.document)}catch(e){break}
+ if(w.parent===w)break;w=w.parent}return r}
+function patch(fav,touch){docs().forEach(function(d){try{var h=d.head;
  d.querySelectorAll('link[rel*="icon"]').forEach(function(e){e.remove()});
- function L(r,u,s){var l=d.createElement('link');l.rel=r;l.href=u;l.sizes=s;h.appendChild(l)}
- L('icon',fav,'64x64');L('apple-touch-icon',touch,'180x180')}
-put('data:image/png;base64,__FAV__','data:image/png;base64,__TOUCH__');
-var m=d.querySelector('meta[name="apple-mobile-web-app-title"]');
-if(!m){m=d.createElement('meta');m.name='apple-mobile-web-app-title';h.appendChild(m)}
-m.content='Green-Walker';
-/* Echte Dateien aus dem Ordner static/ bevorzugen (iOS liest sie zuverlässiger als eingebettete Daten) */
-var base=P.location.origin+'/app/static/';
-fetch(base+'apple-touch-icon.png',{method:'HEAD'}).then(function(r){
- if(r.ok&&/image/.test(r.headers.get('content-type')||''))put(base+'favicon.png',base+'apple-touch-icon.png')
-}).catch(function(){})
-}catch(e){}})();</script>"""
+ [['icon',fav,'64x64'],['shortcut icon',fav,'64x64'],['apple-touch-icon',touch,'180x180']].forEach(function(a){
+  var l=d.createElement('link');l.rel=a[0];l.href=a[1];l.sizes=a[2];h.appendChild(l)});
+ if(d.title!==TITLE)d.title=TITLE;
+ [['apple-mobile-web-app-title',TITLE],['application-name',TITLE],['apple-mobile-web-app-capable','yes']].forEach(function(a){
+  var m=d.querySelector('meta[name="'+a[0]+'"]');if(!m){m=d.createElement('meta');m.name=a[0];h.appendChild(m)}m.content=a[1]})
+ }catch(e){}})}
+var cur=[FAV,TOUCH];
+patch(FAV,TOUCH);
+/* Echte Dateien aus static/ bevorzugen (iOS liest sie zuverlässiger als eingebettete Daten) */
+try{var P=window.parent,base=P.location.origin+P.location.pathname.replace(/[^/]*$/,'')+'app/static/';
+ fetch(base+'apple-touch-icon.png',{method:'HEAD'}).then(function(r){
+  if(r.ok&&/image/.test(r.headers.get('content-type')||'')){cur=[base+'favicon.png',base+'apple-touch-icon.png'];patch(cur[0],cur[1])}
+ }).catch(function(){})}catch(e){}
+/* Der Host (Streamlit-Rahmen) setzt Titel und Ikon gern nachträglich zurück: mehrfach erneut setzen */
+[800,2500,6000,12000].forEach(function(t){setTimeout(function(){patch(cur[0],cur[1])},t)});
+try{var T=window.parent.document.querySelector('title');
+ if(T)new MutationObserver(function(){if(window.parent.document.title!==TITLE)window.parent.document.title=TITLE}).observe(T,{childList:true})}catch(e){}
+})();</script>"""
 
 
 def page_icon():
@@ -2674,8 +3033,65 @@ html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp 
  color:var(--text);background:#fff;border:1px solid var(--line)}
 .stTabs [aria-selected="true"]{background:#E7EDDB;border-color:var(--sage);color:var(--text);box-shadow:none}
 .stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"]{display:none}
+/* Bewegung: Karten gleiten ein, Bedienelemente reagieren weich */
+@keyframes gwrise{from{opacity:0;transform:translateY(16px) scale(.985)}to{opacity:1;transform:none}}
+.st-key-card_route,.st-key-card_loop,.st-key-card_tour{animation:gwrise .55s cubic-bezier(.2,.8,.2,1) both}
+.hero{animation:gwrise .6s cubic-bezier(.2,.8,.2,1) both}
+.stButton button,[data-testid="stButtonGroup"] button{transition:transform .15s,background .25s,border-color .25s,box-shadow .25s}
+.stButton button:active,[data-testid="stButtonGroup"] button:active{transform:scale(.97)}
+.stButton button[kind="primary"]:hover{box-shadow:0 6px 18px rgba(78,110,69,.4);transform:translateY(-1px)}
+[data-testid="stToggle"],[data-testid="stCheckbox"]{transition:opacity .2s}
+@media (prefers-reduced-motion:reduce){.st-key-card_route,.st-key-card_loop,.st-key-card_tour,.hero{animation:none}}
 </style>
 """
+
+
+# Ladeansicht beim Berechnen: Wolken ziehen, Logo atmet, Sprüche wechseln. Gleiche Farbe wie die Wolkendecke der
+# Karte, damit der Übergang ohne Bruch in die Kartenansicht läuft.
+OVERLAY_HTML = """
+<style>
+#gwload{position:fixed;inset:0;z-index:99999;background:#F4EFE6;display:flex;flex-direction:column;align-items:center;
+ justify-content:center;gap:18px;animation:gwfade .35s ease both;overflow:hidden;font-family:system-ui,-apple-system,sans-serif}
+@keyframes gwfade{from{opacity:0}to{opacity:1}}
+#gwload .b{position:absolute;border-radius:50%;filter:blur(34px);background:radial-gradient(closest-side,rgba(255,255,255,.95),rgba(255,255,255,.5) 55%,rgba(255,255,255,0));
+ animation:gwdrift 9s ease-in-out infinite alternate}
+#gwload .b:nth-child(1){width:70vmax;height:44vmax;left:-20vmax;top:-8vmax}
+#gwload .b:nth-child(2){width:60vmax;height:38vmax;right:-18vmax;top:22vh;animation-duration:12s;animation-delay:-3s}
+#gwload .b:nth-child(3){width:66vmax;height:40vmax;left:-12vmax;bottom:-12vmax;animation-duration:10s;animation-delay:-5s}
+#gwload .b:nth-child(4){width:48vmax;height:30vmax;right:4vmax;bottom:4vh;animation-duration:14s;animation-delay:-8s}
+@keyframes gwdrift{from{transform:translate(-4vw,0) scale(1)}to{transform:translate(6vw,3vh) scale(1.12)}}
+#gwload .logo{position:relative;width:84px;height:84px;border-radius:24px;background:#4E6E45;display:flex;align-items:center;justify-content:center;
+ box-shadow:0 10px 30px rgba(60,50,30,.3);animation:gwbreath 2.2s ease-in-out infinite}
+#gwload .logo img{width:54px;height:54px}
+#gwload .logo:before{content:"";position:absolute;inset:-10px;border-radius:32px;border:2px solid rgba(78,110,69,.35);animation:gwring 2.2s ease-out infinite}
+@keyframes gwbreath{50%{transform:scale(1.07)}}
+@keyframes gwring{from{opacity:.9;transform:scale(.92)}to{opacity:0;transform:scale(1.35)}}
+#gwload .t{position:relative;height:1.5em;width:min(86vw,360px);text-align:center;color:#3B3A33;font-weight:600;font-size:1.02rem}
+#gwload .t span{position:absolute;left:0;right:0;opacity:0;animation:gwtxt 10s infinite}
+#gwload .t span:nth-child(2){animation-delay:2.5s}#gwload .t span:nth-child(3){animation-delay:5s}#gwload .t span:nth-child(4){animation-delay:7.5s}
+@keyframes gwtxt{0%{opacity:0;transform:translateY(8px)}4%,22%{opacity:1;transform:none}26%,100%{opacity:0;transform:translateY(-8px)}}
+#gwload .bar{position:relative;width:min(60vw,220px);height:4px;border-radius:4px;background:rgba(78,110,69,.18);overflow:hidden}
+#gwload .bar:after{content:"";position:absolute;inset:0;width:40%;border-radius:4px;background:#4E6E45;animation:gwslide 1.5s ease-in-out infinite}
+@keyframes gwslide{from{transform:translateX(-110%)}to{transform:translateX(280%)}}
+@media (prefers-reduced-motion:reduce){#gwload *{animation-duration:0s!important}#gwload .t span:first-child{opacity:1}}
+</style>
+<div id="gwload"><i class="b"></i><i class="b"></i><i class="b"></i><i class="b"></i>
+<div class="logo"><img src="data:image/svg+xml;base64,__LOGO__" alt=""></div>
+<div class="t"><span>Ich suche den grünsten Weg …</span><span>Parks und Grünflächen werden geprüft …</span><span>Hauptstraßen werden umgangen …</span><span>Gleich geht es los …</span></div>
+<div class="bar"></div></div>
+"""
+
+
+def loading_overlay():
+    """Vollbild-Ladeansicht; gibt den Platzhalter zurück (mit .empty() entfernen, z. B. bei Fehlern)."""
+    ph = st.empty()
+    try:
+        logo = base64.b64encode(LOGO_SVG.encode()).decode()
+        ph.markdown(OVERLAY_HTML.replace("__LOGO__", logo), unsafe_allow_html=True)
+    except Exception:
+        pass
+    return ph
+
 
 # Nur in der Kartenansicht: Karte füllt den ganzen Bildschirm, Suchleiste schwebt darüber.
 MAP_CSS = """
@@ -2849,6 +3265,7 @@ def render_map_view():
     gw = st.session_state["gw"]
     st.markdown(MAP_CSS, unsafe_allow_html=True)
     st.session_state["bias"] = gw["p1"]
+    st.session_state["_water"] = bool(gw.get("water", False))
     dest_new = add_new = None
     with st.container(key="gwtop"):
         if gw["mode"] == "ab":
@@ -2948,6 +3365,8 @@ def home_route():
         start_v = start_input("Start", "start_sb")
         ziel_v = place_input("Ziel", "ziel_sb")
         st.caption(SEARCH_TIP)
+        water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_route", value=False,
+                             help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         go = st.button("Route finden", type="primary", use_container_width=True, key="go_ab")
     if not go:
         return
@@ -2955,6 +3374,8 @@ def home_route():
         st.warning("Bitte Start und Ziel jeweils aus den Vorschlägen auswählen.")
         return
     view = None
+    st.session_state["_water"] = bool(water_on)
+    ov = loading_overlay()
     with st.status("Route wird vorbereitet …", expanded=True) as status:
         try:
             view = make_ab_view_safe(start_v, ziel_v, log=st.write)
@@ -2965,6 +3386,7 @@ def home_route():
     if view:
         open_map(view)
         st.rerun()
+    ov.empty()
 
 
 def home_loop():
@@ -2980,6 +3402,8 @@ def home_loop():
                     unsafe_allow_html=True)
         level = st.select_slider("Wie grün soll es sein?", options=list(LEVELS), value="Sehr grün",
                                  key="level_loop")
+        water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_loop", value=False,
+                             help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         go = st.button("Ründchen finden", type="primary", use_container_width=True, key="go_loop")
     if not go:
         return
@@ -2987,6 +3411,7 @@ def home_loop():
         st.warning("Bitte Start" + ("" if same else " und Ende") + " aus den Vorschlägen auswählen.")
         return
     view, holder = None, {}
+    st.session_state["_water"] = bool(water_on)
 
     def prog(f):
         txt = "🔄 Runden in verschiedene Richtungen probieren …"
@@ -2994,6 +3419,7 @@ def home_loop():
             holder["bar"] = st.progress(0.0, text=txt)
         holder["bar"].progress(min(f, 1.0), text=txt)
 
+    ov = loading_overlay()
     with st.status("Ründchen wird gesucht …", expanded=True) as status:
         try:
             view = make_loop_view_safe(a_v, None if same else b_v, km, level, log=st.write, progress=prog)
@@ -3006,6 +3432,7 @@ def home_loop():
     if view:
         open_map(view)
         st.rerun()
+    ov.empty()
 
 
 def _more_stops(d):
@@ -3033,6 +3460,8 @@ def home_tour():
                                  key="tour_extra", help="Verlängert die Runde um diese Strecke, zusätzlich zum Weg über die Zwischenziele.")
         extra_km = 0 if extra_opt == "Keine" else int(extra_opt.replace("+", "").replace("km", "").strip())
         level = st.select_slider("Wie grün soll es sein?", options=TOUR_LEVELS, value="Sehr grün", key="level_tour")
+        water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_tour", value=False,
+                             help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         go = st.button("Ründchen mit Zwischenziel finden", type="primary", use_container_width=True, key="go_tour")
     if not go:
         return
@@ -3040,6 +3469,8 @@ def home_tour():
         st.warning("Bitte Start, alle Zwischenziele" + ("" if same else " und Endpunkt") + " aus den Vorschlägen auswählen.")
         return
     view = None
+    st.session_state["_water"] = bool(water_on)
+    ov = loading_overlay()
     with st.status("Runde mit Zwischenzielen wird berechnet …", expanded=True) as status:
         try:
             view = make_tour_view_safe(a_v, stops, None if same else b_v, level, log=st.write, extra_km=extra_km)
@@ -3050,6 +3481,7 @@ def home_tour():
     if view:
         open_map(view)
         st.rerun()
+    ov.empty()
 
 
 def render_home():
