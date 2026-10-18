@@ -146,13 +146,14 @@ MAX_SPAN_M = 9000
 M_PER_MIN = 80
 
 LEVELS = {"Schnellste": 0.0, "Leicht grün": 1.0, "Ausgewogen": 3.0,
-          "Sehr grün": 6.0, "Maximal grün": 12.0}
+          "Sehr grün": 6.0, "Maximal grün": 12.0, "Grünster Umweg": 40.0}
 LEVEL_HINT = {
     "Schnellste": "Nur die Distanz zählt.",
     "Leicht grün": "Kleine Umwege für spürbar mehr Grün.",
     "Ausgewogen": "Guter Mittelweg aus Weg und Grün.",
     "Sehr grün": "Deutliche Umwege sind okay, wenn es grüner wird.",
     "Maximal grün": "Grün hat klar Vorrang vor der Länge.",
+    "Grünster Umweg": "Auch große Umwege, solange der Grünanteil steigt.",
 }
 
 
@@ -205,7 +206,7 @@ STATION_TAGS = ["railway:station", "railway:halt", "public_transport:station"]
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _photon(q, blat, blon, tag=None):
-    params = {"q": q, "limit": 8, "lang": "de"}
+    params = {"q": q, "limit": 12, "lang": "de"}
     if blat is not None:
         params.update(lat=blat, lon=blon)
     if tag:
@@ -274,7 +275,20 @@ def search_places(term):
             out = _nominatim(term)
         except Exception:
             out = []
+    if bias and out:
+        # nahe Treffer zuerst: aufsteigend nach Entfernung vom Standort bzw. Startpunkt
+        def dist_of(item):
+            la, lo, _ = _unpack(item[1])
+            return dist_m((bias[0], bias[1]), (la, lo))
+        out.sort(key=dist_of)
+        out = [(f"{lab}  ·  {_fmt_dist(dist_of((lab, val)))}", val) for lab, val in out]
     return out[:8]
+
+
+def _fmt_dist(m):
+    if m < 950:
+        return f"{round(m / 10) * 10:.0f} m" if m >= 100 else f"{max(round(m / 5) * 5, 5):.0f} m"
+    return f"{m / 1000:.1f} km".replace(".", ",") if m < 20_000 else f"{m / 1000:.0f} km"
 
 
 # ------------------------------------------------------- Daten
@@ -283,7 +297,7 @@ def corridor_bbox(p1, p2):
     ky = 111_320.0
     kx = ky * math.cos(math.radians((lat1 + lat2) / 2))
     span = max(abs(lon2 - lon1) * kx, abs(lat2 - lat1) * ky)
-    pad = max(500.0, 0.25 * span)
+    pad = max(700.0, 0.4 * span)  # Platz für große Umwege
     bbox = (round(min(lon1, lon2) - pad / kx, 4), round(min(lat1, lat2) - pad / ky, 4),
             round(max(lon1, lon2) + pad / kx, 4), round(max(lat1, lat2) + pad / ky, 4))
     return bbox, span
@@ -1180,6 +1194,20 @@ def solve_levels(area, o, t, buf):
     short = run(lambda u, v, d: L[d["i"]])
     out = []
     for name, lam in LEVELS.items():
+        if lam >= 30:
+            # „Grünster Umweg“: darf deutlich länger sein, aber nicht ausufern und muss wirklich grüner sein
+            best = max((r_ for _, r_ in out), key=lambda r_: r_["green"])
+            r = None
+            for lam_try in (lam, lam / 2, lam / 4):
+                cand = run(lambda u, v, d, lam=lam_try: L[d["i"]] * (
+                    1 + lam_try * (1 - g[d["i"]]) + QUIET * nz[d["i"]]))
+                if cand["dist"] <= 3.0 * short["dist"] + 600:
+                    r = cand
+                    break
+            if r is None or r["path"] == best["path"] or r["green"] < best["green"] + 0.01:
+                continue
+            out.append((name, r))
+            continue
         r = short if lam == 0 else run(lambda u, v, d, lam=lam: L[d["i"]] * (
             1 + lam * (1 - g[d["i"]]) + QUIET * nz[d["i"]]))
         out.append((name, r))
@@ -1793,7 +1821,7 @@ def scan_score(sa, coords, buf):
     return {"dist": total, "green": float(g.mean()), "noise": float(nz.mean()), "rep": rep / n}
 
 
-def _green_targets(sa, A, B, k=4):
+def _green_targets(sa, A, B, k=4, slack=1.0):
     """Grünflächen nahe der Luftlinie A-B. Je Fläche ein Eingang (Seite von A) und ein Ausgang
     (Seite von B) im Inneren, damit die Route durch den Park führt statt nur am Rand vorbei."""
     D = math.hypot(B[0] - A[0], B[1] - A[1])
@@ -1807,7 +1835,7 @@ def _green_targets(sa, A, B, k=4):
     X = sa["xmin"] + (c + 0.5) * sa["cell"]
     Y = sa["ymin"] + (r + 0.5) * sa["cell"]
     dA, dB = np.hypot(X - A[0], Y - A[1]), np.hypot(X - B[0], Y - B[1])
-    keep = dA + dB - D <= 0.6 * D + 300
+    keep = dA + dB - D <= (0.6 * D + 300) * slack
     if not keep.any():
         return []
     X, Y, dA, dB = X[keep], Y[keep], dA[keep], dB[keep]
@@ -1819,7 +1847,7 @@ def _green_targets(sa, A, B, k=4):
     ia, ib = oa[fa], ob[fb]
     inner = np.hypot(X[ia] - X[ib], Y[ia] - Y[ib])
     detour = dA[ia] + inner + dB[ib] - D
-    ok = detour <= 0.7 * D + 300
+    ok = detour <= (0.7 * D + 300) * slack
     score = np.sqrt(sa["sizes"][ul]) / (1.0 + detour / (0.25 * D + 150)) \
         * (1.0 + 0.5 * np.minimum(inner / (0.3 * D + 50), 1.0))
     score[~ok] = -1
@@ -1916,6 +1944,13 @@ def scan_ab_candidates(sa, p1, p2, log=lambda *_: None):
         nx_, ny_ = -(B[1] - A[1]) / D, (B[0] - A[0]) / D
         for sgn in (1, -1):
             x, y = _snap_green(sa, mx + sgn * 0.3 * D * nx_, my + sgn * 0.3 * D * ny_, 0.2 * D + 80)
+            vias.append([_to_ll(sa, x, y)])
+    # große Umwege für „Grünster Umweg“: weiter entfernte Parks und breitere Ausschläge zur Seite
+    for via in _green_targets(sa, A, B, k=3, slack=3.0):
+        vias.append([_to_ll(sa, x, y) for x, y in via])
+    if D > 150:
+        for sgn in (1, -1):
+            x, y = _snap_green(sa, mx + sgn * 0.7 * D * nx_, my + sgn * 0.7 * D * ny_, 0.35 * D + 120)
             vias.append([_to_ll(sa, x, y)])
     log(f"🌳 {len(vias)} grüne Umwege werden geprüft")
     for via in vias:
@@ -2016,9 +2051,10 @@ def scan_ab_view(start_v, dest_v, buf=150, log=lambda *_: None):
     options, used = [], set()
     for name, lam in LEVELS.items():
         mu = QUIET if lam > 0 else 0.0
-        j = min(range(len(scored)), key=lambda i: scored[i][1]["dist"] * (
+        pool = [i for i in range(len(scored)) if lam < 30 or scored[i][1]["dist"] <= 3.0 * short + 600]
+        j = min(pool, key=lambda i: scored[i][1]["dist"] * (
             1 + lam * (1 - scored[i][1]["green"]) + mu * scored[i][1]["noise"]))
-        if j in used:
+        if j in used or (lam >= 30 and scored[j][1]["green"] < max(scored[u][1]["green"] for u in used) + 0.01):
             continue
         used.add(j)
         rt, sc = scored[j]
@@ -2220,7 +2256,7 @@ def reverse_name(lat, lon):
 
 def start_input(label, key):
     """Startpunkt: per Suche oder per Standortfreigabe des Browsers (Schalter)."""
-    use = st.toggle("📍 Meinen aktuellen Standort verwenden", key=f"{key}_useloc",
+    use = st.toggle("📍 Von meinem Standort starten", key=f"{key}_useloc", value=True,
                     help="Der Browser fragt nach der Standortfreigabe. Der Standort wird nur für die Suche genutzt.")
     if not use:
         v = place_input(label, key)
@@ -2236,7 +2272,10 @@ def start_input(label, key):
             st.warning("Der Standort ist nicht verfügbar. Bitte die Freigabe im Browser erlauben "
                        "(Schloss-Symbol in der Adressleiste) und den Schalter erneut setzen, "
                        "oder den Startpunkt über die Suche eingeben.")
-            return None
+            v = place_input(label, key)
+            if v:
+                st.session_state["bias"] = _unpack(v)[:2]
+            return v
         c = raw.get("coords") if isinstance(raw, dict) else None
         if not c or c.get("latitude") is None:
             st.info("📡 Standort wird ermittelt … bitte im Browser die Freigabe erlauben.")
