@@ -12,10 +12,12 @@ Kosten: kosten(kante) = laenge * (1 + LAMBDA * (1 - gruen(kante)))
 Grün:   Mittel über 8 Abtastpunkte je Kante; 1.0 im Park, linear fallend
         auf 0 im Abstand "Grün-Reichweite".
 """
+import json
 import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from html import escape
 
 import folium
 import geopandas as gpd
@@ -94,6 +96,21 @@ def ensure_theme():
 
 
 ensure_theme()
+
+KIND_DE = {"footway": "Fußweg", "path": "Pfad", "pedestrian": "Fußgängerzone", "steps": "Treppe",
+           "cycleway": "Radweg", "track": "Feldweg", "service": "Zufahrtsweg"}
+
+
+def edge_label(d):
+    """(Straßenname, Wegart) einer Kante, jeweils '' wenn unbekannt."""
+    n = d.get("name")
+    if isinstance(n, (list, tuple)):
+        n = n[0] if n else None
+    hw = d.get("highway")
+    if isinstance(hw, (list, tuple)):
+        hw = hw[0] if hw else None
+    return (str(n) if n else ""), KIND_DE.get(hw, "")
+
 
 SAMPLES = 8
 MAX_BUF = 400
@@ -288,9 +305,11 @@ def load_area(bbox):
     best = {}
     for u, v, d in G.edges(data=True):
         if (u, v) not in best or d["length"] < best[(u, v)][0]:
-            best[(u, v)] = (d["length"], d.get("geometry") or LineString([pos[u], pos[v]]))
+            best[(u, v)] = (d["length"], d.get("geometry") or LineString([pos[u], pos[v]]), *edge_label(d))
     keys = list(best)
     lengths = np.array([best[k][0] for k in keys], dtype=float)
+    names = [best[k][2] for k in keys]
+    kinds = [best[k][3] for k in keys]
     lines = np.empty(len(keys), dtype=object)
     for i, k in enumerate(keys):
         lines[i] = best[k][1]
@@ -319,6 +338,7 @@ def load_area(bbox):
     return {"crs": crs, "pos": pos, "H": H, "lengths": lengths, "lines": lines, "D": D,
             "node_list": node_list, "xy": np.array([pos[n] for n in node_list]),
             "eu": np.array([nidx[u] for u, v in keys]), "ev": np.array([nidx[v] for u, v in keys]),
+            "names": names, "kinds": kinds,
             "parks_json": parks_json, "n_parks": n_parks, "n_edges": len(keys)}
 
 
@@ -345,17 +365,8 @@ def solve(area, o, t, lam, buf):
 
 
 def route_latlon(area, path):
-    coords = []
-    for a, b in zip(path[:-1], path[1:]):
-        c = list(area["lines"][area["H"][a][b]["i"]].coords)
-        pa = area["pos"][a]
-        if math.dist(c[0], pa) > math.dist(c[-1], pa):
-            c.reverse()
-        coords += c
-    if len(coords) < 2:
-        coords = [area["pos"][path[0]]] * 2
-    ll = gpd.GeoSeries([LineString(coords)], crs=area["crs"]).to_crs(4326).iloc[0]
-    return [(y, x) for x, y in ll.coords]
+    coords, _ = route_geom(area, path)
+    return to_latlon(area, coords)
 
 
 def _pin(emoji):
@@ -599,6 +610,326 @@ def build_loop_map(area, variants, sel, p1, p2, t1, t2):
     return _finish_map(m, pts, LEGEND_LOOP)
 
 
+# ------------------------------------------------------- Navigation
+COMPASS = ["Norden", "Nordosten", "Osten", "Südosten", "Süden", "Südwesten", "Westen", "Nordwesten"]
+NAV_H = 640
+
+
+def route_geom(area, path):
+    """Routenlinie in Projektion (Meter) + Index jedes Pfadknotens in dieser Linie."""
+    coords, node_idx = [], [0]
+    for a, b in zip(path[:-1], path[1:]):
+        c = list(area["lines"][area["H"][a][b]["i"]].coords)
+        if math.dist(c[0], area["pos"][a]) > math.dist(c[-1], area["pos"][a]):
+            c.reverse()
+        coords += c if not coords else c[1:]
+        node_idx.append(len(coords) - 1)
+    if len(coords) < 2:
+        coords = [area["pos"][path[0]]] * 2
+        node_idx = [0] * len(path)
+    return coords, node_idx
+
+
+def to_latlon(area, coords):
+    ll = gpd.GeoSeries([LineString(coords)], crs=area["crs"]).to_crs(4326).iloc[0]
+    return [(y, x) for x, y in ll.coords]
+
+
+def _bearing(p, q):
+    return math.degrees(math.atan2(q[0] - p[0], q[1] - p[1])) % 360
+
+
+def _back(cum, idx, dmin=15.0):
+    j = idx
+    while j > 0 and cum[idx] - cum[j] < dmin:
+        j -= 1
+    return j
+
+
+def _fwd(cum, idx, dmin=15.0):
+    j = idx
+    while j < len(cum) - 1 and cum[j] - cum[idx] < dmin:
+        j += 1
+    return j
+
+
+def maneuvers(area, path, coords, node_idx, cum, loop=False):
+    """Wegehinweise: Start, Abbiegungen (>= 30 Grad), Straßenwechsel an Kreuzungen, Ziel."""
+    H = area["H"]
+
+    def label(a, b):
+        i = H[a][b]["i"]
+        return area["names"][i], area["kinds"][i]
+
+    def on(a, b):
+        n, k = label(a, b)
+        return n or k
+
+    steps = []
+    f0 = _fwd(cum, 0)
+    b0 = _bearing(coords[0], coords[f0]) if f0 > 0 else 0.0
+    first = on(path[0], path[1])
+    steps.append({"idx": 0, "i": "🚶", "t": f"Los geht’s Richtung {COMPASS[int(round(b0 / 45)) % 8]}"
+                                            + (f" auf {first}" if first else "")})
+    for n in range(1, len(path) - 1):
+        a, c, d = path[n - 1], path[n], path[n + 1]
+        idx = node_idx[n]
+        bi, fo = _back(cum, idx), _fwd(cum, idx)
+        if bi == idx or fo == idx:
+            continue
+        din = _bearing(coords[bi], coords[idx])
+        dout = _bearing(coords[idx], coords[fo])
+        delta = ((dout - din + 540) % 360) - 180  # > 0: rechts
+        mag, side = abs(delta), ("rechts" if delta > 0 else "links")
+        target = on(c, d)
+        suffix = f" auf {target}" if target else ""
+        if mag < 30:
+            na, nb = label(a, c)[0], label(c, d)[0]
+            deg = len(set(H.successors(c)) | set(H.predecessors(c)))
+            if na and nb and na != nb and deg >= 3:
+                steps.append({"idx": idx, "i": "⬆", "t": f"Weiter geradeaus auf {nb}"})
+            continue
+        if mag < 60:
+            text, icon = f"Halb {side} abbiegen{suffix}", ("↗" if delta > 0 else "↖")
+        elif mag < 120:
+            text, icon = f"{side.capitalize()} abbiegen{suffix}", ("↱" if delta > 0 else "↰")
+        elif mag < 165:
+            text, icon = f"Scharf {side} abbiegen{suffix}", ("↱" if delta > 0 else "↰")
+        else:
+            text, icon = "Wenden", "↩"
+        steps.append({"idx": idx, "i": icon, "t": text})
+    steps.append({"idx": node_idx[-1], "i": "🏁",
+                  "t": "Ründchen geschafft, Ziel erreicht" if loop else "Du hast dein Ziel erreicht"})
+    return steps
+
+
+def build_nav(area, path, title, loop=False):
+    if len(path) < 2:
+        return None
+    coords, node_idx = route_geom(area, path)
+    cum = [0.0]
+    for p, q in zip(coords[:-1], coords[1:]):
+        cum.append(cum[-1] + math.dist(p, q))
+    if cum[-1] < 5:
+        return None
+    ll = to_latlon(area, coords)
+    steps = maneuvers(area, path, coords, node_idx, cum, loop)
+    return {
+        "title": title, "total": round(cum[-1]),
+        "coords": [[round(la, 6), round(lo, 6)] for la, lo in ll],
+        "cum": [round(c, 1) for c in cum],
+        "steps": [{"d": round(cum[s["idx"]]), "lat": round(ll[s["idx"]][0], 6),
+                   "lon": round(ll[s["idx"]][1], 6), "t": s["t"], "i": s["i"]} for s in steps],
+    }
+
+
+NAV_TEMPLATE = r"""<!DOCTYPE html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#3B3A33;background:transparent}
+#app{height:100%;display:flex;flex-direction:column;border-radius:16px;overflow:hidden;background:#F4EFE6;border:1px solid #D9CFBC}
+#banner{background:#4E6E45;color:#FBF7EE;padding:10px 14px;display:flex;gap:12px;align-items:center;min-height:76px}
+#banner.off{background:#B07A35}#banner.done{background:#3F5B3A}
+#ico{font-size:38px;line-height:1;width:48px;text-align:center;flex:none}
+#dist{font-size:1.5rem;font-weight:700;line-height:1.1}
+#ins{font-size:1rem;margin-top:2px;opacity:.96}
+#mapwrap{position:relative;flex:1;min-height:180px}
+#map{position:absolute;top:0;left:0;right:0;bottom:0}
+#start{position:absolute;z-index:1000;left:50%;bottom:20px;transform:translateX(-50%);padding:14px 26px;font-size:1.05rem;
+ border-radius:14px;border:0;background:#5E7F52;color:#FBF7EE;font-weight:700;box-shadow:0 4px 14px rgba(60,50,30,.35)}
+#list{position:absolute;z-index:1001;top:0;left:0;right:0;bottom:0;background:rgba(244,239,230,.98);overflow:auto;padding:12px 14px;display:none}
+.row{display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid #DDD3BF}
+.ri{font-size:22px;width:30px;text-align:center;flex:none}.rt{flex:1}.rd{opacity:.65;font-size:.85rem;white-space:nowrap}
+#bar{padding:8px 14px 10px;background:#E9E1D2;font-size:.95rem;font-weight:600}
+#prog{height:6px;border-radius:4px;background:#D6CBB4;overflow:hidden;margin-top:6px}
+#prog>div{height:100%;width:0;background:linear-gradient(90deg,#9DB38A,#4E6E45)}
+#ctrl{display:flex;gap:8px;padding:8px 10px;background:#F4EFE6}
+button.b{flex:1;border:1px solid #CFC4AB;background:#FBF8F1;color:#3B3A33;border-radius:12px;padding:10px 4px;font-size:.9rem;font-weight:600;cursor:pointer}
+button.b.on{background:#E7EDDB;border-color:#9DB38A}
+</style></head><body>
+<div id="app">
+ <div id="banner"><div id="ico">🧭</div><div><div id="dist"></div><div id="ins"></div></div></div>
+ <div id="mapwrap"><div id="map"></div><button id="start">▶ Navigation starten</button><div id="list"></div></div>
+ <div id="bar"><span id="rem"></span><div id="prog"><div></div></div></div>
+ <div id="ctrl">
+  <button class="b on" id="vbtn">🔊 Ansage</button><button class="b on" id="fbtn">🎯 Folgen</button>
+  <button class="b" id="lbtn">📋 Liste</button><button class="b" id="demo">▶ Demo</button>
+ </div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script>
+const D = __DATA__;
+const $ = id => document.getElementById(id);
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const WALK = 80;
+const lat0 = D.coords[0][0], lon0 = D.coords[0][1];
+const kx = Math.cos(lat0 * Math.PI / 180) * 111320, ky = 110540;
+const toXY = (la, lo) => [(lo - lon0) * kx, (la - lat0) * ky];
+const P = D.coords.map(c => toXY(c[0], c[1]));
+const cum = D.cum, total = D.total, steps = D.steps;
+
+const map = L.map('map', {zoomControl: false}).setView(D.coords[0], 16);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
+  {maxZoom: 19, subdomains: 'abcd', attribution: '© OpenStreetMap © CARTO'}).addTo(map);
+const base = L.polyline(D.coords, {color: '#fff', weight: 11, opacity: .9}).addTo(map);
+L.polyline(D.coords, {color: '#3F6B3A', weight: 7, opacity: 1}).addTo(map);
+const done = L.polyline([], {color: '#B9C9A8', weight: 7, opacity: 1}).addTo(map);
+steps.forEach((s, i) => { if (i > 0 && i < steps.length - 1)
+  L.circleMarker([s.lat, s.lon], {radius: 5, color: '#fff', weight: 2, fillColor: '#4E6E45', fillOpacity: 1}).addTo(map); });
+const pin = e => L.divIcon({html: '<div style="font-size:28px;line-height:28px;filter:drop-shadow(0 2px 3px rgba(0,0,0,.4))">' + e + '</div>',
+  className: '', iconSize: [30, 30], iconAnchor: [15, 26]});
+L.marker(D.coords[0], {icon: pin('🚶')}).addTo(map);
+L.marker(D.coords[D.coords.length - 1], {icon: pin('🏁')}).addTo(map);
+map.fitBounds(base.getBounds(), {padding: [30, 30]});
+const userDot = L.circleMarker([lat0, lon0], {radius: 9, color: '#fff', weight: 3, fillColor: '#2F6F8F', fillOpacity: 1});
+const userAcc = L.circle([lat0, lon0], {radius: 10, color: '#2F6F8F', weight: 1, fillColor: '#2F6F8F', fillOpacity: .12});
+
+let along = 0, lastIdx = 0, offCount = 0, finished = false, follow = true, lastPos = null,
+    said = {}, voice = true, started = false, watchId = null, sim = null, hadFix = false;
+
+function fmt(m) {
+  if (m >= 1000) return (m / 1000).toFixed(1).replace('.', ',') + ' km';
+  const r = m > 100 ? 10 : 5; return Math.max(0, Math.round(m / r) * r) + ' m';
+}
+function eta(rem) {
+  return new Date(Date.now() + rem / WALK * 60000).toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'});
+}
+function banner(cls, ico, dist, ins) {
+  $('banner').className = cls; $('ico').textContent = ico; $('dist').textContent = dist; $('ins').textContent = ins;
+}
+function say(t) {
+  if (!voice || !('speechSynthesis' in window)) return;
+  try { const u = new SpeechSynthesisUtterance(t); u.lang = 'de-DE'; speechSynthesis.cancel(); speechSynthesis.speak(u); } catch (e) {}
+}
+function snap(xy, from, windowed) {
+  let best = null;
+  const lo = windowed ? Math.max(0, from - 5) : 0, hi = windowed ? Math.min(P.length - 1, from + 80) : P.length - 1;
+  for (let i = lo; i < hi; i++) {
+    const a = P[i], b = P[i + 1], dx = b[0] - a[0], dy = b[1] - a[1], l2 = dx * dx + dy * dy;
+    let t = l2 > 0 ? ((xy[0] - a[0]) * dx + (xy[1] - a[1]) * dy) / l2 : 0; t = Math.max(0, Math.min(1, t));
+    const d = Math.hypot(xy[0] - (a[0] + t * dx), xy[1] - (a[1] + t * dy));
+    if (!best || d < best.off) best = {i: i, off: d, along: cum[i] + t * Math.sqrt(l2)};
+  }
+  return best || {i: 0, off: 0, along: 0};
+}
+function finish() {
+  finished = true; stopWatch();
+  banner('done', '🏁', 'Geschafft!', steps[steps.length - 1].t); say(steps[steps.length - 1].t);
+  $('rem').textContent = 'Ziel erreicht'; $('prog').firstElementChild.style.width = '100%';
+}
+function onFix(lat, lon, acc) {
+  if (finished) return;
+  lastPos = [lat, lon];
+  const xy = toXY(lat, lon);
+  let s = snap(xy, lastIdx, true);
+  if (s.off > 60) { const g = snap(xy, 0, false); if (g.off < s.off) s = g; }
+  lastIdx = s.i; along = s.along;
+  userDot.setLatLng(lastPos); userAcc.setLatLng(lastPos); userAcc.setRadius(acc || 10);
+  if (!map.hasLayer(userDot)) { userAcc.addTo(map); userDot.addTo(map); }
+  done.setLatLngs(D.coords.slice(0, lastIdx + 1));
+  const limit = Math.max(35, (acc || 0) * 1.5);
+  if (s.off > limit) offCount = hadFix ? offCount + 1 : 3; else offCount = 0;
+  hadFix = true;
+  const rem = Math.max(0, total - along);
+  $('rem').textContent = fmt(rem) + ' · ' + Math.max(1, Math.round(rem / WALK)) + ' min · Ankunft ' + eta(rem);
+  $('prog').firstElementChild.style.width = Math.min(100, 100 * along / total) + '%';
+  if (rem < 20 && along > total * 0.5) { finish(); return; }
+  if (offCount >= 3) {
+    if (along < 15) banner('off', '🚶', fmt(Math.hypot(xy[0] - P[0][0], xy[1] - P[0][1])), 'bis zum Startpunkt der Route');
+    else {
+      banner('off', '⚠️', fmt(s.off), 'Abseits der Route. Bitte zurück zur grünen Linie gehen.');
+      if (!said.off) { said.off = 1; say('Du bist von der Route abgekommen.'); }
+    }
+  } else {
+    said.off = 0;
+    if (along < 12) {
+      banner('', steps[0].i, 'Start', steps[0].t);
+      if (!said.s0) { said.s0 = 1; say(steps[0].t); }
+    } else {
+      let k = steps.findIndex(t => t.d > along + 8); if (k < 0) k = steps.length - 1;
+      const st = steps[k], dd = Math.max(0, st.d - along);
+      banner('', st.i, fmt(dd), st.t);
+      if (dd <= 70 && !said[k + 'a']) { said[k + 'a'] = 1; say('In ' + (Math.round(dd / 10) * 10) + ' Metern: ' + st.t); }
+      if (dd <= 18 && !said[k + 'b']) { said[k + 'b'] = 1; say(st.t); }
+    }
+  }
+  if (follow) map.setView(lastPos, Math.max(map.getZoom(), 17), {animate: true});
+}
+function begin() {
+  if (started) return; started = true; $('start').style.display = 'none';
+  try { if (navigator.wakeLock) navigator.wakeLock.request('screen').catch(() => {}); } catch (e) {}
+  say('Navigation gestartet.');
+  banner('', '📡', '…', 'Standort wird gesucht');
+}
+function startNav() {
+  begin();
+  if (!navigator.geolocation) { banner('off', '📡', 'Kein GPS', 'Dieses Gerät unterstützt keine Standortabfrage.'); return; }
+  watchId = navigator.geolocation.watchPosition(
+    p => onFix(p.coords.latitude, p.coords.longitude, p.coords.accuracy),
+    err => {
+      if (err.code === 1) banner('off', '🔒', 'Standort blockiert', 'Bitte den Standortzugriff für diese Seite erlauben und neu starten.');
+      else banner('off', '📡', 'Kein GPS-Signal', 'Warte auf Standort …');
+    }, {enableHighAccuracy: true, maximumAge: 1000, timeout: 20000});
+}
+function stopWatch() { if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; } }
+function pointAt(s) {
+  let i = 0; while (i < cum.length - 2 && cum[i + 1] < s) i++;
+  const l = (cum[i + 1] - cum[i]) || 1, t = Math.min(1, Math.max(0, (s - cum[i]) / l));
+  const a = D.coords[i], b = D.coords[i + 1];
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+}
+function toggleDemo() {
+  if (sim) { clearInterval(sim); sim = null; $('demo').textContent = '▶ Demo'; return; }
+  stopWatch(); begin(); finished = false; said = {}; hadFix = false; lastIdx = 0;
+  $('demo').textContent = '⏸ Demo'; let s = 0;
+  sim = setInterval(() => {
+    s = Math.min(total, s + 10); const p = pointAt(s); onFix(p[0], p[1], 5);
+    if (s >= total || finished) { clearInterval(sim); sim = null; $('demo').textContent = '▶ Demo'; }
+  }, 500);
+}
+function buildList() {
+  let h = '<div style="font-weight:700;margin-bottom:6px">Anweisungen</div>';
+  steps.forEach((s, i) => { h += '<div class="row"><span class="ri">' + s.i + '</span><span class="rt">' + esc(s.t) +
+    '</span><span class="rd">' + (i === 0 ? 'Start' : 'bei ' + fmt(s.d)) + '</span></div>'; });
+  $('list').innerHTML = h + '<p><button class="b" id="closelist">Schließen</button></p>';
+  $('closelist').addEventListener('click', () => { $('list').style.display = 'none'; });
+}
+buildList();
+$('start').addEventListener('click', startNav);
+$('demo').addEventListener('click', toggleDemo);
+$('lbtn').addEventListener('click', () => { $('list').style.display = 'block'; });
+$('vbtn').addEventListener('click', () => {
+  voice = !voice; $('vbtn').textContent = voice ? '🔊 Ansage' : '🔇 Stumm'; $('vbtn').classList.toggle('on', voice);
+  if (!voice && 'speechSynthesis' in window) speechSynthesis.cancel();
+});
+$('fbtn').addEventListener('click', () => {
+  follow = true; $('fbtn').classList.add('on'); if (lastPos) map.setView(lastPos, Math.max(map.getZoom(), 17), {animate: true});
+});
+map.on('dragstart', () => { follow = false; $('fbtn').classList.remove('on'); });
+banner('', '🧭', fmt(total), D.title);
+$('rem').textContent = 'Gesamt ' + fmt(total) + ' · ca. ' + Math.max(1, Math.round(total / WALK)) + ' min';
+</script></body></html>"""
+
+
+def nav_html(payload):
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    return NAV_TEMPLATE.replace("__DATA__", data)
+
+
+def render_nav(nav):
+    p = nav["payload"]
+    if st.button("⏹ Navigation beenden", key="nav_stop", use_container_width=True):
+        st.session_state.pop("nav", None)
+        st.rerun()
+    st.markdown(f'<div class="trip"><span class="pill">🧭 {escape(p["title"])}</span>'
+                f'<span class="pill">{fmt_m(p["total"])} m</span></div>', unsafe_allow_html=True)
+    st_html(nav_html(p), height=NAV_H)
+    st.caption("Tippe auf „Navigation starten“ und erlaube den Standort. Display anlassen, die Ansagen "
+               "kommen per Sprachausgabe. Zum Ausprobieren am Computer gibt es den Demo-Knopf.")
+
+
 # ------------------------------------------------------- UI
 st.set_page_config(page_title="Green-Walker", page_icon="🌳", layout="centered")
 st.markdown(
@@ -627,12 +958,13 @@ h1,h2,h3,h4{font-family:Georgia,"Iowan Old Style","Palatino Linotype",serif;lett
 .stButton>button[kind="primary"]:hover{background:#4E6E45;border-color:#4E6E45;color:#FBF7EE}
 .stTabs [data-baseweb="tab"]{font-weight:600;font-size:1.02rem}
 iframe{border-radius:16px}
-</style>
-<div class="hero"><h1>🌳 Green-Walker</h1>
-<p>Der schönere Weg zu Fuß: vorbei an Parks und Grün statt nur auf kürzester Strecke.</p></div>
-""",
+</style>""",
     unsafe_allow_html=True,
 )
+if not st.session_state.get("nav"):
+    st.markdown('<div class="hero"><h1>🌳 Green-Walker</h1>'
+                '<p>Der schönere Weg zu Fuß: vorbei an Parks und Grün statt nur auf kürzester Strecke.</p></div>',
+                unsafe_allow_html=True)
 
 PLACEHOLDER = "Straße, Adresse, Café, Restaurant, Geschäft …"
 SEARCH_TIP = ("Tipp: Tippe mindestens 3 Buchstaben, dann erscheinen Vorschläge. "
@@ -783,6 +1115,13 @@ def render_ab():
                 unsafe_allow_html=True)
     k3.markdown(card("Umweg", f"{detour:+.0%}",
                      f'kürzeste: {fmt_m(s["dist"])} m · {s["green"]:.0%} grün'), unsafe_allow_html=True)
+    if st.button("▶ Navigation starten", type="primary", use_container_width=True, key="nav_ab"):
+        payload = build_nav(area, g["path"], f'{ctx["t1"]} → {ctx["t2"]}')
+        if payload:
+            st.session_state["nav"] = {"payload": payload}
+            st.rerun()
+        else:
+            st.warning("Für diese Route ist keine Navigation möglich.")
     st.write("")
     m = build_map(area, res, ctx["p1"], ctx["p2"], ctx["t1"], ctx["t2"])
     st_html(m._repr_html_(), height=580)
@@ -890,6 +1229,13 @@ def render_loop():
                 unsafe_allow_html=True)
     k3.markdown(card("Dauer", f'{max(1, round(v["dist"] / M_PER_MIN))} min',
                      f'{1 - v["rep"]:.0%} ohne Doppelweg'), unsafe_allow_html=True)
+    if st.button("▶ Navigation starten", type="primary", use_container_width=True, key="nav_loop"):
+        payload = build_nav(area, v["path"], f'Ründchen · {v["dist"] / 1000:.1f} km'.replace(".", ","), loop=True)
+        if payload:
+            st.session_state["nav"] = {"payload": payload}
+            st.rerun()
+        else:
+            st.warning("Für dieses Ründchen ist keine Navigation möglich.")
     st.write("")
     m = build_loop_map(area, variants, sel, lc["p1"], lc["p2"], lc["t1"], lc["t2"])
     st_html(m._repr_html_(), height=580)
@@ -899,6 +1245,10 @@ def render_loop():
                     f"auf die Wunschlänge angepasst (±{LOOP_TOLERANCE:.0%}); schon gelaufene Wegstücke "
                     f"kosten ×{LOOP_REUSE_PENALTY:g}; Ranking: Grünanteil minus Doppelweg minus Längenabweichung")
 
+
+if st.session_state.get("nav"):
+    render_nav(st.session_state["nav"])
+    st.stop()
 
 tab_ab, tab_loop = st.tabs(["🧭 Route", "🔄 Ründchen"])
 with tab_ab:
