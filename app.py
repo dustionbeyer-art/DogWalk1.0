@@ -19,7 +19,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from html import escape
 
-import folium
 import geopandas as gpd
 import networkx as nx
 import numpy as np
@@ -27,7 +26,6 @@ import osmnx as ox
 import requests
 import shapely
 import streamlit as st
-from folium.plugins import AntPath, Fullscreen, LocateControl
 from shapely import STRtree
 from shapely.geometry import LineString, Point
 from streamlit.components.v1 import html as st_html
@@ -255,7 +253,7 @@ def corridor_bbox(p1, p2):
     ky = 111_320.0
     kx = ky * math.cos(math.radians((lat1 + lat2) / 2))
     span = max(abs(lon2 - lon1) * kx, abs(lat2 - lat1) * ky)
-    pad = max(350.0, 0.25 * span)
+    pad = max(600.0, 0.3 * span)
     bbox = (round(min(lon1, lon2) - pad / kx, 4), round(min(lat1, lat2) - pad / ky, 4),
             round(max(lon1, lon2) + pad / kx, 4), round(max(lat1, lat2) + pad / ky, 4))
     return bbox, span
@@ -362,97 +360,6 @@ def solve(area, o, t, lam, buf):
         share = float((L[idx] * g[idx]).sum() / dist) if dist > 0 else 0.0
         out[name] = {"path": path, "dist": dist, "green": share}
     return out
-
-
-def route_latlon(area, path):
-    coords, _ = route_geom(area, path)
-    return to_latlon(area, coords)
-
-
-def _pin(emoji):
-    return folium.DivIcon(
-        html=f'<div style="font-size:30px;line-height:30px;text-align:center;'
-             f'filter:drop-shadow(0 2px 3px rgba(0,0,0,.45))">{emoji}</div>',
-        icon_size=(32, 32), icon_anchor=(16, 28))
-
-
-def _popup(title, r):
-    mins = max(1, round(r["dist"] / M_PER_MIN))
-    return folium.Popup(f"<b>{title}</b><br>{r['dist']:,.0f} m · ca. {mins} min<br>"
-                        f"{r['green']:.0%} Grünanteil".replace(",", "."), max_width=220)
-
-
-def _legend(items):
-    rows = "".join(f'<div>{sw}{txt}</div>' for sw, txt in items)
-    return ('<div style="position:fixed;bottom:24px;left:12px;z-index:9999;background:rgba(251,248,241,.96);'
-            'padding:10px 14px;border-radius:12px;box-shadow:0 2px 10px rgba(60,50,30,.25);'
-            f'font:13px/1.7 system-ui,-apple-system,sans-serif;color:{C_TEXT}">{rows}</div>')
-
-
-def _line_sw(color, dashed=False):
-    st_ = f"border-top:3px dashed {color}" if dashed else f"height:5px;background:{color};border-radius:3px"
-    return f'<span style="display:inline-block;width:24px;{st_};vertical-align:middle;margin-right:8px"></span>'
-
-
-PARK_SW = (f'<span style="display:inline-block;width:14px;height:14px;background:{C_PARK_FILL};'
-           f'border:1px solid {C_PARK_LINE};border-radius:4px;vertical-align:middle;margin-right:10px"></span>')
-LEGEND_AB = _legend([(_line_sw(C_ROUTE), "Grüne Route"), (_line_sw(C_SHORT, True), "Kürzeste Route"),
-                     (PARK_SW, "Park / Grünfläche")])
-LEGEND_LOOP = _legend([(_line_sw(C_ROUTE), "Ründchen"), (_line_sw(C_STONE, True), "Andere Varianten (Ebenen-Menü)"),
-                       (PARK_SW, "Park / Grünfläche")])
-
-
-def _base_map(area):
-    m = folium.Map(tiles=None, control_scale=True, zoom_control=True)
-    folium.TileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
-                     name="Karte", attr="© OpenStreetMap-Mitwirkende © CARTO",
-                     subdomains="abcd", max_zoom=19).add_to(m)
-    folium.TileLayer("CartoDB positron", name="Hell").add_to(m)
-    folium.TileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", name="Gelände",
-                     attr="© OpenStreetMap-Mitwirkende, SRTM | © OpenTopoMap (CC-BY-SA)",
-                     subdomains="abc", max_zoom=17).add_to(m)
-    folium.TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-                     name="Satellit", attr="Esri, Maxar, Earthstar Geographics", max_zoom=19).add_to(m)
-    if area["parks_json"]:
-        folium.GeoJson(
-            area["parks_json"], name="Grünflächen",
-            style_function=lambda _: {"color": C_PARK_LINE, "fillColor": C_PARK_FILL,
-                                      "fillOpacity": 0.5, "weight": 1},
-            highlight_function=lambda _: {"fillOpacity": 0.75, "weight": 2},
-            tooltip=folium.GeoJsonTooltip(fields=["name"], aliases=["🌳"], labels=True),
-        ).add_to(m)
-    return m
-
-
-def _finish_map(m, pts, legend):
-    Fullscreen(position="topright", title="Vollbild", title_cancel="Beenden").add_to(m)
-    LocateControl(auto_start=False, strings={"title": "Mein Standort"}).add_to(m)
-    folium.LayerControl(collapsed=True, position="topright").add_to(m)
-    m.get_root().html.add_child(folium.Element(legend))
-    m.fit_bounds([[min(p[0] for p in pts), min(p[1] for p in pts)],
-                  [max(p[0] for p in pts), max(p[1] for p in pts)]], padding=(40, 40))
-    return m
-
-
-def _draw_green(m, pts, title, res):
-    """Gemeinsamer Stil für die grüne Hauptroute (Route und Ründchen)."""
-    fg = folium.FeatureGroup(name=title).add_to(m)
-    folium.PolyLine(pts, color="#FFFFFF", weight=11, opacity=0.9).add_to(fg)  # helle Kontur
-    AntPath(pts, color=C_ROUTE, pulse_color=C_PULSE, weight=7, delay=1600,
-            dash_array=[18, 28], opacity=1, popup=_popup(title, res)).add_to(fg)
-
-
-def build_map(area, res, p1, p2, t1, t2):
-    m = _base_map(area)
-    short = route_latlon(area, res["short"]["path"])
-    green = route_latlon(area, res["green"]["path"])
-    fs = folium.FeatureGroup(name="Kürzeste Route").add_to(m)
-    folium.PolyLine(short, color=C_SHORT, weight=4, opacity=0.95, dash_array="8 8",
-                    popup=_popup("Kürzeste Route", res["short"])).add_to(fs)
-    _draw_green(m, green, "Grüne Route", res["green"])
-    folium.Marker(p1, icon=_pin("🚶"), tooltip=f"Start: {t1}").add_to(m)
-    folium.Marker(p2, icon=_pin("🏁"), tooltip=f"Ziel: {t2}").add_to(m)
-    return _finish_map(m, short + green, LEGEND_AB)
 
 
 # ------------------------------------------------------- Ründchen
@@ -593,26 +500,8 @@ def find_loops(area, o, t, target, lam, buf, progress=None):
     return picked
 
 
-def build_loop_map(area, variants, sel, p1, p2, t1, t2):
-    m = _base_map(area)
-    others = folium.FeatureGroup(name="Andere Varianten", show=False).add_to(m)
-    for i, v in enumerate(variants):
-        if i != sel:
-            folium.PolyLine(route_latlon(area, v["path"]), color=C_STONE, weight=4, opacity=0.9,
-                            dash_array="6 8", tooltip=f"Variante {i + 1}").add_to(others)
-    v = variants[sel]
-    pts = route_latlon(area, v["path"])
-    _draw_green(m, pts, f"Ründchen (Variante {sel + 1})", v)
-    same = p1 == p2
-    folium.Marker(p1, icon=_pin("🚶"), tooltip=f"Start{' & Ziel' if same else ''}: {t1}").add_to(m)
-    if not same:
-        folium.Marker(p2, icon=_pin("🏁"), tooltip=f"Ziel: {t2}").add_to(m)
-    return _finish_map(m, pts, LEGEND_LOOP)
-
-
 # ------------------------------------------------------- Navigation
 COMPASS = ["Norden", "Nordosten", "Osten", "Südosten", "Süden", "Südwesten", "Westen", "Nordwesten"]
-NAV_H = 640
 
 
 def route_geom(area, path):
@@ -723,86 +612,150 @@ def build_nav(area, path, title, loop=False):
     }
 
 
-NAV_TEMPLATE = r"""<!DOCTYPE html><html lang="de"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+MAP_TEMPLATE = r"""<!DOCTYPE html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
 <style>
+:root{--top:0px;--moss:#4E6E45;--sage:#9DB38A;--sand:#E9E1D2;--paper:#FBF8F1;--line:#D9CFBC;--text:#3B3A33}
 *{box-sizing:border-box}
-html,body{margin:0;height:100%;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#3B3A33;background:transparent}
-#app{height:100%;display:flex;flex-direction:column;border-radius:16px;overflow:hidden;background:#F4EFE6;border:1px solid #D9CFBC}
-#banner{background:#4E6E45;color:#FBF7EE;padding:10px 14px;display:flex;gap:12px;align-items:center;min-height:76px}
+html,body{margin:0;height:100%;overflow:hidden;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--text);background:var(--sand);-webkit-tap-highlight-color:transparent}
+#map{position:fixed;top:0;left:0;right:0;bottom:0;z-index:0}
+.leaflet-container{background:#E9E1D2}
+button{font-family:inherit;cursor:pointer}
+#banner{position:fixed;z-index:1000;top:calc(var(--top) + 8px);left:10px;right:10px;max-width:620px;margin:0 auto;display:none;gap:12px;align-items:center;background:var(--moss);color:#FBF7EE;border-radius:16px;padding:10px 14px;box-shadow:0 6px 18px rgba(60,50,30,.3)}
+body.nav #banner{display:flex}
 #banner.off{background:#B07A35}#banner.done{background:#3F5B3A}
-#ico{font-size:38px;line-height:1;width:48px;text-align:center;flex:none}
+#ico{font-size:36px;line-height:1;width:46px;text-align:center;flex:none}
 #dist{font-size:1.5rem;font-weight:700;line-height:1.1}
-#ins{font-size:1rem;margin-top:2px;opacity:.96}
-#mapwrap{position:relative;flex:1;min-height:180px}
-#map{position:absolute;top:0;left:0;right:0;bottom:0}
-#start{position:absolute;z-index:1000;left:50%;bottom:20px;transform:translateX(-50%);padding:14px 26px;font-size:1.05rem;
- border-radius:14px;border:0;background:#5E7F52;color:#FBF7EE;font-weight:700;box-shadow:0 4px 14px rgba(60,50,30,.35)}
-#list{position:absolute;z-index:1001;top:0;left:0;right:0;bottom:0;background:rgba(244,239,230,.98);overflow:auto;padding:12px 14px;display:none}
-.row{display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid #DDD3BF}
-.ri{font-size:22px;width:30px;text-align:center;flex:none}.rt{flex:1}.rd{opacity:.65;font-size:.85rem;white-space:nowrap}
-#bar{padding:8px 14px 10px;background:#E9E1D2;font-size:.95rem;font-weight:600}
-#prog{height:6px;border-radius:4px;background:#D6CBB4;overflow:hidden;margin-top:6px}
+#ins{font-size:1rem;margin-top:2px}
+#side{position:fixed;z-index:1000;right:10px;top:calc(var(--top) + 8px);display:flex;flex-direction:column;gap:8px}
+body.nav #side{top:calc(var(--top) + 92px)}
+#side button{width:44px;height:44px;border-radius:12px;border:1px solid var(--line);background:var(--paper);font-size:20px;box-shadow:0 3px 10px rgba(60,50,30,.25)}
+#sheet{position:fixed;z-index:1000;left:10px;right:10px;bottom:10px;max-width:620px;margin:0 auto;background:rgba(251,248,241,.98);border:1px solid var(--line);border-radius:20px;padding:12px;box-shadow:0 8px 28px rgba(60,50,30,.3)}
+#ttl{font-size:.85rem;opacity:.75;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#chips{display:flex;gap:8px;overflow-x:auto;padding-bottom:8px;-webkit-overflow-scrolling:touch}
+.chip{flex:none;border:1px solid var(--line);background:#fff;border-radius:14px;padding:8px 12px;text-align:left;min-width:108px;color:var(--text)}
+.chip b{display:block;font-size:.92rem}.chip span{font-size:.78rem;opacity:.7}
+.chip.on{background:#E7EDDB;border-color:var(--sage)}
+#stats{display:flex;gap:8px;margin:2px 0 6px}
+#stats div{flex:1;background:#F2EDE0;border-radius:12px;padding:6px 8px;min-width:0}
+#stats span{display:block;font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;opacity:.65;white-space:nowrap}
+#stats b{font-size:1.05rem}
+#hint{font-size:.8rem;opacity:.7;min-height:1em}
+#navbox{display:none}
+body.nav #navbox{display:block}body.nav #pre{display:none}
+#rem{font-weight:600;font-size:.98rem}
+#prog{height:7px;border-radius:5px;background:#DDD3BF;overflow:hidden;margin-top:6px}
 #prog>div{height:100%;width:0;background:linear-gradient(90deg,#9DB38A,#4E6E45)}
-#ctrl{display:flex;gap:8px;padding:8px 10px;background:#F4EFE6}
-button.b{flex:1;border:1px solid #CFC4AB;background:#FBF8F1;color:#3B3A33;border-radius:12px;padding:10px 4px;font-size:.9rem;font-weight:600;cursor:pointer}
-button.b.on{background:#E7EDDB;border-color:#9DB38A}
+#btns{display:flex;gap:8px;margin-top:8px}
+#go{flex:1;height:48px;border:0;border-radius:14px;background:#5E7F52;color:#FBF7EE;font-size:1rem;font-weight:700}
+.sq{width:48px;height:48px;border-radius:14px;border:1px solid var(--line);background:#fff;font-size:20px}
+.sq.on{background:#E7EDDB;border-color:var(--sage)}
+#vbtn,#fbtn{display:none}body.nav #vbtn,body.nav #fbtn{display:block}
+#list{position:fixed;z-index:1100;top:calc(var(--top) + 8px);left:10px;right:10px;bottom:10px;max-width:620px;margin:0 auto;background:var(--paper);border:1px solid var(--line);border-radius:20px;overflow:auto;padding:12px 14px;display:none;box-shadow:0 8px 28px rgba(60,50,30,.3)}
+.row{display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid #E4DBC8}
+.ri{font-size:22px;width:30px;text-align:center;flex:none}.rt{flex:1}.rd{opacity:.65;font-size:.85rem;white-space:nowrap}
 </style></head><body>
-<div id="app">
- <div id="banner"><div id="ico">🧭</div><div><div id="dist"></div><div id="ins"></div></div></div>
- <div id="mapwrap"><div id="map"></div><button id="start">▶ Navigation starten</button><div id="list"></div></div>
- <div id="bar"><span id="rem"></span><div id="prog"><div></div></div></div>
- <div id="ctrl">
-  <button class="b on" id="vbtn">🔊 Ansage</button><button class="b on" id="fbtn">🎯 Folgen</button>
-  <button class="b" id="lbtn">📋 Liste</button><button class="b" id="demo">▶ Demo</button>
- </div>
+<div id="map"></div>
+<div id="banner"><div id="ico">🧭</div><div><div id="dist"></div><div id="ins"></div></div></div>
+<div id="side"><button id="layers" title="Kartenstil wechseln">🗺️</button><button id="fit" title="Ganze Route zeigen">⤢</button></div>
+<div id="sheet">
+ <div id="ttl"></div>
+ <div id="pre"><div id="chips"></div><div id="stats"></div><div id="hint"></div></div>
+ <div id="navbox"><div id="rem"></div><div id="prog"><div></div></div></div>
+ <div id="btns"><button id="go">▶ Navigation starten</button><button class="sq on" id="vbtn" title="Sprachansagen">🔊</button><button class="sq on" id="fbtn" title="Karte folgt mir">🎯</button><button class="sq" id="lbtn" title="Alle Anweisungen">📋</button><button class="sq" id="demo" title="Demo ohne Gehen">🧪</button></div>
 </div>
+<div id="list"></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 <script>
 const D = __DATA__;
 const $ = id => document.getElementById(id);
-const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const WALK = 80;
-const lat0 = D.coords[0][0], lon0 = D.coords[0][1];
-const kx = Math.cos(lat0 * Math.PI / 180) * 111320, ky = 110540;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const WALK = D.speed || 80, TOP = D.topPad || 0, ky = 110540;
+document.documentElement.style.setProperty('--top', TOP + 'px');
+
+const map = L.map('map', {zoomControl: false, zoomAnimation: false, fadeAnimation: false, markerZoomAnimation: false}).setView(D.p1, 15);
+
+// Kartenhintergründe; bei Ausfall des Anbieters wird automatisch gewechselt
+const TILES = [
+  {n: 'Karte', u: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', o: {subdomains: 'abcd', maxZoom: 19, attribution: '© OpenStreetMap © CARTO'}},
+  {n: 'Gelände', u: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', o: {subdomains: 'abc', maxZoom: 17, attribution: '© OpenStreetMap, SRTM | © OpenTopoMap'}},
+  {n: 'Satellit', u: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', o: {maxZoom: 19, attribution: 'Esri, Maxar'}},
+  {n: 'Straßen', u: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', o: {maxZoom: 19, attribution: 'Esri'}}
+];
+const FALLBACK = [0, 3, 1];
+let tIdx = 0, tLayer = null, tErr = 0, tOk = 0, fbPos = 0;
+function setTiles(i) {
+  if (tLayer) map.removeLayer(tLayer);
+  tIdx = i; tErr = 0; tOk = 0;
+  tLayer = L.tileLayer(TILES[i].u, TILES[i].o).addTo(map);
+  tLayer.on('tileload', () => { tOk++; });
+  tLayer.on('tileerror', () => {
+    tErr++;
+    if (tErr >= 6 && tOk === 0 && fbPos < FALLBACK.length - 1) { fbPos++; setTiles(FALLBACK[fbPos]); }
+  });
+}
+setTiles(0);
+
+if (D.parks) {
+  L.geoJSON(D.parks, {style: {color: '#7C9F69', weight: 1, fillColor: '#B5CDA0', fillOpacity: .5},
+    onEachFeature: (f, l) => { if (f.properties && f.properties.name) l.bindTooltip(f.properties.name, {sticky: true}); }}).addTo(map);
+}
+const pin = e => L.divIcon({html: '<div style="font-size:30px;line-height:30px;filter:drop-shadow(0 2px 3px rgba(0,0,0,.45))">' + e + '</div>',
+  className: '', iconSize: [32, 32], iconAnchor: [16, 28]});
+L.marker(D.p1, {icon: pin('🚶')}).addTo(map);
+if (D.p1[0] !== D.p2[0] || D.p1[1] !== D.p2[1]) L.marker(D.p2, {icon: pin('🏁')}).addTo(map);
+const userDot = L.circleMarker([0, 0], {radius: 9, color: '#fff', weight: 3, fillColor: '#2F6F8F', fillOpacity: 1});
+const userAcc = L.circle([0, 0], {radius: 10, color: '#2F6F8F', weight: 1, fillColor: '#2F6F8F', fillOpacity: .12});
+
+let cur = -1, layers = [], coords = [], cum = [], steps = [], total = 1, P = [], lat0 = 0, lon0 = 0, kx = 1, done = null;
+let navOn = false, along = 0, lastIdx = 0, offCount = 0, finished = false, follow = true, lastPos = null,
+    said = {}, voice = true, watchId = null, sim = null, hadFix = false, wake = null;
+
 const toXY = (la, lo) => [(lo - lon0) * kx, (la - lat0) * ky];
-const P = D.coords.map(c => toXY(c[0], c[1]));
-const cum = D.cum, total = D.total, steps = D.steps;
-
-const map = L.map('map', {zoomControl: false}).setView(D.coords[0], 16);
-L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
-  {maxZoom: 19, subdomains: 'abcd', attribution: '© OpenStreetMap © CARTO'}).addTo(map);
-const base = L.polyline(D.coords, {color: '#fff', weight: 11, opacity: .9}).addTo(map);
-L.polyline(D.coords, {color: '#3F6B3A', weight: 7, opacity: 1}).addTo(map);
-const done = L.polyline([], {color: '#B9C9A8', weight: 7, opacity: 1}).addTo(map);
-steps.forEach((s, i) => { if (i > 0 && i < steps.length - 1)
-  L.circleMarker([s.lat, s.lon], {radius: 5, color: '#fff', weight: 2, fillColor: '#4E6E45', fillOpacity: 1}).addTo(map); });
-const pin = e => L.divIcon({html: '<div style="font-size:28px;line-height:28px;filter:drop-shadow(0 2px 3px rgba(0,0,0,.4))">' + e + '</div>',
-  className: '', iconSize: [30, 30], iconAnchor: [15, 26]});
-L.marker(D.coords[0], {icon: pin('🚶')}).addTo(map);
-L.marker(D.coords[D.coords.length - 1], {icon: pin('🏁')}).addTo(map);
-map.fitBounds(base.getBounds(), {padding: [30, 30]});
-const userDot = L.circleMarker([lat0, lon0], {radius: 9, color: '#fff', weight: 3, fillColor: '#2F6F8F', fillOpacity: 1});
-const userAcc = L.circle([lat0, lon0], {radius: 10, color: '#2F6F8F', weight: 1, fillColor: '#2F6F8F', fillOpacity: .12});
-
-let along = 0, lastIdx = 0, offCount = 0, finished = false, follow = true, lastPos = null,
-    said = {}, voice = true, started = false, watchId = null, sim = null, hadFix = false;
-
 function fmt(m) {
   if (m >= 1000) return (m / 1000).toFixed(1).replace('.', ',') + ' km';
   const r = m > 100 ? 10 : 5; return Math.max(0, Math.round(m / r) * r) + ' m';
 }
-function eta(rem) {
-  return new Date(Date.now() + rem / WALK * 60000).toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'});
-}
-function banner(cls, ico, dist, ins) {
-  $('banner').className = cls; $('ico').textContent = ico; $('dist').textContent = dist; $('ins').textContent = ins;
-}
+function eta(rem) { return new Date(Date.now() + rem / WALK * 60000).toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'}); }
+function banner(cls, ico, dist, ins) { $('banner').className = cls; $('ico').textContent = ico; $('dist').textContent = dist; $('ins').textContent = ins; }
 function say(t) {
   if (!voice || !('speechSynthesis' in window)) return;
   try { const u = new SpeechSynthesisUtterance(t); u.lang = 'de-DE'; speechSynthesis.cancel(); speechSynthesis.speak(u); } catch (e) {}
 }
+function fitRoute() {
+  if (!coords.length) return;
+  map.fitBounds(L.latLngBounds(coords), {paddingTopLeft: [24, TOP + 24], paddingBottomRight: [24, 250], animate: false});
+}
+function buildList() {
+  let h = '<div style="font-weight:700;margin-bottom:6px">Wegehinweise</div>';
+  steps.forEach((s, i) => { h += '<div class="row"><span class="ri">' + esc(s.i) + '</span><span class="rt">' + esc(s.t) +
+    '</span><span class="rd">' + (i === 0 ? 'Start' : 'bei ' + fmt(s.d)) + '</span></div>'; });
+  $('list').innerHTML = h + '<p><button class="sq" id="closelist" style="width:auto;padding:0 18px">Schließen</button></p>';
+  $('closelist').addEventListener('click', () => { $('list').style.display = 'none'; });
+}
+function showOption(i, fit) {
+  const o = D.options[i];
+  cur = i; coords = o.coords; cum = o.cum; steps = o.steps; total = Math.max(o.total, 1);
+  lat0 = coords[0][0]; lon0 = coords[0][1]; kx = Math.cos(lat0 * Math.PI / 180) * 111320;
+  P = coords.map(c => toXY(c[0], c[1]));
+  layers.forEach(l => map.removeLayer(l)); layers = [];
+  const add = l => { l.addTo(map); layers.push(l); return l; };
+  const showShort = D.mode === 'ab' && i !== 0;
+  if (showShort) add(L.polyline(D.options[0].coords, {color: '#C08A47', weight: 4, opacity: .95, dashArray: '8 8'}));
+  add(L.polyline(coords, {color: '#fff', weight: 11, opacity: .9}));
+  add(L.polyline(coords, {color: '#3F6B3A', weight: 7, opacity: 1}));
+  done = add(L.polyline([], {color: '#B9C9A8', weight: 7, opacity: 1}));
+  steps.forEach((s, k) => { if (k > 0 && k < steps.length - 1)
+    add(L.circleMarker([s.lat, s.lon], {radius: 5, color: '#fff', weight: 2, fillColor: '#4E6E45', fillOpacity: 1})); });
+  document.querySelectorAll('.chip').forEach((c, k) => c.classList.toggle('on', k === i));
+  $('stats').innerHTML = o.stats.map(s => '<div><span>' + esc(s[0]) + '</span><b>' + esc(s[1]) + '</b></div>').join('');
+  $('hint').textContent = (o.hint || '') + (showShort ? ' · gestrichelt: kürzeste Route' : '');
+  $('rem').textContent = 'Gesamt ' + fmt(total) + ' · ca. ' + Math.max(1, Math.round(total / WALK)) + ' min';
+  buildList();
+  if (fit) fitRoute();
+}
+
 function snap(xy, from, windowed) {
   let best = null;
   const lo = windowed ? Math.max(0, from - 5) : 0, hi = windowed ? Math.min(P.length - 1, from + 80) : P.length - 1;
@@ -820,23 +773,27 @@ function finish() {
   $('rem').textContent = 'Ziel erreicht'; $('prog').firstElementChild.style.width = '100%';
 }
 function onFix(lat, lon, acc) {
-  if (finished) return;
+  if (finished || !navOn) return;
   lastPos = [lat, lon];
   const xy = toXY(lat, lon);
   let s = snap(xy, lastIdx, true);
   if (s.off > 60) { const g = snap(xy, 0, false); if (g.off < s.off) s = g; }
   lastIdx = s.i; along = s.along;
-  userDot.setLatLng(lastPos); userAcc.setLatLng(lastPos); userAcc.setRadius(acc || 10);
-  if (!map.hasLayer(userDot)) { userAcc.addTo(map); userDot.addTo(map); }
-  done.setLatLngs(D.coords.slice(0, lastIdx + 1));
-  const limit = Math.max(35, (acc || 0) * 1.5);
+  userDot.setLatLng(lastPos); if (!map.hasLayer(userDot)) userDot.addTo(map);
+  // Genauigkeitskreis nur bei brauchbarer Genauigkeit (sonst überdeckt er die ganze Karte)
+  if (acc && acc <= 120) { userAcc.setLatLng(lastPos); userAcc.setRadius(acc); if (!map.hasLayer(userAcc)) userAcc.addTo(map); }
+  else if (map.hasLayer(userAcc)) map.removeLayer(userAcc);
+  done.setLatLngs(coords.slice(0, lastIdx + 1));
+  const limit = Math.max(35, (acc || 0) * 1.5), far = s.off > 1500;
   if (s.off > limit) offCount = hadFix ? offCount + 1 : 3; else offCount = 0;
   hadFix = true;
   const rem = Math.max(0, total - along);
-  $('rem').textContent = fmt(rem) + ' · ' + Math.max(1, Math.round(rem / WALK)) + ' min · Ankunft ' + eta(rem);
-  $('prog').firstElementChild.style.width = Math.min(100, 100 * along / total) + '%';
-  if (rem < 20 && along > total * 0.5) { finish(); return; }
-  if (offCount >= 3) {
+  $('rem').textContent = far ? 'Gesamt ' + fmt(total) : fmt(rem) + ' · ' + Math.max(1, Math.round(rem / WALK)) + ' min · Ankunft ' + eta(rem);
+  $('prog').firstElementChild.style.width = (far ? 0 : Math.min(100, 100 * along / total)) + '%';
+  if (!far && rem < 20 && along > total * 0.5) { finish(); return; }
+  if (far) {
+    banner('off', '📍', fmt(s.off), 'Du bist noch weit von der Route entfernt. Zum Ausprobieren: 🧪');
+  } else if (offCount >= 3) {
     if (along < 15) banner('off', '🚶', fmt(Math.hypot(xy[0] - P[0][0], xy[1] - P[0][1])), 'bis zum Startpunkt der Route');
     else {
       banner('off', '⚠️', fmt(s.off), 'Abseits der Route. Bitte zurück zur grünen Linie gehen.');
@@ -855,16 +812,29 @@ function onFix(lat, lon, acc) {
       if (dd <= 18 && !said[k + 'b']) { said[k + 'b'] = 1; say(st.t); }
     }
   }
-  if (follow) map.setView(lastPos, Math.max(map.getZoom(), 17), {animate: true});
+  if (follow && !far) map.setView(lastPos, Math.max(map.getZoom(), 17), {animate: false});
 }
-function begin() {
-  if (started) return; started = true; $('start').style.display = 'none';
-  try { if (navigator.wakeLock) navigator.wakeLock.request('screen').catch(() => {}); } catch (e) {}
+function stopWatch() {
+  if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+  if (sim) { clearInterval(sim); sim = null; $('demo').classList.remove('on'); }
+  try { if (wake) wake.release(); } catch (e) {} wake = null;
+}
+function enterNav() {
+  navOn = true; finished = false; said = {}; hadFix = false; lastIdx = 0; along = 0; offCount = 0;
+  document.body.classList.add('nav'); $('go').textContent = '⏹ Beenden';
+  try { if (navigator.wakeLock) navigator.wakeLock.request('screen').then(l => { wake = l; }).catch(() => {}); } catch (e) {}
   say('Navigation gestartet.');
   banner('', '📡', '…', 'Standort wird gesucht');
 }
-function startNav() {
-  begin();
+function exitNav() {
+  stopWatch(); navOn = false; finished = false;
+  document.body.classList.remove('nav'); $('go').textContent = '▶ Navigation starten';
+  [userDot, userAcc].forEach(l => { if (map.hasLayer(l)) map.removeLayer(l); });
+  if (done) done.setLatLngs([]);
+  showOption(cur, true);
+}
+function startGps() {
+  enterNav();
   if (!navigator.geolocation) { banner('off', '📡', 'Kein GPS', 'Dieses Gerät unterstützt keine Standortabfrage.'); return; }
   watchId = navigator.geolocation.watchPosition(
     p => onFix(p.coords.latitude, p.coords.longitude, p.coords.accuracy),
@@ -873,98 +843,247 @@ function startNav() {
       else banner('off', '📡', 'Kein GPS-Signal', 'Warte auf Standort …');
     }, {enableHighAccuracy: true, maximumAge: 1000, timeout: 20000});
 }
-function stopWatch() { if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; } }
 function pointAt(s) {
   let i = 0; while (i < cum.length - 2 && cum[i + 1] < s) i++;
   const l = (cum[i + 1] - cum[i]) || 1, t = Math.min(1, Math.max(0, (s - cum[i]) / l));
-  const a = D.coords[i], b = D.coords[i + 1];
+  const a = coords[i], b = coords[i + 1];
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
 }
-function toggleDemo() {
-  if (sim) { clearInterval(sim); sim = null; $('demo').textContent = '▶ Demo'; return; }
-  stopWatch(); begin(); finished = false; said = {}; hadFix = false; lastIdx = 0;
-  $('demo').textContent = '⏸ Demo'; let s = 0;
+function startDemo() {
+  enterNav(); $('demo').classList.add('on'); follow = true; $('fbtn').classList.add('on');
+  let s = 0;
   sim = setInterval(() => {
     s = Math.min(total, s + 10); const p = pointAt(s); onFix(p[0], p[1], 5);
-    if (s >= total || finished) { clearInterval(sim); sim = null; $('demo').textContent = '▶ Demo'; }
+    if (s >= total || finished) { clearInterval(sim); sim = null; $('demo').classList.remove('on'); }
   }, 500);
 }
-function buildList() {
-  let h = '<div style="font-weight:700;margin-bottom:6px">Anweisungen</div>';
-  steps.forEach((s, i) => { h += '<div class="row"><span class="ri">' + s.i + '</span><span class="rt">' + esc(s.t) +
-    '</span><span class="rd">' + (i === 0 ? 'Start' : 'bei ' + fmt(s.d)) + '</span></div>'; });
-  $('list').innerHTML = h + '<p><button class="b" id="closelist">Schließen</button></p>';
-  $('closelist').addEventListener('click', () => { $('list').style.display = 'none'; });
-}
-buildList();
-$('start').addEventListener('click', startNav);
-$('demo').addEventListener('click', toggleDemo);
+
+$('chips').innerHTML = D.options.map((o, i) => '<button class="chip" data-i="' + i + '"><b>' + esc(o.label) + '</b><span>' + esc(o.sub) + '</span></button>').join('');
+$('chips').addEventListener('click', e => { const b = e.target.closest('.chip'); if (b && !navOn) showOption(+b.dataset.i, true); });
+$('ttl').textContent = (D.p1[0] === D.p2[0] && D.p1[1] === D.p2[1]) ? '🔄 Ründchen ab ' + D.t1 : '🚶 ' + D.t1 + '  →  🏁 ' + D.t2;
+$('go').addEventListener('click', () => { if (navOn) exitNav(); else startGps(); });
+$('demo').addEventListener('click', () => { if (navOn && sim) exitNav(); else { if (navOn) exitNav(); startDemo(); } });
 $('lbtn').addEventListener('click', () => { $('list').style.display = 'block'; });
 $('vbtn').addEventListener('click', () => {
-  voice = !voice; $('vbtn').textContent = voice ? '🔊 Ansage' : '🔇 Stumm'; $('vbtn').classList.toggle('on', voice);
+  voice = !voice; $('vbtn').textContent = voice ? '🔊' : '🔇'; $('vbtn').classList.toggle('on', voice);
   if (!voice && 'speechSynthesis' in window) speechSynthesis.cancel();
 });
 $('fbtn').addEventListener('click', () => {
-  follow = true; $('fbtn').classList.add('on'); if (lastPos) map.setView(lastPos, Math.max(map.getZoom(), 17), {animate: true});
+  follow = !follow; $('fbtn').classList.toggle('on', follow);
+  if (follow && lastPos) map.setView(lastPos, Math.max(map.getZoom(), 17), {animate: false});
 });
+$('layers').addEventListener('click', () => setTiles((tIdx + 1) % TILES.length));
+$('fit').addEventListener('click', fitRoute);
 map.on('dragstart', () => { follow = false; $('fbtn').classList.remove('on'); });
-banner('', '🧭', fmt(total), D.title);
-$('rem').textContent = 'Gesamt ' + fmt(total) + ' · ca. ' + Math.max(1, Math.round(total / WALK)) + ' min';
-</script></body></html>"""
+
+function fix() { map.invalidateSize({animate: false}); }
+window.addEventListener('resize', fix);
+if (window.visualViewport) window.visualViewport.addEventListener('resize', fix);
+if (window.ResizeObserver) new ResizeObserver(fix).observe($('map'));
+showOption(D.default || 0, false);
+setTimeout(() => { fix(); if (!navOn) fitRoute(); }, 150);
+setTimeout(() => { fix(); if (!navOn) fitRoute(); }, 900);
+</script></body></html>
+"""
 
 
-def nav_html(payload):
+# ------------------------------------------------------- Karten-Ansicht (Vollbild)
+TOP_PAD = 86  # Höhe der Suchleiste (Streamlit) über der Karte, in Pixeln
+
+
+def fmt_km(m):
+    return f"{m / 1000:.1f} km".replace(".", ",") if m >= 1000 else f"{m:.0f} m"
+
+
+def inside(bbox, p, margin=0.002):
+    left, bottom, right, top = bbox
+    return left + margin <= p[1] <= right - margin and bottom + margin <= p[0] <= top - margin
+
+
+def solve_levels(area, o, t, buf):
+    """Kürzeste Route + grüne Route je Grünstufe (alle vorab, damit die Karte sofort umschalten kann)."""
+    g = np.clip(1 - area["D"] / buf, 0, 1).mean(axis=0)
+    L, H = area["lengths"], area["H"]
+
+    def run(w):
+        path = nx.shortest_path(H, o, t, weight=w)
+        idx = [H[a][b]["i"] for a, b in zip(path[:-1], path[1:])]
+        dist = float(L[idx].sum()) if idx else 0.0
+        share = float((L[idx] * g[idx]).sum() / dist) if dist > 0 else 0.0
+        return {"path": path, "dist": dist, "green": share}
+
+    short = run(lambda u, v, d: L[d["i"]])
+    out = []
+    for name, lam in LEVELS.items():
+        r = short if lam == 0 else run(lambda u, v, d, lam=lam: L[d["i"]] * (1 + lam * (1 - g[d["i"]])))
+        out.append((name, r))
+    return short, out
+
+
+def parks_geo(area):
+    """Grünflächen als kompaktes GeoJSON-Objekt (Koordinaten gerundet)."""
+    if "_geo" in area:
+        return area["_geo"]
+    geo = None
+    if area["parks_json"]:
+        def rnd(c):
+            return [round(c[0], 5), round(c[1], 5)] if isinstance(c[0], (int, float)) else [rnd(x) for x in c]
+        feats = []
+        for f in json.loads(area["parks_json"]).get("features", []):
+            geom = f.get("geometry") or {}
+            if "coordinates" not in geom:
+                continue
+            geom["coordinates"] = rnd(geom["coordinates"])
+            feats.append({"type": "Feature", "geometry": geom,
+                          "properties": {"name": (f.get("properties") or {}).get("name", "Grünfläche")}})
+        geo = {"type": "FeatureCollection", "features": feats}
+    area["_geo"] = geo
+    return geo
+
+
+def map_html(payload):
     data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
-    return NAV_TEMPLATE.replace("__DATA__", data)
+    return MAP_TEMPLATE.replace("__DATA__", data)
 
 
-def render_nav(nav):
-    p = nav["payload"]
-    if st.button("⏹ Navigation beenden", key="nav_stop", use_container_width=True):
-        st.session_state.pop("nav", None)
-        st.rerun()
-    st.markdown(f'<div class="trip"><span class="pill">🧭 {escape(p["title"])}</span>'
-                f'<span class="pill">{fmt_m(p["total"])} m</span></div>', unsafe_allow_html=True)
-    st_html(nav_html(p), height=NAV_H)
-    st.caption("Tippe auf „Navigation starten“ und erlaube den Standort. Display anlassen, die Ansagen "
-               "kommen per Sprachausgabe. Zum Ausprobieren am Computer gibt es den Demo-Knopf.")
+def _option(nav, label, sub, hint, stats):
+    return {**nav, "label": label, "sub": sub, "hint": hint, "stats": stats}
+
+
+def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: None):
+    """Alles für die Vollbild-Karte einer Route A -> B berechnen."""
+    lat1, lon1, lab1 = _unpack(start_v)
+    lat2, lon2, lab2 = _unpack(dest_v)
+    p1, p2 = (lat1, lon1), (lat2, lon2)
+    if area is None or bbox is None or not inside(bbox, p2) or not inside(bbox, p1):
+        bbox, span = corridor_bbox(p1, p2)
+        if span > MAX_SPAN_M:
+            raise ValueError(f"Start und Ziel sind {span / 1000:.1f} km auseinander. "
+                             f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
+        log("🗺️ Wegenetz und Grünflächen laden (nur der Korridor zwischen Start und Ziel)")
+        t0 = time.time()
+        area = load_area(bbox)
+        log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
+    o, t = nearest_node(area, *p1), nearest_node(area, *p2)
+    log("🧭 Routen und Wegehinweise berechnen")
+    try:
+        short, levels = solve_levels(area, o, t, buf)
+    except nx.NetworkXNoPath:
+        raise ValueError("Zwischen Start und Ziel gibt es keinen Fußweg im geladenen Gebiet.")
+    t1, t2 = lab1.split(" · ")[0], lab2.split(" · ")[0]
+    options = []
+    for name, r in levels:
+        nav = build_nav(area, r["path"], f"{t1} → {t2}")
+        if not nav:
+            continue
+        detour = r["dist"] / short["dist"] - 1 if short["dist"] else 0.0
+        mins = max(1, round(r["dist"] / M_PER_MIN))
+        options.append(_option(
+            nav, name, f"{fmt_km(r['dist'])} · {r['green']:.0%} grün", LEVEL_HINT[name],
+            [["Länge", fmt_km(r["dist"])], ["Dauer", f"{mins} min"],
+             ["Grünanteil", f"{r['green']:.0%}"], ["Umweg", f"{detour:+.0%}"]]))
+    if not options:
+        raise ValueError("Start und Ziel liegen zu nah beieinander.")
+    default = next((i for i, o_ in enumerate(options) if o_["label"] == "Ausgewogen"), 0)
+    payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=parks_geo(area),
+                   options=options, default=default, speed=M_PER_MIN, topPad=TOP_PAD)
+    return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
+            "start": start_v, "dest": dest_v, "area": area, "bbox": bbox, "buf": buf}
+
+
+def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
+                   log=lambda *_: None, progress=None):
+    """Alles für die Vollbild-Karte eines Ründchens berechnen."""
+    lat1, lon1, lab1 = _unpack(start_v)
+    p1 = (lat1, lon1)
+    if end_v:
+        lat2, lon2, lab2 = _unpack(end_v)
+        p2 = (lat2, lon2)
+    else:
+        p2, lab2 = p1, lab1
+    target = km * 1000
+    if dist_m(p1, p2) > 0.35 * target:
+        raise ValueError("Start und Ende liegen zu weit auseinander für diese Länge.")
+    if area is None or bbox_km is None or km > bbox_km:
+        log("🗺️ Wegenetz und Grünflächen laden")
+        t0 = time.time()
+        area = load_area(loop_bbox(p1, p2, target))
+        bbox_km = km
+        log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
+    o, t = nearest_node(area, *p1), nearest_node(area, *p2)
+    variants = find_loops(area, o, t, target, LEVELS[level], buf, progress=progress)
+    t1, t2 = lab1.split(" · ")[0], lab2.split(" · ")[0]
+    options = []
+    for i, v in enumerate(variants):
+        nav = build_nav(area, v["path"], f"Ründchen {i + 1}", loop=True)
+        if not nav:
+            continue
+        mins = max(1, round(v["dist"] / M_PER_MIN))
+        diff = v["dist"] / target - 1
+        options.append(_option(
+            nav, f"Variante {i + 1}", f"{fmt_km(v['dist'])} · {v['green']:.0%} grün",
+            f"Wunschlänge {fmt_km(target)} ({diff:+.0%})",
+            [["Länge", fmt_km(v["dist"])], ["Dauer", f"{mins} min"],
+             ["Grünanteil", f"{v['green']:.0%}"], ["Ohne Doppelweg", f"{1 - v['rep']:.0%}"]]))
+    if not options:
+        raise ValueError("Hier konnte ich keine passende Runde finden. Versuche eine andere Länge "
+                         "oder einen anderen Startpunkt.")
+    payload = dict(mode="loop", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=parks_geo(area),
+                   options=options, default=0, speed=M_PER_MIN, topPad=TOP_PAD)
+    return {"mode": "loop", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
+            "start": start_v, "end": end_v, "km": km, "km_ok": km, "level": level, "buf": buf,
+            "area": area, "bbox_km": bbox_km}
 
 
 # ------------------------------------------------------- UI
-st.set_page_config(page_title="Green-Walker", page_icon="🌳", layout="centered")
-st.markdown(
-    """
+st.set_page_config(page_title="Green-Walker", page_icon="🌳", layout="centered",
+                   initial_sidebar_state="collapsed")
+
+BASE_CSS = """
 <style>
-.block-container{padding-top:1.6rem;max-width:760px}
+.block-container{padding-top:1.4rem;max-width:720px}
 h1,h2,h3,h4{font-family:Georgia,"Iowan Old Style","Palatino Linotype",serif;letter-spacing:-.005em}
-.hero{border-radius:20px;padding:26px 24px;margin-bottom:14px;color:#FBF7EE;
- background:linear-gradient(135deg,#4E6E45 0%,#7E9A6A 58%,#B9A77C 100%);
- box-shadow:0 8px 24px rgba(78,110,69,.22)}
-.hero h1{margin:0 0 4px;font-size:2rem;line-height:1.1;color:#FBF7EE}
-.hero p{margin:0;font-size:1.02rem;color:#FBF7EE}
-.card{border:1px solid #D9CFBC;background:#FBF8F1;border-radius:16px;padding:14px 16px;height:100%;color:#3B3A33}
-.card.accent{border-color:#9DB38A;background:#E7EDDB}
-.card .lab{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;opacity:.7}
-.card .val{font-size:1.7rem;font-weight:700;line-height:1.2}
-.card .sub{font-size:.85rem;opacity:.75}
-.bar{height:8px;border-radius:6px;background:#DDD3BF;margin-top:8px;overflow:hidden}
-.bar>div{height:100%;background:linear-gradient(90deg,#9DB38A,#4E6E45);border-radius:6px}
-.hint{opacity:.75;margin:-6px 0 10px;font-size:.92rem}
-.trip{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 14px}
-.pill{border-radius:999px;padding:6px 14px;background:#E7EDDB;color:#3B3A33;
- border:1px solid #9DB38A;font-size:.92rem}
-.stButton>button{border-radius:12px;font-weight:600;padding:.6rem 1rem}
-.stButton>button[kind="primary"]{background:#5E7F52;border-color:#5E7F52;color:#FBF7EE}
+.hero{border-radius:22px;padding:22px 22px;margin-bottom:16px;color:#FBF7EE;
+ background:linear-gradient(135deg,#4E6E45 0%,#7E9A6A 58%,#B9A77C 100%);box-shadow:0 8px 24px rgba(78,110,69,.22)}
+.hero h1{margin:0;font-size:1.8rem;line-height:1.1;color:#FBF7EE}
+.hero p{margin:6px 0 0;font-size:1rem;color:#FBF7EE}
+.st-key-card_route,.st-key-card_loop{background:#FBF8F1;border:1px solid #D9CFBC;border-radius:20px;
+ padding:18px 16px 14px;box-shadow:0 4px 18px rgba(60,50,30,.08);margin-top:12px}
+.hint{opacity:.75;font-size:.92rem;margin:-4px 0 8px}
+.trip{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 10px}
+.pill{border-radius:999px;padding:6px 14px;background:#E7EDDB;color:#3B3A33;border:1px solid #9DB38A;font-size:.92rem}
+.stButton>button{border-radius:14px;font-weight:600;padding:.6rem 1rem}
+.stButton>button[kind="primary"]{background:#5E7F52;border-color:#5E7F52;color:#FBF7EE;height:3rem;font-size:1.05rem}
 .stButton>button[kind="primary"]:hover{background:#4E6E45;border-color:#4E6E45;color:#FBF7EE}
-.stTabs [data-baseweb="tab"]{font-weight:600;font-size:1.02rem}
-iframe{border-radius:16px}
-</style>""",
-    unsafe_allow_html=True,
-)
-if not st.session_state.get("nav"):
-    st.markdown('<div class="hero"><h1>🌳 Green-Walker</h1>'
-                '<p>Der schönere Weg zu Fuß: vorbei an Parks und Grün statt nur auf kürzester Strecke.</p></div>',
-                unsafe_allow_html=True)
+.stTabs [data-baseweb="tab-list"]{gap:4px;background:#E9E1D2;padding:4px;border-radius:14px}
+.stTabs [data-baseweb="tab"]{flex:1;justify-content:center;height:42px;border-radius:10px;font-weight:600;color:#6B675B}
+.stTabs [aria-selected="true"]{background:#FBF8F1;color:#3B3A33;box-shadow:0 1px 4px rgba(60,50,30,.18)}
+.stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"]{display:none}
+</style>
+"""
+
+# Nur in der Kartenansicht: Karte füllt den ganzen Bildschirm, Suchleiste schwebt darüber.
+MAP_CSS = """
+<style>
+[data-testid="stHeader"],[data-testid="stToolbar"],[data-testid="stDecoration"],[data-testid="stStatusWidget"],footer{display:none!important}
+html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stMain"],section.main{overflow:hidden!important}
+.block-container{padding:0!important;max-width:100%!important}
+.st-key-mapfull{position:fixed;top:0;left:0;right:0;bottom:0;z-index:1;margin:0}
+.st-key-mapfull iframe{position:fixed!important;top:0;left:0;width:100vw!important;height:100vh!important;
+ height:100dvh!important;border:0!important;border-radius:0!important}
+[data-stale="true"]{opacity:1!important}
+.st-key-gwtop{position:fixed;top:10px;left:10px;right:10px;z-index:1000002;max-width:620px;margin:0 auto;
+ background:rgba(251,248,241,.98);border:1px solid #D9CFBC;border-radius:16px;padding:8px 10px;
+ box-shadow:0 6px 20px rgba(60,50,30,.25)}
+.st-key-gwtop [data-testid="stHorizontalBlock"]{flex-wrap:nowrap!important;align-items:center;gap:8px}
+.st-key-gwtop [data-testid="stColumn"],.st-key-gwtop [data-testid="column"]{min-width:0!important;width:auto!important;flex:1 1 0!important}
+.st-key-gwtop [data-testid="stColumn"]:has(button),.st-key-gwtop [data-testid="column"]:has(button){flex:0 0 50px!important;width:50px!important}
+.st-key-gwtop .stButton>button{padding:.4rem 0;height:46px}
+.st-key-gwtop [data-testid="stVerticalBlock"]{gap:.25rem}
+.looptitle{font-size:1rem;white-space:nowrap;text-align:center}
+</style>
+"""
+st.markdown(BASE_CSS, unsafe_allow_html=True)
 
 PLACEHOLDER = "Straße, Adresse, Café, Restaurant, Geschäft …"
 SEARCH_TIP = ("Tipp: Tippe mindestens 3 Buchstaben, dann erscheinen Vorschläge. "
@@ -1017,7 +1136,7 @@ def start_input(label, key):
     lat, lon, acc = loc
     name = reverse_name(round(lat, 5), round(lon, 5))
     lab = "📍 Mein Standort" + (f" · {name}" if name else "")
-    st.markdown(f'<div class="trip"><span class="pill">{lab}</span></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="trip"><span class="pill">{escape(lab)}</span></div>', unsafe_allow_html=True)
     if acc and acc > 1000:
         st.caption(f"Standort ungenau (ca. {acc:,.0f} m). Am Handy hilft GPS bzw. genaue Ortung.".replace(",", "."))
     if st.button("🔄 Standort neu bestimmen", key=f"{key}_relocate"):
@@ -1032,226 +1151,179 @@ def show_error(e):
     if any(x in msg for x in ("502", "503", "504", "überlastet", "Timeout", "timed out", "capacity")):
         st.error("Die freien Kartenserver (OpenStreetMap/Overpass) sind gerade überlastet. "
                  "Ich habe mehrere Server probiert. Bitte in 1 bis 2 Minuten noch einmal versuchen.")
+    elif isinstance(e, ValueError):
+        st.error(msg)
     else:
         st.error(f"Das hat nicht geklappt: {e}")
     with st.expander("Technische Details"):
         st.code(msg[:600])
 
 
-def card(label, value, sub, accent=False, bar=None):
-    b = f'<div class="bar"><div style="width:{bar * 100:.0f}%"></div></div>' if bar is not None else ""
-    return (f'<div class="card{" accent" if accent else ""}"><div class="lab">{label}</div>'
-            f'<div class="val">{value}</div><div class="sub">{sub}</div>{b}</div>')
-
-
 def fmt_m(x):
     return f"{x:,.0f}".replace(",", ".")
-
-
-# ---------- Tab 1: A -> B
-def render_ab():
-    start_v = start_input("Start", "start_sb")
-    ziel_v = place_input("Ziel", "ziel_sb")
-    st.caption(SEARCH_TIP)
-    go = st.button("Route finden", type="primary", use_container_width=True, key="go_ab")
-
-    if go:
-        if not (start_v and ziel_v):
-            st.warning("Bitte Start und Ziel jeweils aus den Vorschlägen auswählen.")
-        else:
-            st.session_state.pop("ctx", None)
-            lat1, lon1, lab1 = _unpack(start_v)
-            lat2, lon2, lab2 = _unpack(ziel_v)
-            p1, p2 = (lat1, lon1), (lat2, lon2)
-            with st.status("Route wird vorbereitet …", expanded=True) as status:
-                try:
-                    bbox, span = corridor_bbox(p1, p2)
-                    if span > MAX_SPAN_M:
-                        status.update(label="Strecke zu lang", state="error")
-                        st.error(f"Start und Ziel sind {span / 1000:.1f} km auseinander. "
-                                 f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
-                        return
-                    st.write("🗺️ Wegenetz und Grünflächen laden (nur der Korridor zwischen Start und Ziel)")
-                    t0 = time.time()
-                    area = load_area(bbox)
-                    st.write(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen "
-                             f"({time.time() - t0:.0f} s)")
-                    st.session_state["ctx"] = dict(
-                        area=area, p1=p1, p2=p2,
-                        o=nearest_node(area, *p1), t=nearest_node(area, *p2),
-                        t1=lab1.split(" · ")[0], t2=lab2.split(" · ")[0])
-                    status.update(label="Fertig", state="complete", expanded=False)
-                except Exception as e:
-                    status.update(label="Fehler", state="error")
-                    show_error(e)
-
-    ctx = st.session_state.get("ctx")
-    if not ctx:
-        return
-    area = ctx["area"]
-    st.markdown(f'<div class="trip"><span class="pill">🚶 {ctx["t1"]}</span>'
-                f'<span class="pill">🏁 {ctx["t2"]}</span></div>', unsafe_allow_html=True)
-    st.markdown("#### Wie grün soll es sein?")
-    level = st.select_slider("Grünstufe", options=list(LEVELS), value="Ausgewogen",
-                             label_visibility="collapsed", key="level_ab")
-    st.markdown(f'<div class="hint">{LEVEL_HINT[level]}</div>', unsafe_allow_html=True)
-    with st.expander("Feintuning"):
-        buf = st.slider("Grün-Reichweite um Parks (m)", 50, MAX_BUF, 150, 25, key="buf_ab",
-                        help="So weit vom Parkrand zählt Umgebung noch als grün (linear abnehmend).")
-    try:
-        res = solve(area, ctx["o"], ctx["t"], LEVELS[level], buf)
-    except nx.NetworkXNoPath:
-        st.error("Zwischen Start und Ziel gibt es keinen Fußweg im geladenen Gebiet.")
-        return
-
-    s, g = res["short"], res["green"]
-    detour = g["dist"] / s["dist"] - 1 if s["dist"] else 0
-    gain = (g["green"] - s["green"]) * 100
-    k1, k2, k3 = st.columns(3)
-    k1.markdown(card("Grüne Route", f'{fmt_m(g["dist"])} m',
-                     f'ca. {max(1, round(g["dist"] / M_PER_MIN))} min zu Fuß', accent=True),
-                unsafe_allow_html=True)
-    k2.markdown(card("Grünanteil", f'{g["green"]:.0%}', f"{gain:+.0f} Prozentpunkte", bar=g["green"]),
-                unsafe_allow_html=True)
-    k3.markdown(card("Umweg", f"{detour:+.0%}",
-                     f'kürzeste: {fmt_m(s["dist"])} m · {s["green"]:.0%} grün'), unsafe_allow_html=True)
-    if st.button("▶ Navigation starten", type="primary", use_container_width=True, key="nav_ab"):
-        payload = build_nav(area, g["path"], f'{ctx["t1"]} → {ctx["t2"]}')
-        if payload:
-            st.session_state["nav"] = {"payload": payload}
-            st.rerun()
-        else:
-            st.warning("Für diese Route ist keine Navigation möglich.")
-    st.write("")
-    m = build_map(area, res, ctx["p1"], ctx["p2"], ctx["t1"], ctx["t2"])
-    st_html(m._repr_html_(), height=580)
-    with st.expander("Datenquellen und Gewichtung"):
-        st.markdown(sources_text(buf, LEVELS[level]))
 
 
 def sources_text(buf, lam):
     return (
         "- Wegenetz (Fußwege) und Grünflächen: OpenStreetMap via Overpass (ODbL)\n"
         "- Ortssuche: Photon (photon.komoot.io) auf OSM-Basis, Fallback Nominatim\n"
-        "- Kartenhintergrund: CARTO / OpenStreetMap, Satellit: Esri\n"
+        "- Kartenhintergrund: CARTO / OpenStreetMap, Gelände: OpenTopoMap, Satellit: Esri\n"
         f"- Grünflächen-Tags: `{GREEN_TAGS}`\n"
         f"- Score je Abtastpunkt: 1,0 im Park, linear fallend auf 0 im Abstand von {buf} m\n"
         f"- Kantenscore: Mittel aus {SAMPLES} Abtastpunkten\n"
-        f"- Kosten: Länge × (1 + {lam:g} × (1 − Grünscore))"
+        "- Kosten: Länge × (1 + λ × (1 − Grünscore)), λ je Grünstufe: "
+        + ", ".join(f"{k} {v:g}" for k, v in LEVELS.items())
     )
 
 
-# ---------- Tab 2: Ründchen
-def render_loop():
-    st.markdown("Grüne Runde mit Wunschlänge, die am Startpunkt beginnt und dort (oder an einem "
-                "anderen Punkt) wieder endet.")
-    a_v = start_input("Startpunkt", "loop_a_sb")
-    same = st.checkbox("Ründchen endet wieder am Startpunkt", value=True, key="loop_same")
-    b_v = None if same else place_input("Endpunkt", "loop_b_sb")
-    st.caption(SEARCH_TIP)
+# ---------- Wechsel zwischen Startseite und Kartenansicht
+def open_map(view):
+    st.session_state["gw_sid"] = st.session_state.get("gw_sid", 0) + 1
+    view["sid"] = st.session_state["gw_sid"]
+    st.session_state["gw"] = view
+    st.session_state["bias"] = view["p1"]
 
-    km = st.slider("Gewünschte Länge (km)", 1.0, LOOP_MAX_KM, 3.0, 0.5, key="loop_km")
-    st.markdown(f'<div class="hint">ca. {max(1, round(km * 1000 / M_PER_MIN))} min zu Fuß</div>',
-                unsafe_allow_html=True)
-    level = st.select_slider("Wie grün soll es sein?", options=list(LEVELS), value="Sehr grün",
-                             key="level_loop")
-    with st.expander("Feintuning"):
-        buf = st.slider("Grün-Reichweite um Parks (m)", 50, MAX_BUF, 150, 25, key="buf_loop")
-    go = st.button("Ründchen finden", type="primary", use_container_width=True, key="go_loop")
 
-    if go:
-        if not a_v or (not same and not b_v):
-            st.warning("Bitte Start" + ("" if same else " und Ende") + " aus den Vorschlägen auswählen.")
+def close_map():
+    st.session_state.pop("gw", None)
+
+
+def bump_km(delta):
+    gw = st.session_state.get("gw")
+    if gw:
+        gw["km"] = round(min(max(gw["km"] + delta, 1.0), LOOP_MAX_KM), 1)
+        gw["recalc"] = True
+
+
+def render_map_view():
+    """Vollbild-Karte mit Suchfeld (Ziel ändern) bzw. Längen-Regler (Ründchen) in der Karte."""
+    gw = st.session_state["gw"]
+    st.markdown(MAP_CSS, unsafe_allow_html=True)
+    st.session_state["bias"] = gw["p1"]
+    dest_new = None
+    with st.container(key="gwtop"):
+        if gw["mode"] == "ab":
+            c1, c2 = st.columns([1, 6])
+            c1.button("←", key="gw_back", use_container_width=True, on_click=close_map, help="Zurück zur Suche")
+            with c2:
+                dest_new = st_searchbox(search_places, key=f"gw_dest_{gw['sid']}",
+                                        placeholder=f"🏁 {gw['t2']} · Ziel ändern …", clear_on_submit=False)
         else:
-            st.session_state.pop("loop_ctx", None)
-            lat1, lon1, lab1 = _unpack(a_v)
-            p1 = (lat1, lon1)
-            if same:
-                p2, lab2 = p1, lab1
-            else:
-                lat2, lon2, lab2 = _unpack(b_v)
-                p2 = (lat2, lon2)
-            target = km * 1000
-            if dist_m(p1, p2) > 0.35 * target:
-                st.error("Start und Ende liegen zu weit auseinander für diese Länge. "
-                         "Wähle ein längeres Ründchen oder näher beieinanderliegende Punkte.")
-                return
-            with st.status("Ründchen wird gesucht …", expanded=True) as status:
-                try:
-                    st.write("🗺️ Wegenetz und Grünflächen laden")
-                    t0 = time.time()
-                    area = load_area(loop_bbox(p1, p2, target))
-                    st.write(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen "
-                             f"({time.time() - t0:.0f} s)")
-                    o, t = nearest_node(area, *p1), nearest_node(area, *p2)
-                    bar = st.progress(0.0, text="🔄 Runden in verschiedene Richtungen probieren …")
-                    t0 = time.time()
-                    variants = find_loops(area, o, t, target, LEVELS[level], buf,
-                                          progress=lambda f: bar.progress(min(f, 1.0), text="🔄 Runden in verschiedene Richtungen probieren …"))
-                    bar.empty()
-                    if not variants:
-                        status.update(label="Kein passendes Ründchen gefunden", state="error")
-                        st.error("Hier konnte ich keine passende Runde finden. Versuche eine andere "
-                                 "Länge oder einen anderen Startpunkt.")
-                        return
-                    st.write(f"✅ {len(variants)} Varianten gefunden ({time.time() - t0:.0f} s)")
-                    st.session_state["loop_ctx"] = dict(
-                        area=area, p1=p1, p2=p2, variants=variants, target=target, buf=buf, lam=LEVELS[level],
-                        t1=lab1.split(" · ")[0], t2=lab2.split(" · ")[0])
-                    status.update(label="Fertig", state="complete", expanded=False)
-                except Exception as e:
-                    status.update(label="Fehler", state="error")
-                    show_error(e)
+            c1, c2, c3, c4 = st.columns([1, 4, 1, 1])
+            c1.button("←", key="gw_back", use_container_width=True, on_click=close_map, help="Zurück zur Suche")
+            km_txt = str(gw["km"]).replace(".", ",")
+            c2.markdown(f'<div class="looptitle">🔄 Ründchen · <b>{km_txt} km</b></div>', unsafe_allow_html=True)
+            c3.button("−", key="gw_km_minus", use_container_width=True, on_click=bump_km, args=(-0.5,),
+                      help="Kürzer")
+            c4.button("+", key="gw_km_plus", use_container_width=True, on_click=bump_km, args=(0.5,),
+                      help="Länger")
 
-    lc = st.session_state.get("loop_ctx")
-    if not lc:
+    new = None
+    if gw["mode"] == "ab" and dest_new and dest_new != gw["dest"] and dest_new != gw.get("failed"):
+        st.toast("🧭 Berechne neue Route …")
+        try:
+            new = make_ab_view(gw["start"], dest_new, gw["buf"], gw["area"], gw["bbox"])
+        except Exception as e:
+            gw["failed"] = dest_new
+            st.toast(f"⚠️ {e}"[:220])
+    elif gw["mode"] == "loop" and gw.get("recalc"):
+        gw["recalc"] = False
+        st.toast("🔄 Suche neues Ründchen …")
+        try:
+            new = make_loop_view(gw["start"], gw["end"], gw["km"], gw["level"], gw["buf"],
+                                 area=gw["area"], bbox_km=gw["bbox_km"])
+        except Exception as e:
+            gw["km"] = gw["km_ok"]
+            st.toast(f"⚠️ {e}"[:220])
+    if new:
+        new["sid"] = gw["sid"]
+        st.session_state["gw"] = new
+        st.rerun()
+
+    with st.container(key="mapfull"):
+        st_html(gw["html"], height=700, scrolling=False)
+
+
+# ---------- Startseite
+def home_route():
+    with st.container(key="card_route"):
+        start_v = start_input("Start", "start_sb")
+        ziel_v = place_input("Ziel", "ziel_sb")
+        st.caption(SEARCH_TIP)
+        go = st.button("Route finden", type="primary", use_container_width=True, key="go_ab")
+    if not go:
         return
-    area, variants, target = lc["area"], lc["variants"], lc["target"]
-    if lc["p1"] == lc["p2"]:
-        st.markdown(f'<div class="trip"><span class="pill">🔄 Start & Ziel: {lc["t1"]}</span></div>',
+    if not (start_v and ziel_v):
+        st.warning("Bitte Start und Ziel jeweils aus den Vorschlägen auswählen.")
+        return
+    view = None
+    with st.status("Route wird vorbereitet …", expanded=True) as status:
+        try:
+            view = make_ab_view(start_v, ziel_v, log=st.write)
+            status.update(label="Fertig", state="complete", expanded=False)
+        except Exception as e:
+            status.update(label="Fehler", state="error")
+            show_error(e)
+    if view:
+        open_map(view)
+        st.rerun()
+
+
+def home_loop():
+    with st.container(key="card_loop"):
+        st.markdown("Grüne Runde mit Wunschlänge, die am Startpunkt beginnt und dort (oder an einem "
+                    "anderen Punkt) wieder endet.")
+        a_v = start_input("Startpunkt", "loop_a_sb")
+        same = st.checkbox("Ründchen endet wieder am Startpunkt", value=True, key="loop_same")
+        b_v = None if same else place_input("Endpunkt", "loop_b_sb")
+        st.caption(SEARCH_TIP)
+        km = st.slider("Gewünschte Länge (km)", 1.0, LOOP_MAX_KM, 3.0, 0.5, key="loop_km")
+        st.markdown(f'<div class="hint">ca. {max(1, round(km * 1000 / M_PER_MIN))} min zu Fuß</div>',
                     unsafe_allow_html=True)
-    else:
-        st.markdown(f'<div class="trip"><span class="pill">🚶 {lc["t1"]}</span>'
-                    f'<span class="pill">🏁 {lc["t2"]}</span></div>', unsafe_allow_html=True)
-    sel = 0
-    if len(variants) > 1:
-        sel = st.radio("Variante", list(range(len(variants))), horizontal=True, key="loop_pick",
-                       format_func=lambda i: f"Variante {i + 1} · {variants[i]['dist'] / 1000:.1f} km · "
-                                             f"{variants[i]['green']:.0%} grün")
-        sel = min(sel, len(variants) - 1)
-    v = variants[sel]
-    diff = v["dist"] / target - 1
-    k1, k2, k3 = st.columns(3)
-    k1.markdown(card("Länge", f'{v["dist"] / 1000:.2f} km'.replace(".", ","),
-                     f'gewünscht {target / 1000:.1f} km ({diff:+.0%})'.replace(".", ","), accent=True),
+        level = st.select_slider("Wie grün soll es sein?", options=list(LEVELS), value="Sehr grün",
+                                 key="level_loop")
+        go = st.button("Ründchen finden", type="primary", use_container_width=True, key="go_loop")
+    if not go:
+        return
+    if not a_v or (not same and not b_v):
+        st.warning("Bitte Start" + ("" if same else " und Ende") + " aus den Vorschlägen auswählen.")
+        return
+    view, holder = None, {}
+
+    def prog(f):
+        txt = "🔄 Runden in verschiedene Richtungen probieren …"
+        if "bar" not in holder:
+            holder["bar"] = st.progress(0.0, text=txt)
+        holder["bar"].progress(min(f, 1.0), text=txt)
+
+    with st.status("Ründchen wird gesucht …", expanded=True) as status:
+        try:
+            view = make_loop_view(a_v, None if same else b_v, km, level, log=st.write, progress=prog)
+            if "bar" in holder:
+                holder["bar"].empty()
+            status.update(label="Fertig", state="complete", expanded=False)
+        except Exception as e:
+            status.update(label="Fehler", state="error")
+            show_error(e)
+    if view:
+        open_map(view)
+        st.rerun()
+
+
+def render_home():
+    st.markdown('<div class="hero"><h1>🌳 Green-Walker</h1>'
+                '<p>Gehe den grünen Weg: vorbei an Parks und Grün statt nur auf kürzester Strecke.</p></div>',
                 unsafe_allow_html=True)
-    k2.markdown(card("Grünanteil", f'{v["green"]:.0%}', "der Strecke in Park-Nähe", bar=v["green"]),
-                unsafe_allow_html=True)
-    k3.markdown(card("Dauer", f'{max(1, round(v["dist"] / M_PER_MIN))} min',
-                     f'{1 - v["rep"]:.0%} ohne Doppelweg'), unsafe_allow_html=True)
-    if st.button("▶ Navigation starten", type="primary", use_container_width=True, key="nav_loop"):
-        payload = build_nav(area, v["path"], f'Ründchen · {v["dist"] / 1000:.1f} km'.replace(".", ","), loop=True)
-        if payload:
-            st.session_state["nav"] = {"payload": payload}
-            st.rerun()
-        else:
-            st.warning("Für dieses Ründchen ist keine Navigation möglich.")
-    st.write("")
-    m = build_loop_map(area, variants, sel, lc["p1"], lc["p2"], lc["t1"], lc["t2"])
-    st_html(m._repr_html_(), height=580)
+    tab_route, tab_loop = st.tabs(["🧭 Route", "🔄 Ründchen"])
+    with tab_route:
+        home_route()
+    with tab_loop:
+        home_loop()
     with st.expander("Datenquellen und Gewichtung"):
-        st.markdown(sources_text(lc["buf"], lc["lam"]) +
-                    f"\n- Ründchen: {LOOP_BEARINGS} Richtungen, je 3 Wegpunkte auf einem Kreis, Radius wird "
-                    f"auf die Wunschlänge angepasst (±{LOOP_TOLERANCE:.0%}); schon gelaufene Wegstücke "
-                    f"kosten ×{LOOP_REUSE_PENALTY:g}; Ranking: Grünanteil minus Doppelweg minus Längenabweichung")
+        st.markdown(sources_text(150, LEVELS["Ausgewogen"]))
 
 
-if st.session_state.get("nav"):
-    render_nav(st.session_state["nav"])
-    st.stop()
-
-tab_ab, tab_loop = st.tabs(["🧭 Route", "🔄 Ründchen"])
-with tab_ab:
-    render_ab()
-with tab_loop:
-    render_loop()
+if st.session_state.get("gw"):
+    render_map_view()
+else:
+    render_home()
