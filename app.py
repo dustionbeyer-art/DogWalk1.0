@@ -835,7 +835,7 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
 </style></head><body>
 <div id="map"></div>
 <div id="banner"><div id="ico">🧭</div><div><div id="dist"></div><div id="ins"></div></div></div>
-<div id="side"><button id="layers" title="Kartenstil wechseln">🗺️</button><button id="fit" title="Ganze Route zeigen">⤢</button></div>
+<div id="side"><button id="layers" title="Kartenstil wechseln">🗺️</button><button id="sat" title="Satellit / Luftbild">🛰️</button><button id="fit" title="Ganze Route zeigen">⤢</button></div>
 <div id="sheet">
  <div id="ttl"></div>
  <div id="pre"><div id="chips"></div><div id="stats"></div><div id="hint"></div></div>
@@ -862,8 +862,12 @@ const TILES = [
   {n: 'Straßen', u: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', o: {maxZoom: 19, maxNativeZoom: 18, attribution: 'Kartenbild © Esri u. a.'}},
   {n: 'Gelände', u: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', o: {subdomains: 'abc', maxZoom: 19, maxNativeZoom: 17, attribution: '© OpenStreetMap-Mitwirkende, SRTM | © OpenTopoMap (CC-BY-SA)'}},
   {n: 'OpenStreetMap', u: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', o: {maxZoom: 19, referrerPolicy: 'strict-origin-when-cross-origin', attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>-Mitwirkende'}},
-  {n: 'Satellit', u: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', o: {maxZoom: 19, maxNativeZoom: 18, attribution: 'Bild © Esri, Maxar, Earthstar Geographics'}}
+  // Satellit / Luftbild (sat: true) -> nur über den 🛰️-Knopf, nie als automatischer Ersatz
+  {n: 'Satellit (Esri, aktuell)', sat: true, u: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', o: {maxZoom: 20, maxNativeZoom: 18, attribution: 'Bild © Esri, Maxar, Earthstar Geographics'}},
+  {n: 'Luftbild NRW (10 cm)', sat: true, wms: true, u: 'https://www.wms.nrw.de/geobasis/wms_nw_dop', o: {layers: 'nw_dop_rgb', format: 'image/jpeg', version: '1.3.0', maxZoom: 21, attribution: 'Luftbild © Geobasis NRW (dl-de/zero-2-0)'}},
+  {n: 'Sentinel-2 (2025, 10 m)', sat: true, u: 'https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2025_3857/default/GoogleMapsCompatible/{z}/{y}/{x}.jpg', o: {maxZoom: 19, maxNativeZoom: 13, attribution: 'Sentinel-2 cloudless 2025 © EOX IT Services GmbH (enthält modifizierte Copernicus-Sentinel-Daten)'}}
 ];
+const BASE = TILES.map((t, i) => i).filter(i => !TILES[i].sat), SAT = TILES.map((t, i) => i).filter(i => TILES[i].sat);
 let tIdx = 0, tLayer = null, tOk = 0, tErr = 0, tTimer = null, tTried = new Set(), tipTimer = null;
 function tip(t) {
   const el = $('styletip'); el.textContent = t; el.style.opacity = 1;
@@ -873,7 +877,7 @@ function nextWorking() {
   // automatischer Wechsel: nächste noch nicht probierte Quelle (Satellit nur als letzte)
   for (let k = 1; k <= TILES.length; k++) {
     const j = (tIdx + k) % TILES.length;
-    if (!tTried.has(j)) return j;
+    if (!tTried.has(j) && !TILES[j].sat) return j;
   }
   return -1;
 }
@@ -881,16 +885,16 @@ function setTiles(i, auto) {
   if (tLayer) map.removeLayer(tLayer);
   clearTimeout(tTimer);
   tIdx = i; tOk = 0; tErr = 0; tTried.add(i);
-  const layer = L.tileLayer(TILES[i].u, TILES[i].o).addTo(map);
+  const layer = (TILES[i].wms ? L.tileLayer.wms(TILES[i].u, TILES[i].o) : L.tileLayer(TILES[i].u, TILES[i].o)).addTo(map);
   tLayer = layer;
   layer.on('tileload', () => { tOk++; });
   const fail = () => {
     if (tLayer !== layer || tOk > 0) return;
-    const j = nextWorking();
-    if (j >= 0) { setTiles(j, true); tip('Kartenstil: ' + TILES[j].n); }
+    const j = TILES[i].sat ? BASE[0] : nextWorking();
+    if (j >= 0) { setTiles(j, true); tip((TILES[i].sat ? TILES[i].n + ' nicht erreichbar, ' : '') + 'Kartenstil: ' + TILES[j].n); }
   };
   layer.on('tileerror', () => { tErr++; if (tErr >= 4 && tOk === 0) fail(); });
-  tTimer = setTimeout(fail, 7000);  // nichts geladen (auch ohne Fehlermeldung) -> wechseln
+  tTimer = setTimeout(fail, TILES[i].sat ? 12000 : 7000);  // nichts geladen (auch ohne Fehlermeldung) -> wechseln
 }
 setTiles(0);
 (D.attrib || []).forEach(a => map.attributionControl.addAttribution(a));
@@ -1072,7 +1076,17 @@ $('fbtn').addEventListener('click', () => {
   follow = !follow; $('fbtn').classList.toggle('on', follow);
   if (follow && lastPos) map.setView(lastPos, Math.max(map.getZoom(), 17), {animate: false});
 });
-$('layers').addEventListener('click', () => { tTried = new Set(); const j = (tIdx + 1) % TILES.length; setTiles(j); tip('Kartenstil: ' + TILES[j].n); });
+$('layers').addEventListener('click', () => {
+  tTried = new Set();
+  const k = BASE.indexOf(tIdx);
+  setTiles(k < 0 ? BASE[0] : BASE[(k + 1) % BASE.length]); tip('Kartenstil: ' + TILES[tIdx].n);
+});
+$('sat').addEventListener('click', () => {
+  tTried = new Set();
+  const k = SAT.indexOf(tIdx);
+  const j = k < 0 ? SAT[0] : (k + 1 < SAT.length ? SAT[k + 1] : BASE[0]);  // Satellit -> Luftbild -> Sentinel -> zurück zur Karte
+  setTiles(j); tip(TILES[j].sat ? '🛰️ ' + TILES[j].n : 'Kartenstil: ' + TILES[j].n);
+});
 $('fit').addEventListener('click', fitRoute);
 map.on('dragstart', () => { follow = false; $('fbtn').classList.remove('on'); });
 
@@ -2058,23 +2072,32 @@ st.set_page_config(page_title="Green-Walker", page_icon="🌳", layout="centered
 
 BASE_CSS = """
 <style>
-.block-container{padding-top:1.4rem;max-width:720px}
-h1,h2,h3,h4{font-family:Georgia,"Iowan Old Style","Palatino Linotype",serif;letter-spacing:-.005em}
-.hero{border-radius:22px;padding:22px 22px;margin-bottom:16px;color:#FBF7EE;
- background:linear-gradient(135deg,#4E6E45 0%,#7E9A6A 58%,#B9A77C 100%);box-shadow:0 8px 24px rgba(78,110,69,.22)}
-.hero h1{margin:0;font-size:1.8rem;line-height:1.1;color:#FBF7EE}
-.hero p{margin:6px 0 0;font-size:1rem;color:#FBF7EE}
-.st-key-card_route,.st-key-card_loop{background:#FBF8F1;border:1px solid #D9CFBC;border-radius:20px;
- padding:18px 16px 14px;box-shadow:0 4px 18px rgba(60,50,30,.08);margin-top:12px}
-.hint{opacity:.75;font-size:.92rem;margin:-4px 0 8px}
+:root{--moss:#4E6E45;--sage:#9DB38A;--sand:#E9E1D2;--paper:#FBF8F1;--line:#D9CFBC;--text:#3B3A33}
+html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp p,.stApp li,.stApp div,
+.stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp [data-baseweb]{font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+.block-container{padding-top:1.2rem;max-width:680px}
+.hero{display:flex;gap:14px;align-items:center;border-radius:16px;padding:14px 16px;margin-bottom:14px;
+ background:var(--moss);color:#FBF7EE;box-shadow:0 6px 18px rgba(60,50,30,.3)}
+.hero .ico{font-size:36px;line-height:1;width:46px;text-align:center;flex:none}
+.hero h1{margin:0;padding:0;font-size:1.5rem;font-weight:700;line-height:1.1;color:#FBF7EE;letter-spacing:0}
+.hero p{margin:2px 0 0;font-size:1rem;color:#FBF7EE;opacity:.92}
+.st-key-card_route,.st-key-card_loop{background:rgba(251,248,241,.98);border:1px solid var(--line);border-radius:20px;
+ padding:14px 14px 12px;box-shadow:0 8px 28px rgba(60,50,30,.18);margin-top:12px}
+.st-key-card_route label p,.st-key-card_loop label p{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;
+ opacity:.7;font-weight:600}
+.hint{opacity:.7;font-size:.8rem;margin:-4px 0 8px}
+.stCaption,[data-testid="stCaptionContainer"]{font-size:.8rem;opacity:.7}
 .trip{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 10px}
-.pill{border-radius:999px;padding:6px 14px;background:#E7EDDB;color:#3B3A33;border:1px solid #9DB38A;font-size:.92rem}
-.stButton>button{border-radius:14px;font-weight:600;padding:.6rem 1rem}
-.stButton>button[kind="primary"]{background:#5E7F52;border-color:#5E7F52;color:#FBF7EE;height:3rem;font-size:1.05rem}
-.stButton>button[kind="primary"]:hover{background:#4E6E45;border-color:#4E6E45;color:#FBF7EE}
-.stTabs [data-baseweb="tab-list"]{gap:4px;background:#E9E1D2;padding:4px;border-radius:14px}
-.stTabs [data-baseweb="tab"]{flex:1;justify-content:center;height:42px;border-radius:10px;font-weight:600;color:#6B675B}
-.stTabs [aria-selected="true"]{background:#FBF8F1;color:#3B3A33;box-shadow:0 1px 4px rgba(60,50,30,.18)}
+.pill{border-radius:14px;padding:8px 12px;background:#E7EDDB;color:var(--text);border:1px solid var(--sage);
+ font-size:.92rem;font-weight:600}
+.stButton>button{border-radius:14px;font-weight:600;padding:.6rem 1rem;border:1px solid var(--line);background:#fff;color:var(--text)}
+.stButton>button[kind="primary"]{background:#5E7F52;border-color:#5E7F52;color:#FBF7EE;height:3rem;font-size:1rem;font-weight:700}
+.stButton>button[kind="primary"]:hover{background:var(--moss);border-color:var(--moss);color:#FBF7EE}
+[data-baseweb="input"],[data-baseweb="select"]>div,[data-baseweb="base-input"]{border-radius:14px!important}
+.stTabs [data-baseweb="tab-list"]{gap:8px;background:transparent;padding:0}
+.stTabs [data-baseweb="tab"]{flex:1;justify-content:center;height:46px;border-radius:14px;font-weight:700;
+ color:var(--text);background:#fff;border:1px solid var(--line)}
+.stTabs [aria-selected="true"]{background:#E7EDDB;border-color:var(--sage);color:var(--text);box-shadow:none}
 .stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"]{display:none}
 </style>
 """
@@ -2189,7 +2212,9 @@ def sources_text(buf, lam):
         "- Ortssuche: Photon (photon.komoot.io) auf OSM-Basis, Fallback Nominatim\n"
         "- Ersatz bei überlasteten Servern (Grün-Scan): Vektorkacheln von OpenFreeMap (OpenMapTiles, "
         "OSM-Daten) + Routenserver von FOSSGIS (routing.openstreetmap.de)\n"
-        "- Kartenhintergrund: Esri Topo (Standard), Esri Straßen, OpenTopoMap, OpenStreetMap, Esri Satellit\n"
+        "- Kartenhintergrund: Esri Topo (Standard), Esri Straßen, OpenTopoMap, OpenStreetMap\n"
+        "- Satellit/Luftbild (🛰️): Esri World Imagery; Geobasis NRW Digitalorthophotos 10 cm (nur NRW, dl-de/zero); "
+        "Sentinel-2 cloudless 2025 von EOX (10 m, nicht kommerziell, © EOX IT Services GmbH, Copernicus-Sentinel-Daten)\n"
         f"- Grünflächen-Tags: `{GREEN_TAGS}`\n"
         f"- Score je Abtastpunkt: 1,0 im Park, linear fallend auf 0 im Abstand von {buf} m\n"
         f"- Kantenscore: Mittel aus {SAMPLES} Abtastpunkten\n"
@@ -2364,8 +2389,8 @@ def home_loop():
 
 
 def render_home():
-    st.markdown('<div class="hero"><h1>🌳 Green-Walker</h1>'
-                '<p>Gehe den grünen Weg: vorbei an Parks und Grün statt nur auf kürzester Strecke.</p></div>',
+    st.markdown('<div class="hero"><div class="ico">🌳</div><div><h1>Green-Walker</h1>'
+                '<p>Der grüne Weg statt nur der kürzeste.</p></div></div>',
                 unsafe_allow_html=True)
     tab_route, tab_loop = st.tabs(["🧭 Route", "🔄 Ründchen"])
     with tab_route:
