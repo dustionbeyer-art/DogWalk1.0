@@ -15,6 +15,7 @@ Grün:   Mittel über 8 Abtastpunkte je Kante; 1.0 im Park, linear fallend
 import json
 import math
 import os
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 from html import escape
@@ -34,15 +35,19 @@ from streamlit_searchbox import st_searchbox
 
 ox.settings.use_cache = True
 ox.settings.log_console = False
-ox.settings.requests_timeout = 45
+ox.settings.requests_timeout = 30
 ox.settings.overpass_rate_limit = False
 
 # Mehrere Overpass-Server: der Hauptserver ist oft überlastet (502/504).
 OVERPASS_MIRRORS = [
     "https://overpass.kumi.systems/api",
     "https://overpass-api.de/api",
+    "https://lz4.overpass-api.de/api",
+    "https://z.overpass-api.de/api",
     "https://overpass.private.coffee/api",
+    "https://maps.mail.ru/osm/tools/overpass/api",
 ]
+LOAD_DEADLINE_S = 150  # nach dieser Zeit gibt die App auf und zeigt eine verständliche Meldung
 try:
     from osmnx import errors as ox_errors
 except Exception:  # pragma: no cover
@@ -253,7 +258,7 @@ def corridor_bbox(p1, p2):
     ky = 111_320.0
     kx = ky * math.cos(math.radians((lat1 + lat2) / 2))
     span = max(abs(lon2 - lon1) * kx, abs(lat2 - lat1) * ky)
-    pad = max(600.0, 0.3 * span)
+    pad = max(500.0, 0.25 * span)
     bbox = (round(min(lon1, lon2) - pad / kx, 4), round(min(lat1, lat2) - pad / ky, 4),
             round(max(lon1, lon2) + pad / kx, 4), round(max(lat1, lat2) + pad / ky, 4))
     return bbox, span
@@ -278,9 +283,15 @@ def load_area(bbox):
         gdf["name"] = gdf["name"].fillna("Grünfläche").astype(str)
         return gdf[["name", "geometry"]]
 
+    # Server in zufälliger Reihenfolge probieren (der Hauptserver wird nicht immer zuerst belastet),
+    # mehrere Runden mit wachsender Pause. Bereits erfolgreich geladene Teile liegen im osmnx-Cache
+    # und werden bei einem erneuten Versuch nicht noch einmal abgerufen.
     G0 = parks = last = None
-    for attempt in range(2):
-        for base in OVERPASS_MIRRORS:
+    t_end = time.time() + LOAD_DEADLINE_S
+    for rnd in range(3):
+        for base in random.sample(OVERPASS_MIRRORS, len(OVERPASS_MIRRORS)):
+            if time.time() > t_end:
+                break
             use_mirror(base)
             try:
                 with ThreadPoolExecutor(max_workers=2) as ex:
@@ -290,9 +301,9 @@ def load_area(bbox):
             except Exception as e:
                 last = e
                 G0 = parks = None
-        if G0 is not None:
+        if G0 is not None or time.time() > t_end:
             break
-        time.sleep(4)
+        time.sleep(5 * (rnd + 1))
     if G0 is None:
         raise RuntimeError(f"Alle Kartenserver sind gerade überlastet. ({last})")
 
@@ -1150,7 +1161,10 @@ def show_error(e):
     msg = str(e)
     if any(x in msg for x in ("502", "503", "504", "überlastet", "Timeout", "timed out", "capacity")):
         st.error("Die freien Kartenserver (OpenStreetMap/Overpass) sind gerade überlastet. "
-                 "Ich habe mehrere Server probiert. Bitte in 1 bis 2 Minuten noch einmal versuchen.")
+                 "Ich habe mehrere Server und mehrere Runden probiert. Bitte in ein paar Minuten noch "
+                 "einmal auf den Knopf tippen. Schon geladene Teile sind zwischengespeichert, "
+                 "ein neuer Versuch geht deshalb oft schneller. Besonders ruhig sind die Server meist "
+                 "vormittags.")
     elif isinstance(e, ValueError):
         st.error(msg)
     else:
