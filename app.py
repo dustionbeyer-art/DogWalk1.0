@@ -13,6 +13,7 @@ Kosten: kosten(kante) = laenge * (1 + LAMBDA * (1 - gruen(kante)) + RUHE * haupt
 Grün:   Mittel über 8 Abtastpunkte je Kante; 1.0 im Park, linear fallend
         auf 0 im Abstand "Grün-Reichweite".
 """
+import base64
 import gzip
 import hashlib
 import json
@@ -478,7 +479,7 @@ def walk_xml(path):
     return out
 
 
-@st.cache_resource(show_spinner=False, max_entries=4)
+@st.cache_resource(show_spinner=False, max_entries=2, ttl=3600)
 def load_area(bbox):
     path = fetch_osm(bbox, time.time() + LOAD_DEADLINE_S)
     try:
@@ -1758,7 +1759,7 @@ def _edt(mask, cell):
     return (ndimage.distance_transform_edt(~mask) * cell).astype(np.float32)
 
 
-@st.cache_resource(show_spinner=False, max_entries=3)
+@st.cache_resource(show_spinner=False, max_entries=2, ttl=3600)
 def scan_area(bbox):
     """Lädt die Vektorkacheln für das Gebiet und baut die Abstandskarten."""
     if ndimage is None:
@@ -2232,12 +2233,12 @@ def tour_points(start_v, stops_v, end_v):
     return pts, [_short(lab1)] + [_short(lab) for _, _, lab in stops] + [_short(lab2)], stops
 
 
-def points_bbox(pts):
+def points_bbox(pts, extra_m=0.0):
     ky = 111_320.0
     lats, lons = [p[0] for p in pts], [p[1] for p in pts]
     kx = ky * math.cos(math.radians(sum(lats) / len(lats)))
     span = max((max(lons) - min(lons)) * kx, (max(lats) - min(lats)) * ky)
-    pad = max(700.0, 0.4 * span)
+    pad = max(700.0, 0.4 * span) + 0.4 * extra_m
     return (round(min(lons) - pad / kx, 4), round(min(lats) - pad / ky, 4),
             round(max(lons) + pad / kx, 4), round(max(lats) + pad / ky, 4)), span
 
@@ -2264,6 +2265,52 @@ def tour_path(area, g, lam, mu, wq, nodes):
     return full, marks[:-1]
 
 
+def tour_extra_variants(area, g, lam, mu, wq, nodes, extra_m):
+    """Fügt eine Extra-Schleife von etwa extra_m hinzu: ein grüner Umweg-Punkt wird vor dem ersten bzw. nach
+    dem letzten Zwischenziel eingefügt, sein Abstand wird an die Wunschlänge angepasst."""
+    ng = node_green(area, g)
+    base, _ = tour_path(area, g, lam, mu, wq, nodes)
+    st0 = loop_stats(area, g, base)
+    base_len = st0[0] if st0 else 0.0
+    cands = []
+    for pos in sorted({0, len(nodes) - 2}):
+        ax, ay = area["pos"][nodes[pos]]
+        for k in range(6):
+            theta = 2 * math.pi * k / 6
+            rho = extra_m / 2.6
+            for _ in range(3):
+                w_node = pick_waypoint(area, ng, ax + rho * math.cos(theta), ay + rho * math.sin(theta), 0.3 * rho)
+                seq = nodes[:pos + 1] + [w_node] + nodes[pos + 1:]
+                try:
+                    path, marks = tour_path(area, g, lam, mu, wq, seq)
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    break
+                st_ = loop_stats(area, g, path)
+                if not st_:
+                    break
+                dist, green, rep, noise = st_
+                got = dist - base_len
+                cands.append({"path": path, "marks": marks[:pos] + marks[pos + 1:], "pos": pos, "dist": dist,
+                              "green": green, "rep": rep, "noise": noise, "got": got})
+                if abs(got / extra_m - 1) <= 0.12:
+                    break
+                rho *= min(max(extra_m / max(got, 0.2 * extra_m), 0.5), 2.0)
+    for c in cands:
+        c["score"] = c["green"] - 0.8 * c["rep"] - 0.4 * mu * c["noise"] - 2.0 * abs(c["got"] / extra_m - 1)
+    cands.sort(key=lambda c: -c["score"])
+    picked = []
+    for c in cands:
+        if abs(c["got"] / extra_m - 1) > 0.35:
+            continue
+        es = edge_set(c["path"])
+        if all(len(es & p["es"]) / len(es | p["es"]) < 0.6 for p in picked):
+            c["es"] = es
+            picked.append(c)
+        if len(picked) == 3:
+            break
+    return picked
+
+
 def _tour_payload(mode_extra, p1, pe, t1, t2, stops, options, parks, default, attrib=None):
     payload = dict(mode="tour", p1=list(p1), p2=list(pe), t1=t1, t2=t2, parks=parks, options=options,
                    default=default, speed=M_PER_MIN, topPad=TOP_PAD,
@@ -2273,9 +2320,10 @@ def _tour_payload(mode_extra, p1, pe, t1, t2, stops, options, parks, default, at
     return payload
 
 
-def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None):
+def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None, extra_km=0):
     pts, names, stops = tour_points(start_v, stops_v, end_v)
-    bbox, span = points_bbox(pts)
+    extra_m = extra_km * 1000.0
+    bbox, span = points_bbox(pts, extra_m)
     if span > MAX_SPAN_M:
         raise ValueError(f"Die Punkte liegen {span / 1000:.1f} km auseinander. "
                          f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
@@ -2291,12 +2339,26 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None)
     loop = pts[0] == pts[-1]
     title = " → ".join(names)
     options, seen = [], set()
-    for name in TOUR_LEVELS:
-        mu, wq = level_quiet(name)
+    runs = []  # (Name, Pfad, Marken, Hinweis)
+    if extra_m > 0:
+        log(f"➕ Extra-Strecke von etwa {extra_km} km einbauen")
+        mu, wq = level_quiet(level)
         try:
-            path, marks = tour_path(area, g, LEVELS[name], mu, wq, nodes)
+            vs = tour_extra_variants(area, g, LEVELS[level], mu, wq, nodes, extra_m)
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             raise ValueError("Zwischen den Punkten gibt es keinen Fußweg im geladenen Gebiet.")
+        for i, v in enumerate(vs):
+            runs.append((f"Variante {i + 1}", v["path"], v["marks"],
+                         f"Extra {fmt_km(v['got'])} (Wunsch +{extra_km} km) · "))
+    else:
+        for name in TOUR_LEVELS:
+            mu, wq = level_quiet(name)
+            try:
+                path, marks = tour_path(area, g, LEVELS[name], mu, wq, nodes)
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                raise ValueError("Zwischen den Punkten gibt es keinen Fußweg im geladenen Gebiet.")
+            runs.append((name, path, marks, f"{LEVEL_HINT[name]} · "))
+    for name, path, marks, pre in runs:
         key = tuple(path)
         if key in seen:
             continue
@@ -2312,7 +2374,7 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None)
         mins = max(1, round(dist / M_PER_MIN))
         options.append(_option(
             nav, name, f"{fmt_km(dist)} · {green:.0%} grün",
-            f"{LEVEL_HINT[name]} · {1 - rep:.0%} ohne Doppelweg" + (f" · {narrow:.0%} kleine Wege" if LEVELS[name] >= 12 else ""),
+            f"{pre}{1 - rep:.0%} ohne Doppelweg" + (f" · {narrow:.0%} kleine Wege" if LEVELS[level if extra_m > 0 else name] >= 12 else ""),
             [["Länge", fmt_km(dist)], ["Dauer", f"{mins} min"], ["Grünanteil", f"{green:.0%}"],
              ["Hauptstraße", f"{noise:.0%}"]]))
     if not options:
@@ -2328,7 +2390,7 @@ def _merge_routes(routes):
     for rt in routes:
         c = rt["geometry"]["coordinates"]
         coords += c if not coords else c[1:]
-        legs += (rt.get("legs") or [{"steps": []}])[:1]
+        legs += rt.get("legs") or [{"steps": []}]
         marks.append(len(coords) - 1)
         dist += float(rt.get("distance", 0))
     return {"distance": dist, "geometry": {"type": "LineString", "coordinates": coords}, "legs": legs}, marks
@@ -2343,10 +2405,66 @@ def _add_waypoint_steps(nav, marks, names):
     return nav
 
 
-def scan_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None):
+def _scan_tour_extra(sa, pts, legs, chosen, lam, mu, buf, extra_m, log):
+    """Extra-Schleife im Ersatzmodus: über einen grünen Umweg-Punkt in einer Teilstrecke fahren."""
+    base_rt, base_marks = _merge_routes([c[0] for c in chosen])
+    base_len = scan_score(sa, _route_ll(base_rt), buf)["dist"]
+    cands = []
+
+    def attempt(pos, theta, rho):
+        a, b = pts[pos], pts[pos + 1]
+        ax, ay = _to_xy(sa, a[0], a[1])
+        x, y = _snap_green(sa, float(ax) + rho * math.cos(theta), float(ay) + rho * math.sin(theta), 0.4 * rho)
+        wla, wlo = _to_ll(sa, x, y)
+        rt = osrm_request([a, (float(wla), float(wlo)), b])[0]
+        ks = _grid_keys(_route_ll(rt))
+        ch = list(chosen)
+        ch[pos] = (rt, None, ks)
+        merged, marks = _merge_routes([c[0] for c in ch])
+        sc = scan_score(sa, _route_ll(merged), buf)
+        if sc["dist"] <= 0:
+            return None
+        c = {"merged": merged, "marks": marks, "sc": sc, "got": sc["dist"] - base_len, "pos": pos,
+             "theta": theta, "rho": rho}
+        c["score"] = (sc["green"] - 0.8 * sc["rep"] - 0.25 * mu * sc["noise"] - 2.0 * abs(c["got"] / extra_m - 1))
+        return c
+
+    for pos in sorted({0, len(chosen) - 1}):
+        for k in range(4):
+            try:
+                c = attempt(pos, 2 * math.pi * k / 4 + 0.4, extra_m / 2.6)
+            except Exception:
+                continue
+            if c:
+                cands.append(c)
+    cands.sort(key=lambda c: -c["score"])
+    for c in list(cands[:3]):  # einmal auf die Wunschlänge nachjustieren
+        if abs(c["got"] / extra_m - 1) > 0.12 and c["got"] > 0:
+            try:
+                c2 = attempt(c["pos"], c["theta"], c["rho"] * min(max(extra_m / c["got"], 0.5), 2.0))
+            except Exception:
+                c2 = None
+            if c2:
+                cands.append(c2)
+    cands.sort(key=lambda c: -c["score"])
+    picked = []
+    for c in cands:
+        if abs(c["got"] / extra_m - 1) > 0.4:
+            continue
+        ks = _grid_keys(_route_ll(c["merged"]))
+        if all(len(ks & p["ks"]) / max(len(ks | p["ks"]), 1) < 0.6 for p in picked):
+            c["ks"] = ks
+            picked.append(c)
+        if len(picked) == 3:
+            break
+    return picked
+
+
+def scan_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None, extra_km=0):
     """Ründchen mit Zwischenzielen ohne Overpass: je Teilstrecke Varianten vom Routenserver, per Grün-Scan bewertet."""
     pts, names, stops = tour_points(start_v, stops_v, end_v)
-    bbox, span = points_bbox(pts)
+    extra_m = extra_km * 1000.0
+    bbox, span = points_bbox(pts, extra_m)
     if span > MAX_SPAN_M:
         raise ValueError(f"Die Punkte liegen {span / 1000:.1f} km auseinander. "
                          f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
@@ -2364,7 +2482,31 @@ def scan_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None)
     loop = pts[0] == pts[-1]
     title = " → ".join(names)
     options, seen = [], set()
-    for name in TOUR_LEVELS:
+    if extra_m > 0:
+        lam, mu = LEVELS[level], level_quiet(level)[0]
+        chosen, used = [], set()
+        for cands in legs:
+            def cost(c):
+                rt, x, ks = c
+                ov = len(ks & used) / max(len(ks), 1) if used else 0.0
+                return x["dist"] * (1 + lam * (1 - x["green"]) + mu * x["noise"]) * (1 + 1.5 * ov)
+            best = min(cands, key=cost)
+            chosen.append(best)
+            used |= best[2]
+        log(f"➕ Extra-Strecke von etwa {extra_km} km einbauen")
+        for i, c in enumerate(_scan_tour_extra(sa, pts, legs, chosen, lam, mu, buf, extra_m, log)):
+            nav = osrm_nav(c["merged"], title)
+            if not nav:
+                continue
+            nav = _add_waypoint_steps(nav, c["marks"][:-1], names[1:-1])
+            options.append(_scan_option(
+                nav, f"Variante {i + 1}", f"{fmt_km(c['sc']['dist'])} · {c['sc']['green']:.0%} grün",
+                f"Extra {fmt_km(c['got'])} (Wunsch +{extra_km} km) · {1 - c['sc']['rep']:.0%} ohne Doppelweg · {SCAN_NOTE}",
+                c["sc"]))
+        runs_levels = []
+    else:
+        runs_levels = TOUR_LEVELS
+    for name in runs_levels:
         lam, mu = LEVELS[name], level_quiet(name)[0]
         chosen, used = [], set()
         for cands in legs:
@@ -2396,24 +2538,65 @@ def scan_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None)
             "t2": names[-1], "stops": names[1:-1], "start": start_v, "buf": buf, "fallback": "scan"}
 
 
-def make_tour_view_safe(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None):
+def make_tour_view_safe(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None, extra_km=0):
     try:
-        return make_tour_view(start_v, stops_v, end_v, level, buf, log)
+        return make_tour_view(start_v, stops_v, end_v, level, buf, log, extra_km)
     except ValueError:
         raise
     except Exception as e:
         log("⚠️ OSM-Server überlastet: ich nutze den Grün-Scan")
         try:
-            return scan_tour_view(start_v, stops_v, end_v, level, buf, log)
+            return scan_tour_view(start_v, stops_v, end_v, level, buf, log, extra_km)
         except ValueError:
             raise
         except Exception:
             raise e
 
 
+# ------------------------------------------------------- Logo / App-Ikon (eingebettet, keine Zusatzdateien nötig)
+# Blatt mit Zielpunkt: Kleinform fürs Ikon (Browser-Tab 64 px, Home-Bildschirm 180 px)
+ICON_FAV_B64 = "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"
+ICON_TOUCH_B64 = "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"
+LOGO_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="60 60 380 390" width="46" height="46">'
+    '<g transform="translate(256 256) scale(1.08) translate(-256 -250)">'
+    '<path d="M150 372C124 236 214 138 392 118C410 300 316 396 150 372Z" fill="#FBF7EE"/>'
+    '<path d="M146 376L104 420" stroke="#FBF7EE" stroke-width="20" stroke-linecap="round"/>'
+    '<path d="M176 346C238 330 238 276 284 250C328 226 336 190 356 160" fill="none" stroke="#4E6E45" '
+    'stroke-width="17" stroke-linecap="round" stroke-dasharray="1 33"/>'
+    '<circle cx="358" cy="156" r="21" fill="#B07A35"/></g></svg>'
+)
+ICON_JS = """<script>(function(){try{var d=window.parent.document,h=d.head;
+d.querySelectorAll('link[rel*="icon"]').forEach(function(e){e.remove()});
+function L(r,u,s){var l=d.createElement('link');l.rel=r;l.href=u;l.sizes=s;h.appendChild(l)}
+L('icon','data:image/png;base64,__FAV__','64x64');
+L('apple-touch-icon','data:image/png;base64,__TOUCH__','180x180');
+var m=d.querySelector('meta[name="apple-mobile-web-app-title"]');
+if(!m){m=d.createElement('meta');m.name='apple-mobile-web-app-title';h.appendChild(m)}
+m.content='Green-Walker'}catch(e){}})();</script>"""
+
+
+def page_icon():
+    try:
+        import io
+        from PIL import Image
+        return Image.open(io.BytesIO(base64.b64decode(ICON_FAV_B64)))
+    except Exception:
+        return "🌳"
+
+
+def install_icons():
+    """Setzt Tab-Ikon und Home-Bildschirm-Ikon (Apple Touch Icon) im Elternfenster."""
+    try:
+        st_html(ICON_JS.replace("__FAV__", ICON_FAV_B64).replace("__TOUCH__", ICON_TOUCH_B64), height=0)
+    except Exception:
+        pass
+
+
 # ------------------------------------------------------- UI
-st.set_page_config(page_title="Green-Walker", page_icon="🌳", layout="centered",
+st.set_page_config(page_title="Green-Walker", page_icon=page_icon(), layout="centered",
                    initial_sidebar_state="collapsed")
+install_icons()
 
 BASE_CSS = """
 <style>
@@ -2785,6 +2968,9 @@ def home_tour():
         same = st.checkbox("Runde endet wieder am Startpunkt", value=True, key="tour_same")
         b_v = None if same else place_input("Endpunkt", "tour_b_sb")
         st.caption(SEARCH_TIP)
+        extra_opt = st.selectbox("Extra Strecke (optional)", ["Keine"] + [f"+ {k} km" for k in range(1, 11)],
+                                 key="tour_extra", help="Verlängert die Runde um diese Strecke, zusätzlich zum Weg über die Zwischenziele.")
+        extra_km = 0 if extra_opt == "Keine" else int(extra_opt.replace("+", "").replace("km", "").strip())
         level = st.select_slider("Wie grün soll es sein?", options=TOUR_LEVELS, value="Sehr grün", key="level_tour")
         go = st.button("Ründchen mit Zwischenziel finden", type="primary", use_container_width=True, key="go_tour")
     if not go:
@@ -2795,7 +2981,7 @@ def home_tour():
     view = None
     with st.status("Runde mit Zwischenzielen wird berechnet …", expanded=True) as status:
         try:
-            view = make_tour_view_safe(a_v, stops, None if same else b_v, level, log=st.write)
+            view = make_tour_view_safe(a_v, stops, None if same else b_v, level, log=st.write, extra_km=extra_km)
             status.update(label="Fertig", state="complete", expanded=False)
         except Exception as e:
             status.update(label="Fehler", state="error")
@@ -2806,7 +2992,9 @@ def home_tour():
 
 
 def render_home():
-    st.markdown('<div class="hero"><div class="ico">🌳</div><div><h1>Green-Walker</h1>'
+    logo = base64.b64encode(LOGO_SVG.encode()).decode()
+    st.markdown('<div class="hero"><div class="ico"><img src="data:image/svg+xml;base64,' + logo +
+                '" width="46" height="46" alt=""></div><div><h1>Green-Walker</h1>'
                 '<p>Der grüne Weg statt nur der kürzeste.</p></div></div>',
                 unsafe_allow_html=True)
     tab_route, tab_loop, tab_tour = st.tabs(["🧭 Route", "🔄 Ründchen", "🛍️ Ründchen mit Zwischenziel"])
