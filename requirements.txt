@@ -1,8 +1,7 @@
 osmnx>=2.0
-streamlit>=1.35
+streamlit>=1.40
 streamlit-searchbox>=0.1.14
 streamlit-js-eval>=0.1.7
-folium>=0.16
 geopandas>=1.0
 shapely>=2.0
 networkx>=3.2
