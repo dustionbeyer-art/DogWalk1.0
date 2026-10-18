@@ -13,6 +13,7 @@ Grün:   Mittel über 8 Abtastpunkte je Kante; 1.0 im Park, linear fallend
         auf 0 im Abstand "Grün-Reichweite".
 """
 import math
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -24,10 +25,11 @@ import osmnx as ox
 import requests
 import shapely
 import streamlit as st
-from folium.plugins import AntPath, Fullscreen, LocateControl, PolyLineTextPath
+from folium.plugins import AntPath, Fullscreen, LocateControl
 from shapely import STRtree
 from shapely.geometry import LineString, Point
 from streamlit.components.v1 import html as st_html
+from streamlit_js_eval import get_geolocation
 from streamlit_searchbox import st_searchbox
 
 ox.settings.use_cache = True
@@ -61,6 +63,38 @@ GREEN_TAGS = {
     "landuse": ["grass", "forest", "village_green"],
     "natural": ["wood"],
 }
+# Naturtöne: Moos, Salbei, Sand, Lehm, Stein
+C_MOSS, C_SAGE, C_SAND = "#4E6E45", "#9DB38A", "#E9E1D2"
+C_ROUTE, C_PULSE = "#3F6B3A", "#CFE3BE"          # grüne Route
+C_SHORT = "#C08A47"                              # kürzeste Route (Ocker statt Rot)
+C_STONE = "#8A8577"                              # andere Varianten
+C_PARK_FILL, C_PARK_LINE = "#B5CDA0", "#7C9F69"
+C_TEXT = "#3B3A33"
+
+THEME_TOML = """[theme]
+base = "light"
+primaryColor = "#5E7F52"
+backgroundColor = "#F4EFE6"
+secondaryBackgroundColor = "#E9E1D2"
+textColor = "#3B3A33"
+font = "sans serif"
+"""
+
+
+def ensure_theme():
+    """Legt die Theme-Datei an, falls sie fehlt (greift ggf. erst nach einem Neustart der App)."""
+    p = os.path.join(".streamlit", "config.toml")
+    if not os.path.exists(p):
+        try:
+            os.makedirs(".streamlit", exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(THEME_TOML)
+        except Exception:
+            pass
+
+
+ensure_theme()
+
 SAMPLES = 8
 MAX_BUF = 400
 MAX_SPAN_M = 9000
@@ -337,23 +371,24 @@ def _popup(title, r):
                         f"{r['green']:.0%} Grünanteil".replace(",", "."), max_width=220)
 
 
-LEGEND_AB = """
-<div style="position:fixed;bottom:24px;left:12px;z-index:9999;background:rgba(255,255,255,.96);
-padding:10px 14px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.25);
-font:13px/1.7 system-ui,-apple-system,sans-serif;color:#222">
-<div><span style="display:inline-block;width:24px;height:5px;background:#0d7a45;border-radius:3px;vertical-align:middle;margin-right:8px"></span>Grüne Route</div>
-<div><span style="display:inline-block;width:24px;border-top:3px dashed #e4572e;vertical-align:middle;margin-right:8px"></span>Kürzeste Route</div>
-<div><span style="display:inline-block;width:14px;height:14px;background:#9fd89a;border:1px solid #4f9d57;border-radius:4px;vertical-align:middle;margin-right:10px"></span>Park / Grünfläche</div>
-</div>"""
+def _legend(items):
+    rows = "".join(f'<div>{sw}{txt}</div>' for sw, txt in items)
+    return ('<div style="position:fixed;bottom:24px;left:12px;z-index:9999;background:rgba(251,248,241,.96);'
+            'padding:10px 14px;border-radius:12px;box-shadow:0 2px 10px rgba(60,50,30,.25);'
+            f'font:13px/1.7 system-ui,-apple-system,sans-serif;color:{C_TEXT}">{rows}</div>')
 
-LEGEND_LOOP = """
-<div style="position:fixed;bottom:24px;left:12px;z-index:9999;background:rgba(255,255,255,.96);
-padding:10px 14px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.25);
-font:13px/1.7 system-ui,-apple-system,sans-serif;color:#222">
-<div><span style="display:inline-block;width:24px;height:5px;background:#0d7a45;border-radius:3px;vertical-align:middle;margin-right:8px"></span>Ründchen (Pfeile: Laufrichtung)</div>
-<div><span style="display:inline-block;width:24px;border-top:3px dashed #7a8f84;vertical-align:middle;margin-right:8px"></span>Andere Varianten (Ebenen-Menü)</div>
-<div><span style="display:inline-block;width:14px;height:14px;background:#9fd89a;border:1px solid #4f9d57;border-radius:4px;vertical-align:middle;margin-right:10px"></span>Park / Grünfläche</div>
-</div>"""
+
+def _line_sw(color, dashed=False):
+    st_ = f"border-top:3px dashed {color}" if dashed else f"height:5px;background:{color};border-radius:3px"
+    return f'<span style="display:inline-block;width:24px;{st_};vertical-align:middle;margin-right:8px"></span>'
+
+
+PARK_SW = (f'<span style="display:inline-block;width:14px;height:14px;background:{C_PARK_FILL};'
+           f'border:1px solid {C_PARK_LINE};border-radius:4px;vertical-align:middle;margin-right:10px"></span>')
+LEGEND_AB = _legend([(_line_sw(C_ROUTE), "Grüne Route"), (_line_sw(C_SHORT, True), "Kürzeste Route"),
+                     (PARK_SW, "Park / Grünfläche")])
+LEGEND_LOOP = _legend([(_line_sw(C_ROUTE), "Ründchen"), (_line_sw(C_STONE, True), "Andere Varianten (Ebenen-Menü)"),
+                       (PARK_SW, "Park / Grünfläche")])
 
 
 def _base_map(area):
@@ -362,14 +397,17 @@ def _base_map(area):
                      name="Karte", attr="© OpenStreetMap-Mitwirkende © CARTO",
                      subdomains="abcd", max_zoom=19).add_to(m)
     folium.TileLayer("CartoDB positron", name="Hell").add_to(m)
+    folium.TileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", name="Gelände",
+                     attr="© OpenStreetMap-Mitwirkende, SRTM | © OpenTopoMap (CC-BY-SA)",
+                     subdomains="abc", max_zoom=17).add_to(m)
     folium.TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                      name="Satellit", attr="Esri, Maxar, Earthstar Geographics", max_zoom=19).add_to(m)
     if area["parks_json"]:
         folium.GeoJson(
             area["parks_json"], name="Grünflächen",
-            style_function=lambda _: {"color": "#4f9d57", "fillColor": "#8fd18a",
-                                      "fillOpacity": 0.45, "weight": 1},
-            highlight_function=lambda _: {"fillOpacity": 0.7, "weight": 2},
+            style_function=lambda _: {"color": C_PARK_LINE, "fillColor": C_PARK_FILL,
+                                      "fillOpacity": 0.5, "weight": 1},
+            highlight_function=lambda _: {"fillOpacity": 0.75, "weight": 2},
             tooltip=folium.GeoJsonTooltip(fields=["name"], aliases=["🌳"], labels=True),
         ).add_to(m)
     return m
@@ -385,17 +423,22 @@ def _finish_map(m, pts, legend):
     return m
 
 
+def _draw_green(m, pts, title, res):
+    """Gemeinsamer Stil für die grüne Hauptroute (Route und Ründchen)."""
+    fg = folium.FeatureGroup(name=title).add_to(m)
+    folium.PolyLine(pts, color="#FFFFFF", weight=11, opacity=0.9).add_to(fg)  # helle Kontur
+    AntPath(pts, color=C_ROUTE, pulse_color=C_PULSE, weight=7, delay=1600,
+            dash_array=[18, 28], opacity=1, popup=_popup(title, res)).add_to(fg)
+
+
 def build_map(area, res, p1, p2, t1, t2):
     m = _base_map(area)
     short = route_latlon(area, res["short"]["path"])
     green = route_latlon(area, res["green"]["path"])
     fs = folium.FeatureGroup(name="Kürzeste Route").add_to(m)
-    folium.PolyLine(short, color="#e4572e", weight=4, opacity=0.9, dash_array="8 8",
+    folium.PolyLine(short, color=C_SHORT, weight=4, opacity=0.95, dash_array="8 8",
                     popup=_popup("Kürzeste Route", res["short"])).add_to(fs)
-    fg = folium.FeatureGroup(name="Grüne Route").add_to(m)
-    folium.PolyLine(green, color="#ffffff", weight=11, opacity=0.9).add_to(fg)
-    AntPath(green, color="#0d7a45", pulse_color="#b9f0cb", weight=7, delay=1600,
-            dash_array=[18, 28], opacity=1, popup=_popup("Grüne Route", res["green"])).add_to(fg)
+    _draw_green(m, green, "Grüne Route", res["green"])
     folium.Marker(p1, icon=_pin("🚶"), tooltip=f"Start: {t1}").add_to(m)
     folium.Marker(p2, icon=_pin("🏁"), tooltip=f"Ziel: {t2}").add_to(m)
     return _finish_map(m, short + green, LEGEND_AB)
@@ -544,16 +587,11 @@ def build_loop_map(area, variants, sel, p1, p2, t1, t2):
     others = folium.FeatureGroup(name="Andere Varianten", show=False).add_to(m)
     for i, v in enumerate(variants):
         if i != sel:
-            folium.PolyLine(route_latlon(area, v["path"]), color="#7a8f84", weight=4, opacity=0.85,
+            folium.PolyLine(route_latlon(area, v["path"]), color=C_STONE, weight=4, opacity=0.9,
                             dash_array="6 8", tooltip=f"Variante {i + 1}").add_to(others)
     v = variants[sel]
     pts = route_latlon(area, v["path"])
-    fg = folium.FeatureGroup(name="Ründchen").add_to(m)
-    folium.PolyLine(pts, color="#ffffff", weight=11, opacity=0.9).add_to(fg)
-    line = folium.PolyLine(pts, color="#0d7a45", weight=7, opacity=1,
-                           popup=_popup(f"Variante {sel + 1}", v)).add_to(fg)
-    PolyLineTextPath(line, "      ►      ", repeat=True, offset=5,
-                     attributes={"fill": "#ffffff", "font-weight": "bold", "font-size": "13"}).add_to(fg)
+    _draw_green(m, pts, f"Ründchen (Variante {sel + 1})", v)
     same = p1 == p2
     folium.Marker(p1, icon=_pin("🚶"), tooltip=f"Start{' & Ziel' if same else ''}: {t1}").add_to(m)
     if not same:
@@ -567,24 +605,26 @@ st.markdown(
     """
 <style>
 .block-container{padding-top:1.6rem;max-width:760px}
-.hero{border-radius:20px;padding:26px 24px;margin-bottom:14px;color:#fff;
- background:linear-gradient(135deg,#0d7a45 0%,#2fa866 55%,#7bcf8e 100%);
- box-shadow:0 8px 24px rgba(13,122,69,.25)}
-.hero h1{margin:0 0 4px;font-size:2rem;line-height:1.1;color:#fff}
-.hero p{margin:0;opacity:.92;font-size:1.02rem}
-.card{border:1px solid rgba(127,127,127,.25);background:rgba(127,127,127,.07);
- border-radius:16px;padding:14px 16px;height:100%}
-.card.accent{border-color:#2fa866;background:rgba(47,168,102,.12)}
+h1,h2,h3,h4{font-family:Georgia,"Iowan Old Style","Palatino Linotype",serif;letter-spacing:-.005em}
+.hero{border-radius:20px;padding:26px 24px;margin-bottom:14px;color:#FBF7EE;
+ background:linear-gradient(135deg,#4E6E45 0%,#7E9A6A 58%,#B9A77C 100%);
+ box-shadow:0 8px 24px rgba(78,110,69,.22)}
+.hero h1{margin:0 0 4px;font-size:2rem;line-height:1.1;color:#FBF7EE}
+.hero p{margin:0;font-size:1.02rem;color:#FBF7EE}
+.card{border:1px solid #D9CFBC;background:#FBF8F1;border-radius:16px;padding:14px 16px;height:100%;color:#3B3A33}
+.card.accent{border-color:#9DB38A;background:#E7EDDB}
 .card .lab{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;opacity:.7}
 .card .val{font-size:1.7rem;font-weight:700;line-height:1.2}
 .card .sub{font-size:.85rem;opacity:.75}
-.bar{height:8px;border-radius:6px;background:rgba(127,127,127,.25);margin-top:8px;overflow:hidden}
-.bar>div{height:100%;background:linear-gradient(90deg,#2fa866,#0d7a45);border-radius:6px}
+.bar{height:8px;border-radius:6px;background:#DDD3BF;margin-top:8px;overflow:hidden}
+.bar>div{height:100%;background:linear-gradient(90deg,#9DB38A,#4E6E45);border-radius:6px}
 .hint{opacity:.75;margin:-6px 0 10px;font-size:.92rem}
 .trip{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 14px}
-.pill{border-radius:999px;padding:6px 14px;background:rgba(47,168,102,.14);
- border:1px solid rgba(47,168,102,.45);font-size:.92rem}
+.pill{border-radius:999px;padding:6px 14px;background:#E7EDDB;color:#3B3A33;
+ border:1px solid #9DB38A;font-size:.92rem}
 .stButton>button{border-radius:12px;font-weight:600;padding:.6rem 1rem}
+.stButton>button[kind="primary"]{background:#5E7F52;border-color:#5E7F52;color:#FBF7EE}
+.stButton>button[kind="primary"]:hover{background:#4E6E45;border-color:#4E6E45;color:#FBF7EE}
 .stTabs [data-baseweb="tab"]{font-weight:600;font-size:1.02rem}
 iframe{border-radius:16px}
 </style>
@@ -602,6 +642,57 @@ SEARCH_TIP = ("Tipp: Tippe mindestens 3 Buchstaben, dann erscheinen Vorschläge.
 def place_input(label, key):
     return st_searchbox(search_places, key=key, label=label, placeholder=PLACEHOLDER,
                         clear_on_submit=False)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def reverse_name(lat, lon):
+    """Adresse zu Koordinaten (Photon), nur zur Anzeige."""
+    try:
+        r = requests.get("https://photon.komoot.io/reverse", headers=UA, timeout=6,
+                         params={"lat": lat, "lon": lon, "lang": "de"})
+        p = r.json()["features"][0]["properties"]
+        street = " ".join(x for x in [p.get("street") or p.get("name"), p.get("housenumber")] if x)
+        return ", ".join(x for x in [street, p.get("city") or p.get("district")] if x)
+    except Exception:
+        return ""
+
+
+def start_input(label, key):
+    """Startpunkt: per Suche oder per Standortfreigabe des Browsers (Schalter)."""
+    use = st.toggle("📍 Meinen aktuellen Standort verwenden", key=f"{key}_useloc",
+                    help="Der Browser fragt nach der Standortfreigabe. Der Standort wird nur für die Suche genutzt.")
+    if not use:
+        v = place_input(label, key)
+        if v:
+            st.session_state["bias"] = _unpack(v)[:2]
+        return v
+
+    skey = f"{key}_loc"
+    loc = st.session_state.get(skey)
+    if loc is None:
+        raw = get_geolocation(component_key=f"{key}_geo")
+        if isinstance(raw, dict) and raw.get("error"):
+            st.warning("Der Standort ist nicht verfügbar. Bitte die Freigabe im Browser erlauben "
+                       "(Schloss-Symbol in der Adressleiste) und den Schalter erneut setzen, "
+                       "oder den Startpunkt über die Suche eingeben.")
+            return None
+        c = raw.get("coords") if isinstance(raw, dict) else None
+        if not c or c.get("latitude") is None:
+            st.info("📡 Standort wird ermittelt … bitte im Browser die Freigabe erlauben.")
+            return None
+        loc = (float(c["latitude"]), float(c["longitude"]), c.get("accuracy"))
+        st.session_state[skey] = loc
+    lat, lon, acc = loc
+    name = reverse_name(round(lat, 5), round(lon, 5))
+    lab = "📍 Mein Standort" + (f" · {name}" if name else "")
+    st.markdown(f'<div class="trip"><span class="pill">{lab}</span></div>', unsafe_allow_html=True)
+    if acc and acc > 1000:
+        st.caption(f"Standort ungenau (ca. {acc:,.0f} m). Am Handy hilft GPS bzw. genaue Ortung.".replace(",", "."))
+    if st.button("🔄 Standort neu bestimmen", key=f"{key}_relocate"):
+        st.session_state.pop(skey, None)
+        st.rerun()
+    st.session_state["bias"] = (lat, lon)
+    return _pack(lat, lon, lab)
 
 
 def show_error(e):
@@ -627,9 +718,7 @@ def fmt_m(x):
 
 # ---------- Tab 1: A -> B
 def render_ab():
-    start_v = place_input("Start", "start_sb")
-    if start_v:
-        st.session_state["bias"] = _unpack(start_v)[:2]
+    start_v = start_input("Start", "start_sb")
     ziel_v = place_input("Ziel", "ziel_sb")
     st.caption(SEARCH_TIP)
     go = st.button("Route finden", type="primary", use_container_width=True, key="go_ab")
@@ -717,9 +806,7 @@ def sources_text(buf, lam):
 def render_loop():
     st.markdown("Grüne Runde mit Wunschlänge, die am Startpunkt beginnt und dort (oder an einem "
                 "anderen Punkt) wieder endet.")
-    a_v = place_input("Startpunkt", "loop_a_sb")
-    if a_v:
-        st.session_state["bias"] = _unpack(a_v)[:2]
+    a_v = start_input("Startpunkt", "loop_a_sb")
     same = st.checkbox("Ründchen endet wieder am Startpunkt", value=True, key="loop_same")
     b_v = None if same else place_input("Endpunkt", "loop_b_sb")
     st.caption(SEARCH_TIP)
@@ -813,7 +900,7 @@ def render_loop():
                     f"kosten ×{LOOP_REUSE_PENALTY:g}; Ranking: Grünanteil minus Doppelweg minus Längenabweichung")
 
 
-tab_ab, tab_loop = st.tabs(["🧭 Von A nach B", "🔄 Ründchen"])
+tab_ab, tab_loop = st.tabs(["🧭 Route", "🔄 Ründchen"])
 with tab_ab:
     render_ab()
 with tab_loop:
