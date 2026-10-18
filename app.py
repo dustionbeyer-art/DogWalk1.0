@@ -5,19 +5,27 @@ Zwei Modi: Route von A nach B und "Ründchen" (grüne Runde mit Wunschlänge).
 Start:  pip install -r requirements.txt
         streamlit run app.py
 
-Daten:  OpenStreetMap (Overpass via osmnx, ODbL) für Wegenetz + Grünflächen.
+Daten:  OpenStreetMap (Overpass, ODbL) für Wegenetz + Grünflächen. Wenn die Overpass-Server
+        überlastet sind: "Grün-Scan" mit Vektorkacheln (OpenFreeMap) + FOSSGIS-Routenserver.
         Ortssuche mit Vorschlägen: Photon (photon.komoot.io, OSM-Daten, fehler-
         tolerant, findet auch Läden/Restaurants), Fallback Nominatim.
-Kosten: kosten(kante) = laenge * (1 + LAMBDA * (1 - gruen(kante)))
+Kosten: kosten(kante) = laenge * (1 + LAMBDA * (1 - gruen(kante)) + RUHE * hauptstrasse(kante))
 Grün:   Mittel über 8 Abtastpunkte je Kante; 1.0 im Park, linear fallend
         auf 0 im Abstand "Grün-Reichweite".
 """
+import gzip
+import hashlib
 import json
 import math
 import os
 import random
 import re
+import socket
+import struct
+import tempfile
+import threading
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from html import escape
 
@@ -28,6 +36,10 @@ import osmnx as ox
 import requests
 import shapely
 import streamlit as st
+try:
+    from scipy import ndimage
+except Exception:  # Grün-Scan braucht scipy; ohne bleibt die einfache Fußroute
+    ndimage = None
 from shapely import STRtree
 from shapely.geometry import LineString, Point
 from streamlit.components.v1 import html as st_html
@@ -48,21 +60,9 @@ OVERPASS_MIRRORS = [
     "https://overpass.private.coffee/api",
     "https://maps.mail.ru/osm/tools/overpass/api",
 ]
-LOAD_DEADLINE_S = 45  # danach weicht die App auf eine einfache Fußroute aus
-try:
-    from osmnx import errors as ox_errors
-except Exception:  # pragma: no cover
-    ox_errors = None
-NO_DATA = getattr(ox_errors, "InsufficientResponseError", ())  # "keine Treffer" ist kein Serverfehler
-
-_OV_ATTR = "overpass_url" if hasattr(ox.settings, "overpass_url") else "overpass_endpoint"
-_OV_SUFFIX = "/interpreter" if str(getattr(ox.settings, _OV_ATTR, "")).rstrip("/").endswith("/interpreter") else ""
-
-
-def use_mirror(base):
-    setattr(ox.settings, _OV_ATTR, base + _OV_SUFFIX)
-
-
+LOAD_DEADLINE_S = 20  # harte Zeitgrenze für Overpass; danach übernimmt der Grün-Scan
+OSM_CACHE_DIR = os.path.join(tempfile.gettempdir(), "green_walker_osm")
+OSM_CACHE_DAYS = 7
 def rank_mirrors():
     """Fragt den Status aller Overpass-Server kurz und parallel ab: Server mit freien Plätzen zuerst,
     nicht erreichbare Server werden übersprungen. Spart das lange Warten auf überlastete Server."""
@@ -289,48 +289,166 @@ def corridor_bbox(p1, p2):
     return bbox, span
 
 
-@st.cache_resource(show_spinner=False, max_entries=4)
-def load_area(bbox):
-    def get_graph():
-        return ox.graph_from_bbox(bbox, network_type="walk", simplify=True)
+# Fußwege wie bei osmnx (network_type="walk")
+WALK_EXCLUDE = ("abandoned|bus_guideway|construction|cycleway|motor|no|planned|platform|proposed|"
+                "raceway|razed|rest_area|services")
+WALK_FILTER = ('["highway"]["area"!~"yes"]["access"!~"private"]'
+               f'["highway"!~"{WALK_EXCLUDE}"]["foot"!~"no"]["service"!~"private"]'
+               '["sidewalk"!~"separate"]["sidewalk:both"!~"separate"]'
+               '["sidewalk:left"!~"separate"]["sidewalk:right"!~"separate"]')
+_WALK_EXCLUDE_RE = re.compile(WALK_EXCLUDE)
 
-    def get_parks():
+
+def overpass_query(bbox):
+    """Eine einzige Abfrage für Fußwege und Grünflächen (statt zwei getrennter)."""
+    w, s, e, n = bbox
+    b = f"({s},{w},{n},{e})"
+    parts = [f"way{WALK_FILTER}{b};"]
+    for k, vals in GREEN_TAGS.items():
+        rx = "|".join(vals)
+        parts += [f'way["{k}"~"^({rx})$"]{b};', f'relation["{k}"~"^({rx})$"]{b};']
+    return "[out:xml][timeout:25];\n(\n  " + "\n  ".join(parts) + "\n);\n(._;>;);\nout body qt;"
+
+
+def _osm_complete(path):
+    """Prüft, ob die Datei vollständig ist und Overpass keinen Abbruch gemeldet hat."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        f.seek(max(0, size - 4000))
+        tail = f.read().decode("utf-8", "ignore")
+    return "</osm>" in tail and "runtime error" not in tail
+
+
+def _cut(resp):
+    """Trennt die Verbindung hart (unterbricht auch ein gerade wartendes Lesen)."""
+    socks = []
+    for path in (("raw", "_connection", "sock"), ("raw", "_fp", "fp", "raw", "_sock")):
+        obj = resp
         try:
-            gdf = ox.features_from_bbox(bbox, tags=GREEN_TAGS)
-        except NO_DATA:
-            return None  # wirklich keine Grünflächen im Gebiet
-        gdf = gdf[gdf.geometry.type.isin(["Polygon", "MultiPolygon"])]
-        if not len(gdf):
-            return None
-        gdf = gdf.reset_index(drop=True)
-        if "name" not in gdf:
-            gdf["name"] = None
-        gdf["name"] = gdf["name"].fillna("Grünfläche").astype(str)
-        return gdf[["name", "geometry"]]
+            for a in path:
+                obj = getattr(obj, a)
+            socks.append(obj)
+        except Exception:
+            pass
+    for s in socks:
+        try:
+            s.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+    try:
+        resp.close()
+    except Exception:
+        pass
 
-    # Server in zufälliger Reihenfolge probieren (der Hauptserver wird nicht immer zuerst belastet),
-    # mehrere Runden mit wachsender Pause. Bereits erfolgreich geladene Teile liegen im osmnx-Cache
-    # und werden bei einem erneuten Versuch nicht noch einmal abgerufen.
-    G0 = parks = last = None
-    t_end = time.time() + LOAD_DEADLINE_S
+
+def fetch_osm(bbox, deadline):
+    """Lädt OSM-Daten mit harter Zeitgrenze. Kein endloses Warten: überlastete Server (429/50x)
+    werden sofort übersprungen. Ergebnis wird einige Tage auf der Festplatte zwischengespeichert."""
+    os.makedirs(OSM_CACHE_DIR, exist_ok=True)
+    path = os.path.join(OSM_CACHE_DIR, hashlib.md5(repr(bbox).encode()).hexdigest() + ".osm")
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < OSM_CACHE_DAYS * 86400:
+        return path
+    query, last = overpass_query(bbox), "keine Antwort"
+    tmp = path + f".{os.getpid()}.part"
     for rnd in range(2):
         for base in rank_mirrors():
-            if time.time() > t_end:
+            left = deadline - time.time()
+            if left < 4:
                 break
-            use_mirror(base)
             try:
-                with ThreadPoolExecutor(max_workers=2) as ex:
-                    f_g, f_p = ex.submit(get_graph), ex.submit(get_parks)
-                    G0, parks = f_g.result(), f_p.result()
-                break
+                with requests.post(base + "/interpreter", data={"data": query}, headers=UA,
+                                   timeout=(4, min(25, left)), stream=True) as r:
+                    if r.status_code != 200:
+                        last = f"{base.split('/')[2]}: {r.status_code} {r.reason}"
+                        continue
+                    # Wächter: kappt die Verbindung an der Zeitgrenze, auch wenn Daten nur tröpfeln
+                    guard = threading.Timer(max(0.5, deadline - time.time()), _cut, args=(r,))
+                    guard.daemon = True
+                    guard.start()
+                    try:
+                        with open(tmp, "wb") as f:
+                            for chunk in r.iter_content(1 << 14):
+                                f.write(chunk)
+                    finally:
+                        guard.cancel()
+                    if time.time() > deadline:
+                        raise TimeoutError("Download dauert zu lange")
+                if not _osm_complete(tmp):
+                    last = f"{base.split('/')[2]}: Abfrage abgebrochen"
+                    continue
+                os.replace(tmp, path)
+                return path
             except Exception as e:
-                last = e
-                G0 = parks = None
-        if G0 is not None or time.time() > t_end:
+                last = f"{base.split('/')[2]}: {type(e).__name__}"
+            finally:
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+        if deadline - time.time() < 6:
             break
-        time.sleep(3)
-    if G0 is None:
-        raise RuntimeError(f"Alle Kartenserver sind gerade überlastet. ({last})")
+        time.sleep(2)
+    raise RuntimeError(f"Alle Kartenserver sind gerade überlastet ({last}).")
+
+
+def _walkable(el):
+    tags = {t.get("k"): t.get("v") for t in el.iter("tag")}
+    hw = tags.get("highway")
+    if not hw or tags.get("area") == "yes" or _WALK_EXCLUDE_RE.search(hw):
+        return False
+    return (tags.get("foot") != "no" and tags.get("access") != "private"
+            and tags.get("service") != "private")
+
+
+def walk_xml(path):
+    """Schreibt eine zweite Datei nur mit Knoten und Fußwegen (osmnx macht aus jedem Weg eine Kante,
+    Parkränder dürfen also nicht mit hinein). Arbeitet gestreamt, damit der Speicher klein bleibt."""
+    out = path[:-4] + ".walk.osm"
+    if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(path):
+        return out
+    tmp = out + f".{os.getpid()}.part"
+    depth = 0
+    with open(tmp, "wb") as f:
+        f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n<osm version="0.6" generator="green-walker">\n')
+        for ev, el in ET.iterparse(path, events=("start", "end")):
+            if ev == "start":
+                depth += 1
+                continue
+            depth -= 1
+            if depth != 1:
+                continue
+            if el.tag == "node" or (el.tag == "way" and _walkable(el)):
+                el.tail = "\n"
+                f.write(ET.tostring(el, encoding="unicode").encode("utf-8"))
+            el.clear()
+        f.write(b"</osm>\n")
+    os.replace(tmp, out)
+    return out
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def load_area(bbox):
+    path = fetch_osm(bbox, time.time() + LOAD_DEADLINE_S)
+    try:
+        G0 = ox.graph_from_xml(walk_xml(path), bidirectional=True, simplify=True, retain_all=False)
+    except Exception as e:
+        raise ValueError(f"In diesem Gebiet habe ich keine Fußwege gefunden ({type(e).__name__}).")
+    if G0.number_of_edges() == 0:
+        raise ValueError("In diesem Gebiet habe ich keine Fußwege gefunden.")
+
+    parks = None
+    try:
+        gdf = ox.features_from_xml(path, tags=GREEN_TAGS)
+        gdf = gdf[gdf.geometry.type.isin(["Polygon", "MultiPolygon"])]
+        if len(gdf):
+            gdf = gdf.reset_index(drop=True)
+            if "name" not in gdf:
+                gdf["name"] = None
+            gdf["name"] = gdf["name"].fillna("Grünfläche").astype(str)
+            parks = gdf[["name", "geometry"]]
+    except Exception:
+        parks = None  # keine Grünflächen im Gebiet: Route geht trotzdem
 
     G = ox.project_graph(G0)
     crs = G.graph["crs"]
@@ -339,7 +457,9 @@ def load_area(bbox):
     best = {}
     for u, v, d in G.edges(data=True):
         if (u, v) not in best or d["length"] < best[(u, v)][0]:
-            best[(u, v)] = (d["length"], d.get("geometry") or LineString([pos[u], pos[v]]), *edge_label(d))
+            hw = d.get("highway")
+            hw = (hw[0] if hw else "") if isinstance(hw, (list, tuple)) else (hw or "")
+            best[(u, v)] = (d["length"], d.get("geometry") or LineString([pos[u], pos[v]]), *edge_label(d), hw)
     keys = list(best)
     lengths = np.array([best[k][0] for k in keys], dtype=float)
     names = [best[k][2] for k in keys]
@@ -350,6 +470,19 @@ def load_area(bbox):
     H = nx.DiGraph()
     for i, (u, v) in enumerate(keys):
         H.add_edge(u, v, i=i)
+
+    # Hauptstraßen-Nähe je Kante (0 = ruhig, 1 = an/auf einer Hauptstraße)
+    noise = np.zeros(len(keys), dtype=np.float32)
+    wts = np.array([OSM_ROAD_W.get(best[k][4], 0.0) for k in keys], dtype=np.float32)
+    main = np.nonzero(wts > 0)[0]
+    if len(main):
+        rtree = STRtree(list(lines[main]))
+        acc = np.zeros(len(keys), dtype=np.float32)
+        for f in (np.arange(SAMPLES) + 0.5) / SAMPLES:
+            pts = shapely.line_interpolate_point(lines, f, normalized=True)
+            idx, _ = rtree.query_nearest(pts, max_distance=NOISE_DIST, return_distance=True, all_matches=False)
+            acc[idx[0]] += wts[main][idx[1]]
+        noise = acc / SAMPLES
 
     D = np.full((SAMPLES, len(keys)), MAX_BUF, dtype=np.float32)
     parks_json, n_parks = None, 0
@@ -372,7 +505,7 @@ def load_area(bbox):
     return {"crs": crs, "pos": pos, "H": H, "lengths": lengths, "lines": lines, "D": D,
             "node_list": node_list, "xy": np.array([pos[n] for n in node_list]),
             "eu": np.array([nidx[u] for u, v in keys]), "ev": np.array([nidx[v] for u, v in keys]),
-            "names": names, "kinds": kinds,
+            "names": names, "kinds": kinds, "noise": noise,
             "parks_json": parks_json, "n_parks": n_parks, "n_edges": len(keys)}
 
 
@@ -445,6 +578,9 @@ def build_loop_path(area, g, ng, lam, o, t, theta, rho):
     """Runde A -> 3 Wegpunkte auf einem Kreis -> B. Jede Teilstrecke wird grün-optimal geroutet;
     schon genutzte Wegstücke werden teurer, damit möglichst keine Doppelstrecken entstehen."""
     H, L = area["H"], area["lengths"]
+    nz = area.get("noise")
+    nz = np.zeros(len(L)) if nz is None else nz
+    mu = QUIET if lam > 0 else 0.0
     ax, ay = area["pos"][o]
     cx, cy = ax + rho * math.cos(theta), ay + rho * math.sin(theta)
     wps = []
@@ -459,7 +595,7 @@ def build_loop_path(area, g, ng, lam, o, t, theta, rho):
 
         def w(u, v, d, used=used):
             i = d["i"]
-            c = L[i] * (1 + lam * (1 - g[i]))
+            c = L[i] * (1 + lam * (1 - g[i]) + mu * nz[i])
             return c * LOOP_REUSE_PENALTY if ((u, v) in used or (v, u) in used) else c
 
         p = nx.shortest_path(H, s, e, weight=w)
@@ -489,7 +625,9 @@ def loop_stats(area, g, path):
             rep += li
         else:
             seen.add(k)
-    return dist, float((l * g[idx]).sum() / dist), float(rep / dist)
+    nz = area.get("noise")
+    noise = float((l * nz[idx]).sum() / dist) if nz is not None else 0.0
+    return dist, float((l * g[idx]).sum() / dist), float(rep / dist), noise
 
 
 def find_loops(area, o, t, target, lam, buf, progress=None):
@@ -509,8 +647,8 @@ def find_loops(area, o, t, target, lam, buf, progress=None):
             st_ = loop_stats(area, g, path)
             if not st_:
                 break
-            dist, green, rep = st_
-            cands.append({"path": path, "dist": dist, "green": green, "rep": rep})
+            dist, green, rep, noise = st_
+            cands.append({"path": path, "dist": dist, "green": green, "rep": rep, "noise": noise})
             ratio = dist / target
             if abs(ratio - 1) <= LOOP_TOLERANCE:
                 break
@@ -518,7 +656,8 @@ def find_loops(area, o, t, target, lam, buf, progress=None):
         if progress:
             progress((k + 1) / LOOP_BEARINGS)
     for c in cands:
-        c["score"] = c["green"] - 0.8 * c["rep"] - 2.0 * abs(c["dist"] / target - 1)
+        c["score"] = (c["green"] - 0.8 * c["rep"] - 0.4 * (QUIET if lam > 0 else 0) * c["noise"]
+                      - 2.0 * abs(c["dist"] / target - 1))
     cands.sort(key=lambda c: -c["score"])
     picked = []
     for c in cands:
@@ -689,6 +828,7 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
 .sq{width:48px;height:48px;border-radius:14px;border:1px solid var(--line);background:#fff;font-size:20px}
 .sq.on{background:#E7EDDB;border-color:var(--sage)}
 #vbtn,#fbtn{display:none}body.nav #vbtn,body.nav #fbtn{display:block}
+#styletip{position:fixed;z-index:1200;left:50%;top:calc(var(--top) + 14px);transform:translateX(-50%);background:rgba(59,58,51,.88);color:#FBF7EE;padding:6px 12px;border-radius:10px;font-size:.85rem;opacity:0;transition:opacity .3s;pointer-events:none}
 #list{position:fixed;z-index:1100;top:calc(var(--top) + 8px);left:10px;right:10px;bottom:10px;max-width:620px;margin:0 auto;background:var(--paper);border:1px solid var(--line);border-radius:20px;overflow:auto;padding:12px 14px;display:none;box-shadow:0 8px 28px rgba(60,50,30,.3)}
 .row{display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid #E4DBC8}
 .ri{font-size:22px;width:30px;text-align:center;flex:none}.rt{flex:1}.rd{opacity:.65;font-size:.85rem;white-space:nowrap}
@@ -703,6 +843,7 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
  <div id="btns"><button id="go">▶ Navigation starten</button><button class="sq on" id="vbtn" title="Sprachansagen">🔊</button><button class="sq on" id="fbtn" title="Karte folgt mir">🎯</button><button class="sq" id="lbtn" title="Alle Anweisungen">📋</button><button class="sq" id="demo" title="Demo ohne Gehen">🧪</button></div>
 </div>
 <div id="list"></div>
+<div id="styletip"></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 <script>
 const D = __DATA__;
@@ -714,26 +855,45 @@ document.documentElement.style.setProperty('--top', TOP + 'px');
 
 const map = L.map('map', {zoomControl: false, zoomAnimation: false, fadeAnimation: false, markerZoomAnimation: false}).setView(D.p1, 15);
 
-// Kartenhintergründe; bei Ausfall des Anbieters wird automatisch gewechselt
+// Kartenhintergründe. Standard ohne Schlüssel und ohne Referer-Pflicht (in eingebetteten Fenstern
+// fehlt der Referer oft; OpenStreetMap blockiert dann). Lädt eine Quelle nicht, wird gewechselt.
 const TILES = [
-  {n: 'Karte', u: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', o: {subdomains: 'abcd', maxZoom: 19, attribution: '© OpenStreetMap © CARTO'}},
-  {n: 'Gelände', u: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', o: {subdomains: 'abc', maxZoom: 17, attribution: '© OpenStreetMap, SRTM | © OpenTopoMap'}},
-  {n: 'Satellit', u: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', o: {maxZoom: 19, attribution: 'Esri, Maxar'}},
-  {n: 'Straßen', u: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', o: {maxZoom: 19, attribution: 'Esri'}}
+  {n: 'Karte', u: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}', o: {maxZoom: 19, maxNativeZoom: 18, attribution: 'Kartenbild © Esri, OpenStreetMap-Mitwirkende u. a.'}},
+  {n: 'Straßen', u: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', o: {maxZoom: 19, maxNativeZoom: 18, attribution: 'Kartenbild © Esri u. a.'}},
+  {n: 'Gelände', u: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', o: {subdomains: 'abc', maxZoom: 19, maxNativeZoom: 17, attribution: '© OpenStreetMap-Mitwirkende, SRTM | © OpenTopoMap (CC-BY-SA)'}},
+  {n: 'OpenStreetMap', u: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', o: {maxZoom: 19, referrerPolicy: 'strict-origin-when-cross-origin', attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>-Mitwirkende'}},
+  {n: 'Satellit', u: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', o: {maxZoom: 19, maxNativeZoom: 18, attribution: 'Bild © Esri, Maxar, Earthstar Geographics'}}
 ];
-const FALLBACK = [0, 3, 1];
-let tIdx = 0, tLayer = null, tErr = 0, tOk = 0, fbPos = 0;
-function setTiles(i) {
+let tIdx = 0, tLayer = null, tOk = 0, tErr = 0, tTimer = null, tTried = new Set(), tipTimer = null;
+function tip(t) {
+  const el = $('styletip'); el.textContent = t; el.style.opacity = 1;
+  clearTimeout(tipTimer); tipTimer = setTimeout(() => { el.style.opacity = 0; }, 1600);
+}
+function nextWorking() {
+  // automatischer Wechsel: nächste noch nicht probierte Quelle (Satellit nur als letzte)
+  for (let k = 1; k <= TILES.length; k++) {
+    const j = (tIdx + k) % TILES.length;
+    if (!tTried.has(j)) return j;
+  }
+  return -1;
+}
+function setTiles(i, auto) {
   if (tLayer) map.removeLayer(tLayer);
-  tIdx = i; tErr = 0; tOk = 0;
-  tLayer = L.tileLayer(TILES[i].u, TILES[i].o).addTo(map);
-  tLayer.on('tileload', () => { tOk++; });
-  tLayer.on('tileerror', () => {
-    tErr++;
-    if (tErr >= 6 && tOk === 0 && fbPos < FALLBACK.length - 1) { fbPos++; setTiles(FALLBACK[fbPos]); }
-  });
+  clearTimeout(tTimer);
+  tIdx = i; tOk = 0; tErr = 0; tTried.add(i);
+  const layer = L.tileLayer(TILES[i].u, TILES[i].o).addTo(map);
+  tLayer = layer;
+  layer.on('tileload', () => { tOk++; });
+  const fail = () => {
+    if (tLayer !== layer || tOk > 0) return;
+    const j = nextWorking();
+    if (j >= 0) { setTiles(j, true); tip('Kartenstil: ' + TILES[j].n); }
+  };
+  layer.on('tileerror', () => { tErr++; if (tErr >= 4 && tOk === 0) fail(); });
+  tTimer = setTimeout(fail, 7000);  // nichts geladen (auch ohne Fehlermeldung) -> wechseln
 }
 setTiles(0);
+(D.attrib || []).forEach(a => map.attributionControl.addAttribution(a));
 
 if (D.parks) {
   L.geoJSON(D.parks, {style: {color: '#7C9F69', weight: 1, fillColor: '#B5CDA0', fillOpacity: .5},
@@ -912,7 +1072,7 @@ $('fbtn').addEventListener('click', () => {
   follow = !follow; $('fbtn').classList.toggle('on', follow);
   if (follow && lastPos) map.setView(lastPos, Math.max(map.getZoom(), 17), {animate: false});
 });
-$('layers').addEventListener('click', () => setTiles((tIdx + 1) % TILES.length));
+$('layers').addEventListener('click', () => { tTried = new Set(); const j = (tIdx + 1) % TILES.length; setTiles(j); tip('Kartenstil: ' + TILES[j].n); });
 $('fit').addEventListener('click', fitRoute);
 map.on('dragstart', () => { follow = false; $('fbtn').classList.remove('on'); });
 
@@ -944,18 +1104,22 @@ def solve_levels(area, o, t, buf):
     """Kürzeste Route + grüne Route je Grünstufe (alle vorab, damit die Karte sofort umschalten kann)."""
     g = np.clip(1 - area["D"] / buf, 0, 1).mean(axis=0)
     L, H = area["lengths"], area["H"]
+    nz = area.get("noise")
+    nz = np.zeros(len(L)) if nz is None else nz
 
     def run(w):
         path = nx.shortest_path(H, o, t, weight=w)
         idx = [H[a][b]["i"] for a, b in zip(path[:-1], path[1:])]
         dist = float(L[idx].sum()) if idx else 0.0
         share = float((L[idx] * g[idx]).sum() / dist) if dist > 0 else 0.0
-        return {"path": path, "dist": dist, "green": share}
+        noise = float((L[idx] * nz[idx]).sum() / dist) if dist > 0 else 0.0
+        return {"path": path, "dist": dist, "green": share, "noise": noise}
 
     short = run(lambda u, v, d: L[d["i"]])
     out = []
     for name, lam in LEVELS.items():
-        r = short if lam == 0 else run(lambda u, v, d, lam=lam: L[d["i"]] * (1 + lam * (1 - g[d["i"]])))
+        r = short if lam == 0 else run(lambda u, v, d, lam=lam: L[d["i"]] * (
+            1 + lam * (1 - g[d["i"]]) + QUIET * nz[d["i"]]))
         out.append((name, r))
     return short, out
 
@@ -1019,9 +1183,10 @@ def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: 
         detour = r["dist"] / short["dist"] - 1 if short["dist"] else 0.0
         mins = max(1, round(r["dist"] / M_PER_MIN))
         options.append(_option(
-            nav, name, f"{fmt_km(r['dist'])} · {r['green']:.0%} grün", LEVEL_HINT[name],
+            nav, name, f"{fmt_km(r['dist'])} · {r['green']:.0%} grün",
+            f"{LEVEL_HINT[name]} · Umweg {detour:+.0%}",
             [["Länge", fmt_km(r["dist"])], ["Dauer", f"{mins} min"],
-             ["Grünanteil", f"{r['green']:.0%}"], ["Umweg", f"{detour:+.0%}"]]))
+             ["Grünanteil", f"{r['green']:.0%}"], ["Hauptstraße", f"{r['noise']:.0%}"]]))
     if not options:
         raise ValueError("Start und Ziel liegen zu nah beieinander.")
     default = next((i for i, o_ in enumerate(options) if o_["label"] == "Ausgewogen"), 0)
@@ -1062,9 +1227,9 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
         diff = v["dist"] / target - 1
         options.append(_option(
             nav, f"Variante {i + 1}", f"{fmt_km(v['dist'])} · {v['green']:.0%} grün",
-            f"Wunschlänge {fmt_km(target)} ({diff:+.0%})",
+            f"Wunschlänge {fmt_km(target)} ({diff:+.0%}) · {1 - v['rep']:.0%} ohne Doppelweg",
             [["Länge", fmt_km(v["dist"])], ["Dauer", f"{mins} min"],
-             ["Grünanteil", f"{v['green']:.0%}"], ["Ohne Doppelweg", f"{1 - v['rep']:.0%}"]]))
+             ["Grünanteil", f"{v['green']:.0%}"], ["Hauptstraße", f"{v.get('noise', 0):.0%}"]]))
     if not options:
         raise ValueError("Hier konnte ich keine passende Runde finden. Versuche eine andere Länge "
                          "oder einen anderen Startpunkt.")
@@ -1092,14 +1257,7 @@ def _hav(p, q):
 
 
 def osrm_route(p1, p2):
-    url = f"{OSRM_FOOT}{p1[1]:.6f},{p1[0]:.6f};{p2[1]:.6f},{p2[0]:.6f}"
-    r = requests.get(url, headers=UA, timeout=12,
-                     params={"overview": "full", "geometries": "geojson", "steps": "true"})
-    r.raise_for_status()
-    js = r.json()
-    if js.get("code") != "Ok" or not js.get("routes"):
-        raise ValueError("Für diese Punkte habe ich keinen Fußweg gefunden.")
-    return js["routes"][0]
+    return osrm_request([p1, p2])[0]
 
 
 def osrm_nav(route, title):
@@ -1113,8 +1271,17 @@ def osrm_nav(route, title):
     total = cum[-1]
     if total < 5:
         return None
-    raw = [s for leg in route["legs"] for s in leg["steps"]]
-    sum_raw = sum(float(s.get("distance", 0)) for s in raw) or 1.0
+    legs = route.get("legs") or []
+    raw = []
+    for li, leg in enumerate(legs):
+        for s in leg.get("steps", []):
+            typ = (s.get("maneuver") or {}).get("type", "")
+            if typ == "depart" and li > 0:
+                continue  # Zwischenpunkt: kein neues "Los geht's"
+            if typ == "arrive" and li < len(legs) - 1:
+                continue  # Zwischenpunkt: noch nicht am Ziel
+            raw.append(s)
+    sum_raw = sum(float(s.get("distance", 0)) for leg in legs for s in leg.get("steps", [])) or 1.0
     scale = total / sum_raw
     steps, acc = [], 0.0
     for s in raw:
@@ -1185,9 +1352,700 @@ def make_ab_view_safe(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda
     except ValueError:
         raise
     except Exception as e:
-        log("⚠️ Grünflächen-Server überlastet: ich berechne stattdessen eine einfache Fußroute")
+        log("⚠️ OSM-Server überlastet: ich nutze den Grün-Scan")
+        try:
+            return scan_ab_view(start_v, dest_v, buf, log)
+        except ValueError:
+            raise
+        except Exception:
+            pass
+        log("⚠️ Grün-Scan nicht möglich: einfache Fußroute")
         try:
             return osrm_view(start_v, dest_v)
+        except ValueError:
+            raise
+        except Exception:
+            raise e
+
+
+# ------------------------------------------------------- Grün-Scan (Ersatz, wenn Overpass nicht antwortet)
+# Grünflächen und Hauptstraßen kommen aus freien Vektorkacheln (OpenFreeMap, OpenMapTiles-Schema),
+# Wegvarianten vom FOSSGIS-Routenserver. Die Karte wird auf ein feines Raster gezeichnet; daraus
+# entstehen zwei Abstandskarten ("wie weit bis zum nächsten Grün", "wie nah an einer Hauptstraße").
+# Jede Wegvariante wird alle paar Meter abgetastet und bewertet; die beste je Grünstufe gewinnt.
+OFM_TILEJSON = "https://tiles.openfreemap.org/planet"
+VT_ZOOM = 14
+SCAN_STEP = 10.0          # Abtastabstand entlang einer Route (m)
+NOISE_DIST = 20.0         # bis zu diesem Abstand zählt eine Hauptstraße als laut (m)
+QUIET = 1.5               # Gewicht "Hauptstraßen meiden" (bei "Schnellste" 0)
+PARK_MIN_M2 = 3000        # kleinere Grünflächen werden nicht gezielt angesteuert
+ROAD_W = {"motorway": 1.0, "trunk": 1.0, "primary": 1.0, "secondary": 0.8, "tertiary": 0.4}
+OSM_ROAD_W = {"trunk": 1.0, "trunk_link": 1.0, "primary": 1.0, "primary_link": 1.0,
+              "secondary": 0.8, "secondary_link": 0.8, "tertiary": 0.4, "tertiary_link": 0.4}
+GREEN_LC = {"wood", "grass", "wetland"}
+GREEN_SUB = {"park", "garden", "recreation_ground", "village_green", "allotments", "meadow", "grassland",
+             "scrub", "shrubbery", "forest", "wood", "heath", "orchard", "golf_course", "flowerbed",
+             "wet_meadow", "plant_nursery"}
+GREEN_LU = {"cemetery"}
+GREEN_DE = {"park": "Park", "garden": "Garten", "forest": "Wald", "wood": "Wald", "grass": "Wiese",
+            "meadow": "Wiese", "grassland": "Wiese", "cemetery": "Friedhof", "allotments": "Kleingärten",
+            "recreation_ground": "Grünanlage", "village_green": "Grünanlage", "scrub": "Gebüsch",
+            "heath": "Heide", "wetland": "Feuchtgebiet", "orchard": "Obstwiese", "golf_course": "Golfplatz",
+            "nature_reserve": "Naturschutzgebiet", "protected_area": "Schutzgebiet"}
+
+
+# ---------- Mapbox-Vektorkacheln lesen (kleiner eigener Decoder, keine Zusatzbibliothek)
+def _pb_varint(b, i):
+    r = s = 0
+    while True:
+        c = b[i]
+        i += 1
+        r |= (c & 0x7F) << s
+        if c < 0x80:
+            return r, i
+        s += 7
+
+
+def _pb_fields(b):
+    i, n = 0, len(b)
+    while i < n:
+        key, i = _pb_varint(b, i)
+        f, wt = key >> 3, key & 7
+        if wt == 0:
+            v, i = _pb_varint(b, i)
+        elif wt == 1:
+            v, i = b[i:i + 8], i + 8
+        elif wt == 2:
+            ln, i = _pb_varint(b, i)
+            v, i = b[i:i + ln], i + ln
+        elif wt == 5:
+            v, i = b[i:i + 4], i + 4
+        else:
+            raise ValueError("unbekannter Protobuf-Typ")
+        yield f, wt, v
+
+
+def _pb_packed(v, wt):
+    if wt == 0:
+        return [v]
+    out, i = [], 0
+    while i < len(v):
+        x, i = _pb_varint(v, i)
+        out.append(x)
+    return out
+
+
+def _pb_value(b):
+    for f, wt, v in _pb_fields(b):
+        if f == 1:
+            return bytes(v).decode("utf-8", "replace")
+        if f == 2:
+            return struct.unpack("<f", v)[0]
+        if f == 3:
+            return struct.unpack("<d", v)[0]
+        if f == 4:
+            return v - (1 << 64) if v >= (1 << 63) else v
+        if f == 5:
+            return v
+        if f == 6:
+            return (v >> 1) ^ -(v & 1)
+        if f == 7:
+            return bool(v)
+    return None
+
+
+def _mvt_geom(c):
+    """Geometrie-Befehle (MoveTo/LineTo/ClosePath) -> Liste von Punktfolgen in Kachelkoordinaten."""
+    parts, cur, x, y, i = [], None, 0, 0, 0
+    while i < len(c):
+        cmd, cnt = c[i] & 7, c[i] >> 3
+        i += 1
+        if cmd in (1, 2):
+            for _ in range(cnt):
+                if i + 1 >= len(c):
+                    return parts
+                dx, dy = c[i], c[i + 1]
+                i += 2
+                x += (dx >> 1) ^ -(dx & 1)
+                y += (dy >> 1) ^ -(dy & 1)
+                if cmd == 1:
+                    cur = [(x, y)]
+                    parts.append(cur)
+                elif cur is not None:
+                    cur.append((x, y))
+        elif cmd == 7:
+            if cur:
+                cur.append(cur[0])
+        else:
+            break
+    return parts
+
+
+def mvt_decode(data, want):
+    """Liest die gewünschten Ebenen: {name: [(extent, typ, teile, eigenschaften), ...]}."""
+    out = {}
+    for f, wt, v in _pb_fields(data):
+        if f != 3 or wt != 2:
+            continue
+        name, keys, vals, feats, extent = None, [], [], [], 4096
+        for f2, wt2, v2 in _pb_fields(v):
+            if f2 == 1:
+                name = bytes(v2).decode("utf-8", "replace")
+            elif f2 == 2:
+                feats.append(v2)
+            elif f2 == 3:
+                keys.append(bytes(v2).decode("utf-8", "replace"))
+            elif f2 == 4:
+                vals.append(v2)
+            elif f2 == 5:
+                extent = v2
+        if name not in want:
+            continue
+        vals = [_pb_value(x) for x in vals]
+        lst = out.setdefault(name, [])
+        for fb in feats:
+            tags, gtype, geom = [], 0, []
+            for f3, wt3, v3 in _pb_fields(fb):
+                if f3 == 2:
+                    tags += _pb_packed(v3, wt3)
+                elif f3 == 3:
+                    gtype = v3
+                elif f3 == 4:
+                    geom += _pb_packed(v3, wt3)
+            props = {}
+            for k in range(0, len(tags) - 1, 2):
+                if tags[k] < len(keys) and tags[k + 1] < len(vals):
+                    props[keys[tags[k]]] = vals[tags[k + 1]]
+            lst.append((extent, gtype, _mvt_geom(geom), props))
+    return out
+
+
+def _tile_of(lat, lon, z):
+    n = 2 ** z
+    x = int((lon + 180.0) / 360.0 * n)
+    y = int((1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * n)
+    return min(max(x, 0), n - 1), min(max(y, 0), n - 1)
+
+
+def _tile_lonlat(tx, ty, z, extent, pts):
+    a = np.asarray(pts, dtype=float)
+    n = 2.0 ** z
+    lon = (tx + a[:, 0] / extent) / n * 360.0 - 180.0
+    lat = np.degrees(np.arctan(np.sinh(np.pi * (1.0 - 2.0 * (ty + a[:, 1] / extent) / n))))
+    return lon, lat
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _ofm_template():
+    r = requests.get(OFM_TILEJSON, headers=UA, timeout=8)
+    r.raise_for_status()
+    return r.json()["tiles"][0]
+
+
+def _fetch_tile(tpl, z, x, y):
+    os.makedirs(OSM_CACHE_DIR, exist_ok=True)
+    path = os.path.join(OSM_CACHE_DIR, "vt_" + hashlib.md5(f"{tpl}{z}/{x}/{y}".encode()).hexdigest() + ".pbf")
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < 14 * 86400:
+        with open(path, "rb") as f:
+            return f.read()
+    url = tpl.replace("{z}", str(z)).replace("{x}", str(x)).replace("{y}", str(y))
+    r = requests.get(url, headers=UA, timeout=10)
+    if r.status_code in (204, 404):
+        data = b""
+    else:
+        r.raise_for_status()
+        data = r.content
+    if data[:2] == b"\x1f\x8b":
+        data = gzip.decompress(data)
+    with open(path + f".{os.getpid()}", "wb") as f:
+        f.write(data)
+    os.replace(path + f".{os.getpid()}", path)
+    return data
+
+
+def _is_green(layer, cls, sub):
+    if layer == "park":
+        return True
+    if layer == "landcover":
+        return cls in GREEN_LC or sub in GREEN_SUB
+    if layer == "landuse":
+        return cls in GREEN_LU
+    return False
+
+
+# ---------- Raster
+def _fill_ring(mask, cx, cy):
+    """Füllt einen Ring (in Rasterkoordinaten) per Scanline (gerade-ungerade-Regel)."""
+    ny, nx_ = mask.shape
+    r0, r1 = max(0, int(math.floor(cy.min()))), min(ny - 1, int(math.ceil(cy.max())))
+    if r0 > r1 or cx.max() < 0 or cx.min() > nx_:
+        return
+    x0, y0, x1, y1 = cx[:-1], cy[:-1], cx[1:], cy[1:]
+    for b0 in range(r0, r1 + 1, 256):
+        rows = np.arange(b0, min(r1, b0 + 255) + 1) + 0.5
+        R = rows[:, None]
+        cond = ((y0 <= R) & (y1 > R)) | ((y1 <= R) & (y0 > R))
+        if not cond.any():
+            continue
+        with np.errstate(divide="ignore", invalid="ignore"):
+            xi = x0 + (R - y0) * (x1 - x0) / (y1 - y0)
+        for k in np.nonzero(cond.any(axis=1))[0]:
+            xs = np.sort(xi[k][cond[k]])
+            for a, b in zip(xs[0::2], xs[1::2]):
+                c0, c1 = max(0, int(math.ceil(a - 0.5))), min(nx_ - 1, int(math.floor(b - 0.5)))
+                if c1 >= c0:
+                    mask[b0 + k, c0:c1 + 1] = True
+
+
+def _draw_line(mask, cx, cy):
+    ny, nx_ = mask.shape
+    seg = np.hypot(np.diff(cx), np.diff(cy))
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    if cum[-1] <= 0:
+        return
+    s = np.linspace(0, cum[-1], int(cum[-1] * 2) + 2)
+    px, py = np.interp(s, cum, cx), np.interp(s, cum, cy)
+    c, r = np.floor(px).astype(int), np.floor(py).astype(int)
+    ok = (c >= 0) & (c < nx_) & (r >= 0) & (r < ny)
+    mask[r[ok], c[ok]] = True
+
+
+def _edt(mask, cell):
+    if not mask.any():
+        return np.full(mask.shape, np.inf, dtype=np.float32)
+    return (ndimage.distance_transform_edt(~mask) * cell).astype(np.float32)
+
+
+@st.cache_resource(show_spinner=False, max_entries=3)
+def scan_area(bbox):
+    """Lädt die Vektorkacheln für das Gebiet und baut die Abstandskarten."""
+    if ndimage is None:
+        raise RuntimeError("scipy fehlt (requirements.txt aktualisieren)")
+    w, s, e, n = bbox
+    tpl = _ofm_template()
+    x0, y0 = _tile_of(n, w, VT_ZOOM)
+    x1, y1 = _tile_of(s, e, VT_ZOOM)
+    tiles = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+    if len(tiles) > 64:
+        raise ValueError("Das Gebiet ist für den Grün-Scan zu groß. Bitte eine kürzere Strecke wählen.")
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        datas = list(ex.map(lambda t: _fetch_tile(tpl, VT_ZOOM, t[0], t[1]), tiles))
+
+    lat0, lon0 = (s + n) / 2, (w + e) / 2
+    ky = 111_320.0
+    kx = ky * math.cos(math.radians(lat0))
+    xmin, ymin = (w - lon0) * kx, (s - lat0) * ky
+    width, height = (e - w) * kx, (n - s) * ky
+    cell = max(5.0, math.sqrt(width * height / 2.5e6))
+    ncol, nrow = int(math.ceil(width / cell)) + 1, int(math.ceil(height / cell)) + 1
+    green = np.zeros((nrow, ncol), dtype=bool)
+    roads = {wt: np.zeros((nrow, ncol), dtype=bool) for wt in sorted(set(ROAD_W.values()))}
+    geo, n_green = [], 0
+
+    for (tx, ty), data in zip(tiles, datas):
+        if not data:
+            continue
+        layers = mvt_decode(data, {"landcover", "landuse", "park", "transportation"})
+        for lname, feats in layers.items():
+            for extent, gtype, parts, props in feats:
+                cls, sub = props.get("class"), props.get("subclass")
+                if gtype == 3 and _is_green(lname, cls, sub):
+                    for ring in parts:
+                        if len(ring) < 4:
+                            continue
+                        lon, lat = _tile_lonlat(tx, ty, VT_ZOOM, extent, ring)
+                        X, Y = (lon - lon0) * kx, (lat - lat0) * ky
+                        area_m2 = 0.5 * abs(np.dot(X[:-1], Y[1:]) - np.dot(X[1:], Y[:-1]))
+                        if area_m2 < 50:
+                            continue
+                        _fill_ring(green, (X - xmin) / cell, (Y - ymin) / cell)
+                        n_green += 1
+                        if area_m2 >= 2500 and len(geo) < 900:
+                            step = max(1, len(lon) // 60)
+                            ring_ll = [[round(float(a), 5), round(float(b), 5)]
+                                       for a, b in zip(lon[::step], lat[::step])]
+                            ring_ll.append(ring_ll[0])
+                            name = props.get("name") or GREEN_DE.get(sub) or GREEN_DE.get(cls) or "Grünfläche"
+                            geo.append({"type": "Feature", "properties": {"name": str(name)},
+                                        "geometry": {"type": "Polygon", "coordinates": [ring_ll]}})
+                elif gtype == 2 and lname == "transportation" and cls in ROAD_W:
+                    for part in parts:
+                        if len(part) < 2:
+                            continue
+                        lon, lat = _tile_lonlat(tx, ty, VT_ZOOM, extent, part)
+                        X, Y = (lon - lon0) * kx, (lat - lat0) * ky
+                        _draw_line(roads[ROAD_W[cls]], (X - xmin) / cell, (Y - ymin) / cell)
+
+    gdist = _edt(green, cell)
+    depth = (ndimage.distance_transform_edt(green) * cell).astype(np.float32) if green.any() \
+        else np.zeros(green.shape, dtype=np.float32)
+    noise = np.zeros(green.shape, dtype=np.float32)
+    for wt, m in roads.items():
+        noise = np.maximum(noise, np.where(_edt(m, cell) < NOISE_DIST, wt, 0.0).astype(np.float32))
+    lab, nlab = ndimage.label(green)
+    sizes = np.bincount(lab.ravel(), minlength=nlab + 1).astype(np.float64) * cell * cell
+    sizes[0] = 0.0
+    return {"lat0": lat0, "lon0": lon0, "kx": kx, "ky": ky, "xmin": xmin, "ymin": ymin, "cell": cell,
+            "gdist": gdist, "depth": depth, "noise": noise, "lab": lab, "sizes": sizes,
+            "geo": {"type": "FeatureCollection", "features": geo} if geo else None,
+            "n_green": n_green, "green_share": float(green.mean())}
+
+
+def _to_xy(sa, lat, lon):
+    return (np.asarray(lon, float) - sa["lon0"]) * sa["kx"], (np.asarray(lat, float) - sa["lat0"]) * sa["ky"]
+
+
+def _to_ll(sa, x, y):
+    return sa["lat0"] + y / sa["ky"], sa["lon0"] + x / sa["kx"]
+
+
+def _cells(sa, X, Y):
+    c = np.floor((X - sa["xmin"]) / sa["cell"]).astype(int)
+    r = np.floor((Y - sa["ymin"]) / sa["cell"]).astype(int)
+    ny, nx_ = sa["gdist"].shape
+    ok = (c >= 0) & (c < nx_) & (r >= 0) & (r < ny)
+    return np.clip(r, 0, ny - 1), np.clip(c, 0, nx_ - 1), ok
+
+
+def scan_score(sa, coords, buf):
+    """Bewertet eine Route (Liste [lat, lon]): Grünanteil, Hauptstraßen-Anteil, Doppelwege."""
+    a = np.asarray(coords, dtype=float)
+    X, Y = _to_xy(sa, a[:, 0], a[:, 1])
+    seg = np.hypot(np.diff(X), np.diff(Y))
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(cum[-1])
+    if total <= 0:
+        return {"dist": 0.0, "green": 0.0, "noise": 0.0, "rep": 0.0}
+    s = np.arange(SCAN_STEP / 2, total, SCAN_STEP)
+    px, py = np.interp(s, cum, X), np.interp(s, cum, Y)
+    r, c, ok = _cells(sa, px, py)
+    gd = np.where(ok, sa["gdist"][r, c], np.inf)
+    g = np.clip(1.0 - gd / buf, 0.0, 1.0)
+    nz = np.where(ok, sa["noise"][r, c], 0.0)
+    first, rep = {}, 0
+    for i, k in enumerate(zip(np.round(px / 8).astype(int), np.round(py / 8).astype(int))):
+        j = first.setdefault(k, i)
+        if i - j > 5:
+            rep += 1
+    n = max(len(s), 1)
+    return {"dist": total, "green": float(g.mean()), "noise": float(nz.mean()), "rep": rep / n}
+
+
+def _green_targets(sa, A, B, k=4):
+    """Grünflächen nahe der Luftlinie A-B. Je Fläche ein Eingang (Seite von A) und ein Ausgang
+    (Seite von B) im Inneren, damit die Route durch den Park führt statt nur am Rand vorbei."""
+    D = math.hypot(B[0] - A[0], B[1] - A[1])
+    big = np.nonzero(sa["sizes"] >= PARK_MIN_M2)[0]
+    if not len(big):
+        return []
+    deep = (sa["depth"] >= min(12.0, 2 * sa["cell"])) & np.isin(sa["lab"], big)
+    r, c = np.nonzero(deep)
+    if not len(r):
+        return []
+    X = sa["xmin"] + (c + 0.5) * sa["cell"]
+    Y = sa["ymin"] + (r + 0.5) * sa["cell"]
+    dA, dB = np.hypot(X - A[0], Y - A[1]), np.hypot(X - B[0], Y - B[1])
+    keep = dA + dB - D <= 0.6 * D + 300
+    if not keep.any():
+        return []
+    X, Y, dA, dB = X[keep], Y[keep], dA[keep], dB[keep]
+    labs = sa["lab"][r[keep], c[keep]]
+    oa = np.lexsort((dA, labs))
+    ul, fa = np.unique(labs[oa], return_index=True)
+    ob = np.lexsort((dB, labs))
+    _, fb = np.unique(labs[ob], return_index=True)
+    ia, ib = oa[fa], ob[fb]
+    inner = np.hypot(X[ia] - X[ib], Y[ia] - Y[ib])
+    detour = dA[ia] + inner + dB[ib] - D
+    ok = detour <= 0.7 * D + 300
+    score = np.sqrt(sa["sizes"][ul]) / (1.0 + detour / (0.25 * D + 150)) \
+        * (1.0 + 0.5 * np.minimum(inner / (0.3 * D + 50), 1.0))
+    score[~ok] = -1
+    out = []
+    for j in np.argsort(-score):
+        if score[j] < 0:
+            break
+        e, x = (float(X[ia[j]]), float(Y[ia[j]])), (float(X[ib[j]]), float(Y[ib[j]]))
+        via = [e] if math.hypot(e[0] - x[0], e[1] - x[1]) < 60 else [e, x]
+        mid = via[len(via) // 2]
+        if all(math.hypot(mid[0] - q[-1][0], mid[1] - q[-1][1]) > 200 for q in out):
+            out.append(via)
+        if len(out) == k:
+            break
+    return out
+
+
+def _snap_green(sa, x, y, radius):
+    """Verschiebt einen Wegpunkt ins Innere einer nahen, möglichst großen Grünfläche."""
+    cell = sa["cell"]
+    ny, nx_ = sa["lab"].shape
+    c0, c1 = int((x - radius - sa["xmin"]) / cell), int((x + radius - sa["xmin"]) / cell) + 1
+    r0, r1 = int((y - radius - sa["ymin"]) / cell), int((y + radius - sa["ymin"]) / cell) + 1
+    c0, r0, c1, r1 = max(c0, 0), max(r0, 0), min(c1, nx_), min(r1, ny)
+    if c0 >= c1 or r0 >= r1:
+        return x, y
+    lab = sa["lab"][r0:r1, c0:c1]
+    ok = (sa["depth"][r0:r1, c0:c1] >= min(12.0, 2 * cell)) & (sa["sizes"][lab] >= PARK_MIN_M2)
+    rr, cc = np.nonzero(ok)
+    if not len(rr):
+        return x, y
+    X = sa["xmin"] + (cc + c0 + 0.5) * cell
+    Y = sa["ymin"] + (rr + r0 + 0.5) * cell
+    d = np.hypot(X - x, Y - y)
+    inside = d <= radius
+    if not inside.any():
+        return x, y
+    sc = np.sqrt(sa["sizes"][lab[rr, cc]]) / (1.0 + 3.0 * d / radius)
+    sc[~inside] = -1
+    i = int(np.argmax(sc))
+    return float(X[i]), float(Y[i])
+
+
+# ---------- Routenserver (FOSSGIS OSRM, höchstens 1 Anfrage pro Sekunde)
+_OSRM_LOCK = threading.Lock()
+_OSRM_LAST = [0.0]
+
+
+def osrm_request(points, alternatives=False):
+    with _OSRM_LOCK:
+        wait = _OSRM_LAST[0] + 1.05 - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _OSRM_LAST[0] = time.time()
+    coords = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in points)
+    params = {"overview": "full", "geometries": "geojson", "steps": "true"}
+    if alternatives and len(points) == 2:
+        params["alternatives"] = "3"
+    if len(points) > 2:
+        params["continue_straight"] = "true"
+    r = requests.get(OSRM_FOOT + coords, headers=UA, timeout=10, params=params)
+    r.raise_for_status()
+    js = r.json()
+    if js.get("code") != "Ok" or not js.get("routes"):
+        raise ValueError("Für diese Punkte habe ich keinen Fußweg gefunden.")
+    return js["routes"]
+
+
+def _route_ll(route):
+    return [[y, x] for x, y in route["geometry"]["coordinates"]]
+
+
+def _dedupe(routes):
+    out, seen = [], set()
+    for rt in routes:
+        ll = _route_ll(rt)
+        if len(ll) < 2:
+            continue
+        key = (round(float(rt.get("distance", 0)) / 5), tuple(round(v, 4) for v in ll[len(ll) // 2]))
+        if key not in seen:
+            seen.add(key)
+            out.append(rt)
+    return out
+
+
+def scan_ab_candidates(sa, p1, p2, log=lambda *_: None):
+    A, B = _to_xy(sa, p1[0], p1[1]), _to_xy(sa, p2[0], p2[1])
+    A, B = (float(A[0]), float(A[1])), (float(B[0]), float(B[1]))
+    D = math.hypot(B[0] - A[0], B[1] - A[1])
+    routes = list(osrm_request([p1, p2], alternatives=True))
+    vias = [[_to_ll(sa, x, y) for x, y in via] for via in _green_targets(sa, A, B, k=4)]
+    if D > 150:
+        mx, my = (A[0] + B[0]) / 2, (A[1] + B[1]) / 2
+        nx_, ny_ = -(B[1] - A[1]) / D, (B[0] - A[0]) / D
+        for sgn in (1, -1):
+            x, y = _snap_green(sa, mx + sgn * 0.3 * D * nx_, my + sgn * 0.3 * D * ny_, 0.2 * D + 80)
+            vias.append([_to_ll(sa, x, y)])
+    log(f"🌳 {len(vias)} grüne Umwege werden geprüft")
+    for via in vias:
+        try:
+            routes += osrm_request([p1] + [(float(v[0]), float(v[1])) for v in via] + [p2])
+        except Exception:
+            continue
+    return _dedupe(routes)
+
+
+def scan_loop_candidates(sa, p1, p2, target, buf, progress=None):
+    A = _to_xy(sa, p1[0], p1[1])
+    ax, ay = float(A[0]), float(A[1])
+
+    def build(theta, rho):
+        cx, cy = ax + rho * math.cos(theta), ay + rho * math.sin(theta)
+        pts = [p1]
+        for alpha in (90, 180, 270):
+            ang = theta + math.pi + math.radians(alpha)
+            x, y = _snap_green(sa, cx + rho * math.cos(ang), cy + rho * math.sin(ang), 0.4 * rho)
+            la, lo = _to_ll(sa, x, y)
+            pts.append((float(la), float(lo)))
+        pts.append(p2)
+        rt = osrm_request(pts)[0]
+        if len(_route_ll(rt)) < 2:
+            raise ValueError("leere Route")
+        sc = scan_score(sa, _route_ll(rt), buf)
+        return {"route": rt, **sc}
+
+    cands, first = [], []
+    bearings = [2 * math.pi * k / 6 for k in range(6)]
+    rho0 = target / (2 * math.pi * 1.3)
+    total_steps = len(bearings) + 3
+    for k, th in enumerate(bearings):
+        try:
+            c = build(th, rho0)
+            c["theta"], c["rho"] = th, rho0
+            cands.append(c)
+            first.append(c)
+        except Exception:
+            pass
+        if progress:
+            progress((k + 1) / total_steps)
+    # die drei vielversprechendsten Richtungen auf die Wunschlänge nachjustieren
+    first.sort(key=lambda c: -(c["green"] - 0.8 * c["rep"] - abs(c["dist"] / target - 1)))
+    for j, c in enumerate(first[:3]):
+        ratio = c["dist"] / target if target else 1
+        if abs(ratio - 1) > 0.07 and ratio > 0:
+            try:
+                c2 = build(c["theta"], c["rho"] / ratio)
+                cands.append(c2)
+            except Exception:
+                pass
+        if progress:
+            progress((len(bearings) + j + 1) / total_steps)
+    return cands
+
+
+def _grid_keys(coords):
+    a = np.asarray(coords, dtype=float)
+    return set(zip(np.round(a[:, 0] * 4000).astype(int), np.round(a[:, 1] * 2500).astype(int)))
+
+
+def _scan_option(nav, label, sub, hint, sc, extra=None):
+    mins = max(1, round(sc["dist"] / M_PER_MIN))
+    stats = [["Länge", fmt_km(sc["dist"])], ["Dauer", f"{mins} min"],
+             ["Grünanteil", f"{sc['green']:.0%}"], ["Hauptstraße", f"{sc['noise']:.0%}"]]
+    return _option(nav, label, sub, hint, stats)
+
+
+SCAN_NOTE = "🛰️ Grün-Scan (Ersatzdaten aus Kartenkacheln)"
+SCAN_ATTRIB = ['Grün-Scan: <a href="https://openfreemap.org">OpenFreeMap</a> © OpenMapTiles, OSM',
+               'Routing: <a href="https://routing.openstreetmap.de">FOSSGIS</a>']
+
+
+def scan_ab_view(start_v, dest_v, buf=150, log=lambda *_: None):
+    """Grüne Route A -> B ohne Overpass: Varianten vom Routenserver, bewertet per Grün-Scan."""
+    lat1, lon1, lab1 = _unpack(start_v)
+    lat2, lon2, lab2 = _unpack(dest_v)
+    p1, p2 = (lat1, lon1), (lat2, lon2)
+    bbox, span = corridor_bbox(p1, p2)
+    if span > MAX_SPAN_M:
+        raise ValueError(f"Start und Ziel sind {span / 1000:.1f} km auseinander. "
+                         f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
+    log("🛰️ Grün-Scan: Grünflächen und Hauptstraßen aus Kartenkacheln laden")
+    t0 = time.time()
+    sa = scan_area(bbox)
+    log(f"✅ {sa['n_green']} Grünflächen erkannt, {sa['green_share']:.0%} des Gebiets grün "
+        f"({time.time() - t0:.0f} s)")
+    log("🧭 Wegvarianten vergleichen (direkt, durch Parks, seitliche Umwege)")
+    routes = scan_ab_candidates(sa, p1, p2, log)
+    scored = [(rt, scan_score(sa, _route_ll(rt), buf)) for rt in routes]
+    scored = [(rt, sc) for rt, sc in scored if sc["dist"] > 0]
+    if not scored:
+        raise ValueError("Für diese Punkte habe ich keinen Fußweg gefunden.")
+    short = min(sc["dist"] for _, sc in scored)
+    t1, t2 = lab1.split(" · ")[0], lab2.split(" · ")[0]
+    options, used = [], set()
+    for name, lam in LEVELS.items():
+        mu = QUIET if lam > 0 else 0.0
+        j = min(range(len(scored)), key=lambda i: scored[i][1]["dist"] * (
+            1 + lam * (1 - scored[i][1]["green"]) + mu * scored[i][1]["noise"]))
+        if j in used:
+            continue
+        used.add(j)
+        rt, sc = scored[j]
+        nav = osrm_nav(rt, f"{t1} → {t2}")
+        if not nav:
+            continue
+        detour = sc["dist"] / short - 1 if short else 0.0
+        options.append(_scan_option(nav, name, f"{fmt_km(sc['dist'])} · {sc['green']:.0%} grün",
+                                    f"{LEVEL_HINT[name]} · Umweg {detour:+.0%} · {SCAN_NOTE}", sc))
+    if not options:
+        raise ValueError("Start und Ziel liegen zu nah beieinander.")
+    order = list(LEVELS)
+    default = min(range(len(options)), key=lambda i: abs(order.index(options[i]["label"]) - 2))
+    payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=sa["geo"],
+                   options=options, default=default, speed=M_PER_MIN, topPad=TOP_PAD, attrib=SCAN_ATTRIB)
+    return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
+            "start": start_v, "dest": dest_v, "area": None, "bbox": None, "buf": buf, "fallback": "scan"}
+
+
+def scan_loop_view(start_v, end_v, km, level, buf=150, log=lambda *_: None, progress=None):
+    """Grünes Ründchen ohne Overpass."""
+    lat1, lon1, lab1 = _unpack(start_v)
+    p1 = (lat1, lon1)
+    if end_v:
+        lat2, lon2, lab2 = _unpack(end_v)
+        p2 = (lat2, lon2)
+    else:
+        p2, lab2 = p1, lab1
+    target = km * 1000
+    if dist_m(p1, p2) > 0.35 * target:
+        raise ValueError("Start und Ende liegen zu weit auseinander für diese Länge.")
+    log("🛰️ Grün-Scan: Grünflächen und Hauptstraßen aus Kartenkacheln laden")
+    t0 = time.time()
+    sa = scan_area(loop_bbox(p1, p2, target))
+    log(f"✅ {sa['n_green']} Grünflächen erkannt, {sa['green_share']:.0%} des Gebiets grün "
+        f"({time.time() - t0:.0f} s)")
+    log("🔄 Runden in verschiedene Richtungen probieren (ca. 10 s)")
+    cands = scan_loop_candidates(sa, p1, p2, target, buf, progress)
+    if not cands:
+        raise ValueError("Für diesen Startpunkt habe ich keine Runde gefunden.")
+    lam = LEVELS[level]
+    mu = QUIET if lam > 0 else 0.0
+    w_green = 0.15 + lam / 12.0
+    for c in cands:
+        c["score"] = (w_green * c["green"] - 0.8 * c["rep"] - 0.25 * mu * c["noise"]
+                      - 2.0 * abs(c["dist"] / target - 1))
+    cands.sort(key=lambda c: -c["score"])
+    picked = []
+    for c in cands:
+        if abs(c["dist"] / target - 1) > 0.25:
+            continue
+        ks = _grid_keys(_route_ll(c["route"]))
+        if all(len(ks & p["ks"]) / max(len(ks | p["ks"]), 1) < 0.6 for p in picked):
+            c["ks"] = ks
+            picked.append(c)
+        if len(picked) == 3:
+            break
+    if not picked:
+        picked = cands[:1]
+    t1, t2 = lab1.split(" · ")[0], lab2.split(" · ")[0]
+    options = []
+    for i, c in enumerate(picked):
+        nav = osrm_nav(c["route"], f"Ründchen {i + 1}")
+        if not nav:
+            continue
+        diff = c["dist"] / target - 1
+        options.append(_scan_option(
+            nav, f"Variante {i + 1}", f"{fmt_km(c['dist'])} · {c['green']:.0%} grün",
+            f"Wunschlänge {fmt_km(target)} ({diff:+.0%}) · {1 - c['rep']:.0%} ohne Doppelweg · {SCAN_NOTE}", c))
+    if not options:
+        raise ValueError("Für diesen Startpunkt habe ich keine Runde gefunden.")
+    payload = dict(mode="loop", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=sa["geo"],
+                   options=options, default=0, speed=M_PER_MIN, topPad=TOP_PAD, attrib=SCAN_ATTRIB)
+    return {"mode": "loop", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
+            "start": start_v, "end": end_v, "km": km, "km_ok": km, "level": level, "buf": buf,
+            "area": None, "bbox_km": None, "fallback": "scan"}
+
+
+def make_loop_view_safe(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
+                        log=lambda *_: None, progress=None):
+    """Ründchen mit Overpass-Daten; wenn die Server überlastet sind, per Grün-Scan."""
+    try:
+        return make_loop_view(start_v, end_v, km, level, buf, area, bbox_km, log, progress)
+    except ValueError:
+        raise
+    except Exception as e:
+        log("⚠️ OSM-Server überlastet: ich nutze den Grün-Scan")
+        try:
+            return scan_loop_view(start_v, end_v, km, level, buf, log, progress)
         except ValueError:
             raise
         except Exception:
@@ -1329,12 +2187,16 @@ def sources_text(buf, lam):
     return (
         "- Wegenetz (Fußwege) und Grünflächen: OpenStreetMap via Overpass (ODbL)\n"
         "- Ortssuche: Photon (photon.komoot.io) auf OSM-Basis, Fallback Nominatim\n"
-        "- Kartenhintergrund: CARTO / OpenStreetMap, Gelände: OpenTopoMap, Satellit: Esri\n"
+        "- Ersatz bei überlasteten Servern (Grün-Scan): Vektorkacheln von OpenFreeMap (OpenMapTiles, "
+        "OSM-Daten) + Routenserver von FOSSGIS (routing.openstreetmap.de)\n"
+        "- Kartenhintergrund: Esri Topo (Standard), Esri Straßen, OpenTopoMap, OpenStreetMap, Esri Satellit\n"
         f"- Grünflächen-Tags: `{GREEN_TAGS}`\n"
         f"- Score je Abtastpunkt: 1,0 im Park, linear fallend auf 0 im Abstand von {buf} m\n"
         f"- Kantenscore: Mittel aus {SAMPLES} Abtastpunkten\n"
-        "- Kosten: Länge × (1 + λ × (1 − Grünscore)), λ je Grünstufe: "
+        f"- Kosten: Länge × (1 + λ × (1 − Grünscore) + {QUIET:g} × Hauptstraßen-Nähe), λ je Grünstufe: "
         + ", ".join(f"{k} {v:g}" for k, v in LEVELS.items())
+        + f"\n- Hauptstraßen (Bundes-, Haupt-, Neben-, Kreisstraßen) zählen bis {NOISE_DIST:g} m Abstand als laut "
+        "(bei „Schnellste“ ignoriert)"
     )
 
 
@@ -1374,7 +2236,7 @@ def render_map_view():
             if gw.get("fallback"):
                 c1, c2, c3 = st.columns([1, 5, 1])
                 c3.button("🌿", key="gw_retry", use_container_width=True, on_click=set_retry,
-                          help="Grüne Route erneut versuchen")
+                          help="Genauere OSM-Grünflächen erneut versuchen")
             else:
                 c1, c2 = st.columns([1, 6])
             c1.button("←", key="gw_back", use_container_width=True, on_click=close_map, help="Zurück zur Suche")
@@ -1398,15 +2260,17 @@ def render_map_view():
         try:
             new = make_ab_view_safe(gw["start"], gw["dest"], gw["buf"])
             if new.get("fallback"):
-                st.toast("Die Server sind noch überlastet. Bitte später noch einmal.")
+                st.toast("Die OSM-Server sind noch überlastet. Der Grün-Scan bleibt aktiv.")
                 new = None
         except Exception as e:
             st.toast(f"⚠️ {e}"[:220])
     elif gw["mode"] == "ab" and dest_new and dest_new != gw["dest"] and dest_new != gw.get("failed"):
         st.toast("🧭 Berechne neue Route …")
         try:
-            if gw.get("fallback"):
-                new = osrm_view(gw["start"], dest_new)
+            if gw.get("fallback") == "scan":
+                new = scan_ab_view(gw["start"], dest_new, gw["buf"])
+            elif gw.get("fallback"):
+                new = make_ab_view_safe(gw["start"], dest_new, gw["buf"])
             else:
                 new = make_ab_view_safe(gw["start"], dest_new, gw["buf"], gw["area"], gw["bbox"])
         except Exception as e:
@@ -1416,8 +2280,11 @@ def render_map_view():
         gw["recalc"] = False
         st.toast("🔄 Suche neues Ründchen …")
         try:
-            new = make_loop_view(gw["start"], gw["end"], gw["km"], gw["level"], gw["buf"],
-                                 area=gw["area"], bbox_km=gw["bbox_km"])
+            if gw.get("fallback") == "scan":
+                new = scan_loop_view(gw["start"], gw["end"], gw["km"], gw["level"], gw["buf"])
+            else:
+                new = make_loop_view_safe(gw["start"], gw["end"], gw["km"], gw["level"], gw["buf"],
+                                          area=gw["area"], bbox_km=gw["bbox_km"])
         except Exception as e:
             gw["km"] = gw["km_ok"]
             st.toast(f"⚠️ {e}"[:220])
@@ -1484,7 +2351,7 @@ def home_loop():
 
     with st.status("Ründchen wird gesucht …", expanded=True) as status:
         try:
-            view = make_loop_view(a_v, None if same else b_v, km, level, log=st.write, progress=prog)
+            view = make_loop_view_safe(a_v, None if same else b_v, km, level, log=st.write, progress=prog)
             if "bar" in holder:
                 holder["bar"].empty()
             status.update(label="Fertig", state="complete", expanded=False)
