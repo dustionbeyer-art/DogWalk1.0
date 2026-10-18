@@ -30,27 +30,53 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from html import escape
 
-import geopandas as gpd
 import networkx as nx
 import numpy as np
-import osmnx as ox
 import requests
-import shapely
 import streamlit as st
 try:
     from scipy import ndimage
 except Exception:  # Grün-Scan braucht scipy; ohne bleibt die einfache Fußroute
     ndimage = None
-from shapely import STRtree
-from shapely.geometry import LineString, Point
 from streamlit.components.v1 import html as st_html
 from streamlit_js_eval import get_geolocation
 from streamlit_searchbox import st_searchbox
 
-ox.settings.use_cache = True
-ox.settings.log_console = False
-ox.settings.requests_timeout = 25
-ox.settings.overpass_rate_limit = False
+
+
+class _Lazy:
+    """Schwere Bibliotheken (geopandas, osmnx, shapely) erst beim ersten Gebrauch laden:
+    die Startseite erscheint dadurch deutlich schneller, vor allem nach dem Aufwachen der App."""
+
+    def __init__(self, name):
+        self._name, self._mod = name, None
+
+    def __getattr__(self, attr):
+        if self._mod is None:
+            import importlib
+            self._mod = importlib.import_module(self._name)
+            if self._name == "osmnx":
+                self._mod.settings.use_cache = True
+                self._mod.settings.log_console = False
+                self._mod.settings.requests_timeout = 25
+                self._mod.settings.overpass_rate_limit = False
+        return getattr(self._mod, attr)
+
+
+gpd, ox, shapely = _Lazy("geopandas"), _Lazy("osmnx"), _Lazy("shapely")
+
+
+def STRtree(*a, **k):
+    return shapely.STRtree(*a, **k)
+
+
+def LineString(*a, **k):
+    return shapely.geometry.LineString(*a, **k)
+
+
+def Point(*a, **k):
+    return shapely.geometry.Point(*a, **k)
+
 
 # Mehrere Overpass-Server: der Hauptserver ist oft überlastet (502/504).
 OVERPASS_MIRRORS = [
@@ -61,7 +87,7 @@ OVERPASS_MIRRORS = [
     "https://overpass.private.coffee/api",
     "https://maps.mail.ru/osm/tools/overpass/api",
 ]
-LOAD_DEADLINE_S = 20  # harte Zeitgrenze für Overpass; danach übernimmt der Grün-Scan
+LOAD_DEADLINE_S = 16  # harte Zeitgrenze für Overpass; danach übernimmt der Grün-Scan
 OSM_CACHE_DIR = os.path.join(tempfile.gettempdir(), "green_walker_osm")
 OSM_CACHE_DAYS = 7
 def rank_mirrors():
@@ -335,7 +361,7 @@ def corridor_bbox(p1, p2):
     ky = 111_320.0
     kx = ky * math.cos(math.radians((lat1 + lat2) / 2))
     span = max(abs(lon2 - lon1) * kx, abs(lat2 - lat1) * ky)
-    pad = max(700.0, 0.4 * span)  # Platz für große Umwege
+    pad = max(600.0, 0.3 * span)  # Platz für Umwege
     bbox = (round(min(lon1, lon2) - pad / kx, 4), round(min(lat1, lat2) - pad / ky, 4),
             round(max(lon1, lon2) + pad / kx, 4), round(max(lat1, lat2) + pad / ky, 4))
     return bbox, span
@@ -2239,7 +2265,7 @@ def points_bbox(pts, extra_m=0.0):
     lats, lons = [p[0] for p in pts], [p[1] for p in pts]
     kx = ky * math.cos(math.radians(sum(lats) / len(lats)))
     span = max((max(lons) - min(lons)) * kx, (max(lats) - min(lats)) * ky)
-    pad = max(700.0, 0.4 * span) + 0.4 * extra_m
+    pad = max(600.0, 0.3 * span) + 0.4 * extra_m
     return (round(min(lons) - pad / kx, 4), round(min(lats) - pad / ky, 4),
             round(max(lons) + pad / kx, 4), round(max(lats) + pad / ky, 4)), span
 
@@ -2638,6 +2664,11 @@ html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp 
 .stButton>button[kind="primary"]{background:#5E7F52;border-color:#5E7F52;color:#FBF7EE;height:3rem;font-size:1rem;font-weight:700}
 .stButton>button[kind="primary"]:hover{background:var(--moss);border-color:var(--moss);color:#FBF7EE}
 [data-baseweb="input"],[data-baseweb="select"]>div,[data-baseweb="base-input"]{border-radius:14px!important}
+[data-testid="stButtonGroup"]{display:flex;width:100%;gap:8px;margin-bottom:4px}
+[data-testid="stButtonGroup"] button{flex:1 1 0;min-height:46px;border-radius:14px;font-weight:700;white-space:normal;
+ line-height:1.15;background:#fff;border:1px solid var(--line);color:var(--text)}
+[data-testid="stButtonGroup"] button[aria-checked="true"],[data-testid="stButtonGroup"] button[kind*="Active"]{
+ background:#E7EDDB;border-color:var(--sage)}
 .stTabs [data-baseweb="tab-list"]{gap:8px;background:transparent;padding:0;overflow-x:auto}
 .stTabs [data-baseweb="tab"]{flex:1 0 auto;white-space:nowrap;padding:0 14px;justify-content:center;height:46px;border-radius:14px;font-weight:700;
  color:var(--text);background:#fff;border:1px solid var(--line)}
@@ -2718,10 +2749,10 @@ def start_input(label, key):
             st.session_state["bias"] = _unpack(v)[:2]
         return v
 
-    skey = f"{key}_loc"
+    skey = "loc_shared"  # ein Standort für alle Reiter: wird nur einmal abgefragt
     loc = st.session_state.get(skey)
     if loc is None:
-        raw = get_geolocation(component_key=f"{key}_geo")
+        raw = get_geolocation(component_key="geo_shared")
         if isinstance(raw, dict) and raw.get("error"):
             st.warning("Der Standort ist nicht verfügbar. Bitte die Freigabe im Browser erlauben "
                        "(Schloss-Symbol in der Adressleiste) und den Schalter erneut setzen, "
@@ -3027,13 +3058,17 @@ def render_home():
                 '" width="46" height="46" alt=""></div><div><h1>Green-Walker</h1>'
                 '<p>Der grüne Weg statt nur der kürzeste.</p></div></div>',
                 unsafe_allow_html=True)
-    tab_route, tab_loop, tab_tour = st.tabs(["🧭 Route", "🔄 Ründchen", "🛍️ Ründchen mit Zwischenziel"])
-    with tab_route:
-        home_route()
-    with tab_loop:
-        home_loop()
-    with tab_tour:
-        home_tour()
+    # Nur der gewählte Reiter wird aufgebaut (st.tabs würde alle drei samt Suchfeldern laden = langsam)
+    pages = {"route": "🧭 Route", "loop": "🔄 Ründchen", "tour": "🛍️ Ründchen mit Zwischenziel"}
+    try:
+        page = st.segmented_control("Ansicht", list(pages), format_func=pages.get, default="route",
+                                    key="page_sel", label_visibility="collapsed")
+    except Exception:
+        page = st.radio("Ansicht", list(pages), format_func=pages.get, horizontal=True, key="page_sel_r",
+                        label_visibility="collapsed")
+    page = page or st.session_state.get("page_last", "route")
+    st.session_state["page_last"] = page
+    {"route": home_route, "loop": home_loop, "tour": home_tour}[page]()
     with st.expander("Datenquellen und Gewichtung"):
         st.markdown(sources_text(150, LEVELS["Ausgewogen"]))
 
