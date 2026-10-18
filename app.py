@@ -535,7 +535,7 @@ def solve(area, o, t, lam, buf):
 LOOP_BEARINGS = 8      # Richtungen, in die Runden probiert werden
 LOOP_TOLERANCE = 0.07  # akzeptierte Längenabweichung beim Anpassen (±7 %)
 LOOP_REUSE_PENALTY = 4.0  # Strafe für bereits gelaufene Wegstücke (vermeidet Hin-und-zurück)
-LOOP_MAX_KM = 6.0
+LOOP_MAX_KM = 10.0
 
 
 def dist_m(p1, p2):
@@ -550,7 +550,7 @@ def loop_bbox(p1, p2, target):
     ky = 111_320.0
     clat, clon = (lat1 + lat2) / 2, (lon1 + lon2) / 2
     kx = ky * math.cos(math.radians(clat))
-    half = 0.38 * target + 400 + dist_m(p1, p2) / 2
+    half = (0.38 if target <= 6000 else 0.31) * target + 400 + dist_m(p1, p2) / 2  # lange Runden: Gebiet knapper halten
     return (round(clon - half / kx, 4), round(clat - half / ky, 4),
             round(clon + half / kx, 4), round(clat + half / ky, 4))
 
@@ -829,11 +829,21 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
 .sq.on{background:#E7EDDB;border-color:var(--sage)}
 #vbtn,#fbtn{display:none}body.nav #vbtn,body.nav #fbtn{display:block}
 #styletip{position:fixed;z-index:1200;left:50%;top:calc(var(--top) + 14px);transform:translateX(-50%);background:rgba(59,58,51,.88);color:#FBF7EE;padding:6px 12px;border-radius:10px;font-size:.85rem;opacity:0;transition:opacity .3s;pointer-events:none}
+#clouds{position:fixed;inset:0;z-index:3000;pointer-events:none;background:#F4EFE6;animation:cbase 1.2s .25s cubic-bezier(.4,0,.6,1) forwards;overflow:hidden}
+.cl{position:absolute;border-radius:50%;filter:blur(30px);background:radial-gradient(closest-side,rgba(255,255,255,.96),rgba(255,255,255,.55) 55%,rgba(255,255,255,0));will-change:transform,opacity;animation:cpart 1.9s .15s cubic-bezier(.45,0,.2,1) forwards}
+@keyframes cbase{to{opacity:0}}
+@keyframes cpart{0%{transform:translate(0,0) scale(1);opacity:1}60%{opacity:.9}100%{transform:translate(var(--dx),var(--dy)) scale(1.9);opacity:0}}
+#map.arrive{animation:czoom 2.2s cubic-bezier(.16,.7,.2,1) both}
+@keyframes czoom{from{transform:scale(1.22)}to{transform:scale(1)}}
+#sheet.arrive,#side.arrive,#banner.arrive{animation:crise .7s 1s cubic-bezier(.2,.8,.2,1) both}
+@keyframes crise{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){#clouds{display:none}#map.arrive,.arrive{animation:none!important}}
 #list{position:fixed;z-index:1100;top:calc(var(--top) + 8px);left:10px;right:10px;bottom:10px;max-width:620px;margin:0 auto;background:var(--paper);border:1px solid var(--line);border-radius:20px;overflow:auto;padding:12px 14px;display:none;box-shadow:0 8px 28px rgba(60,50,30,.3)}
 .row{display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid #E4DBC8}
 .ri{font-size:22px;width:30px;text-align:center;flex:none}.rt{flex:1}.rd{opacity:.65;font-size:.85rem;white-space:nowrap}
 </style></head><body>
 <div id="map"></div>
+<div id="clouds"></div>
 <div id="banner"><div id="ico">🧭</div><div><div id="dist"></div><div id="ins"></div></div></div>
 <div id="side"><button id="layers" title="Kartenstil wechseln">🗺️</button><button id="sat" title="Satellit / Luftbild">🛰️</button><button id="fit" title="Ganze Route zeigen">⤢</button></div>
 <div id="sheet">
@@ -853,6 +863,24 @@ const WALK = D.speed || 80, TOP = D.topPad || 0, ky = 110540;
 const GO = D.mode === 'loop' ? '▶ Ründchen starten' : '▶ Route starten';
 document.documentElement.style.setProperty('--top', TOP + 'px');
 
+// Übergang: Wolkendecke, die aufbricht und zur Seite zieht, dahinter zoomt die Karte heran
+(function () {
+  let seen = false; const key = 'gw_cloud_' + JSON.stringify([D.p1, D.p2, D.mode]);
+  try { seen = sessionStorage.getItem(key) === '1'; sessionStorage.setItem(key, '1'); } catch (e) {}
+  const c = $('clouds');
+  if (seen) { c.style.display = 'none'; return; }
+  const W = innerWidth, H = innerHeight, N = 9;
+  for (let i = 0; i < N; i++) {
+    const d = document.createElement('div'); d.className = 'cl';
+    const w = (0.5 + Math.random() * 0.5) * Math.max(W, H) * 0.7, h = w * (0.55 + Math.random() * 0.25);
+    const cx = (i % 3) / 2 * W, cy = Math.floor(i / 3) / 2 * H;  // 3 x 3 Raster, leicht verschoben
+    d.style.cssText = 'width:' + w + 'px;height:' + h + 'px;left:' + (cx - w / 2 + (Math.random() - .5) * 80) + 'px;top:' + (cy - h / 2 + (Math.random() - .5) * 80) +
+      'px;--dx:' + ((cx - W / 2) * 1.1 + (Math.random() - .5) * 120) + 'px;--dy:' + ((cy - H / 2) * 1.1 + (Math.random() - .5) * 120) + 'px;animation-delay:' + (0.1 + Math.random() * 0.25) + 's';
+    c.appendChild(d);
+  }
+  ['map', 'sheet', 'side', 'banner'].forEach(id => $(id).classList.add('arrive'));
+  setTimeout(() => { c.style.display = 'none'; ['map', 'sheet', 'side', 'banner'].forEach(id => $(id).classList.remove('arrive')); }, 2600);
+})();
 const map = L.map('map', {zoomControl: false, zoomAnimation: false, fadeAnimation: false, markerZoomAnimation: false}).setView(D.p1, 15);
 
 // Kartenhintergründe. Standard ohne Schlüssel und ohne Referer-Pflicht (in eingebetteten Fenstern
@@ -921,9 +949,29 @@ function fmt(m) {
 }
 function eta(rem) { return new Date(Date.now() + rem / WALK * 60000).toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'}); }
 function banner(cls, ico, dist, ins) { $('banner').className = cls; $('ico').textContent = ico; $('dist').textContent = dist; $('ins').textContent = ins; }
+let VOICE = null;
+function pickVoice() {
+  // beste deutsche Stimme: neuronale/hochwertige zuerst, blecherne (compact/espeak) zuletzt
+  try {
+    const vs = (speechSynthesis.getVoices() || []).filter(v => /^de/i.test(v.lang));
+    if (!vs.length) return;
+    const score = v => (/neural|natural|online/i.test(v.name) ? 60 : 0) + (/premium|enhanced|erweitert|verbessert/i.test(v.name) ? 45 : 0) +
+      (/google/i.test(v.name) ? 25 : 0) + (/anna|petra|katja|marlene|vicki|amala|conrad|florian|seraphina/i.test(v.name) ? 15 : 0) +
+      (/de[-_]DE/i.test(v.lang) ? 5 : 0) - (/compact|eloquence|espeak|robot/i.test(v.name) ? 50 : 0);
+    vs.sort((a, b) => score(b) - score(a));
+    VOICE = vs[0];
+  } catch (e) {}
+}
+if ('speechSynthesis' in window) { pickVoice(); try { speechSynthesis.addEventListener('voiceschanged', pickVoice); } catch (e) {} }
 function say(t) {
   if (!voice || !('speechSynthesis' in window)) return;
-  try { const u = new SpeechSynthesisUtterance(t); u.lang = 'de-DE'; speechSynthesis.cancel(); speechSynthesis.speak(u); } catch (e) {}
+  try {
+    const clean = String(t).replace(/[\u{1F000}-\u{1FFFF}\u2600-\u27BF]/gu, '').replace(/\s+/g, ' ').replace(/ m\b/g, ' Meter').trim();
+    const u = new SpeechSynthesisUtterance(clean);
+    u.lang = 'de-DE'; if (VOICE) u.voice = VOICE;
+    u.rate = 0.96; u.pitch = 1.0; u.volume = 1;
+    speechSynthesis.cancel(); speechSynthesis.speak(u);
+  } catch (e) {}
 }
 function fitRoute() {
   if (!coords.length) return;
@@ -2086,6 +2134,12 @@ html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp 
 .st-key-card_route label p,.st-key-card_loop label p{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;
  opacity:.7;font-weight:600}
 .hint{opacity:.7;font-size:.8rem;margin:-4px 0 8px}
+.fld{display:flex;align-items:center;gap:8px;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;font-weight:700;
+ color:var(--text);opacity:.75;margin:10px 0 4px}
+.fld .dot{width:10px;height:10px;border-radius:50%;display:inline-block;box-shadow:0 0 0 3px rgba(78,110,69,.15)}
+.fld .dot.s{background:var(--moss)}.fld .dot.z{background:#B07A35;box-shadow:0 0 0 3px rgba(176,122,53,.18)}
+[data-testid="stToggle"] label p,[data-testid="stCheckbox"] label p{font-size:.92rem;font-weight:600}
+[data-testid="stSlider"] [role="slider"]{box-shadow:0 2px 8px rgba(60,50,30,.3)}
 .stCaption,[data-testid="stCaptionContainer"]{font-size:.8rem;opacity:.7}
 .trip{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 10px}
 .pill{border-radius:14px;padding:8px 12px;background:#E7EDDB;color:var(--text);border:1px solid var(--sage);
@@ -2130,9 +2184,25 @@ SEARCH_TIP = ("Tipp: Tippe mindestens 3 Buchstaben, dann erscheinen Vorschläge.
               "Tippfehler sind okay, es werden ähnliche Orte angezeigt.")
 
 
+SEARCH_STYLE = {
+    "searchbox": {
+        "control": {"borderRadius": 14, "minHeight": 50, "borderColor": "#D9CFBC", "backgroundColor": "#FFFFFF",
+                    "boxShadow": "0 1px 2px rgba(60,50,30,.06)"},
+        "menu": {"borderRadius": 14, "overflow": "hidden", "border": "1px solid #D9CFBC",
+                 "boxShadow": "0 8px 24px rgba(60,50,30,.18)"},
+        "option": {"padding": "10px 14px"},
+    },
+}
+
+
 def place_input(label, key):
-    return st_searchbox(search_places, key=key, label=label, placeholder=PLACEHOLDER,
-                        clear_on_submit=False)
+    dot = "s" if label.startswith("Start") else "z"
+    st.markdown(f'<div class="fld"><i class="dot {dot}"></i>{escape(label)}</div>', unsafe_allow_html=True)
+    kw = dict(key=key, placeholder=PLACEHOLDER, clear_on_submit=False)
+    try:
+        return st_searchbox(search_places, style_overrides=SEARCH_STYLE, **kw)
+    except TypeError:  # ältere Version ohne style_overrides
+        return st_searchbox(search_places, **kw)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
