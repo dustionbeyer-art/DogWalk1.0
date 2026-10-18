@@ -6,4 +6,5 @@ geopandas>=1.0
 shapely>=2.0
 networkx>=3.2
 numpy
+scipy
 requests
