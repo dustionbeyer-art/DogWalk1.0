@@ -866,7 +866,9 @@ def edge_water(area):
 
 def edge_green(area, buf, water=None):
     """Attraktivität je Kante: Grünscore; bei aktiver Wassernähe zählt Wasser genauso (das Bessere gilt)."""
-    g = np.clip(1 - area["D"] / buf, 0, 1).mean(axis=0)
+    D = area["D"]
+    # im Park (Abstand 0) zählt voll, am Parkrand entlang etwas weniger: Wege führen durch Parks statt außen herum
+    g = np.where(D <= 0.5, 1.0, INSIDE_FACTOR * np.clip(1 - D / buf, 0, 1)).mean(axis=0)
     if _water() if water is None else water:
         w = edge_water(area)
         if w is not None:
@@ -1926,6 +1928,8 @@ def make_ab_view_safe(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda
 # Jede Wegvariante wird alle paar Meter abgetastet und bewertet; die beste je Grünstufe gewinnt.
 OFM_TILEJSON = "https://tiles.openfreemap.org/planet"
 VT_ZOOM = 14
+INSIDE_FACTOR = 0.85      # Wert für „nur am Parkrand entlang“ gegenüber „im Park“ (1.0)
+WATER_SCAN_NEAR = 70.0    # m: so nah am Gewässer gilt ein Wegstück im Scan als „am Wasser“
 SCAN_STEP = 10.0          # Abtastabstand entlang einer Route (m)
 NOISE_DIST = 20.0         # bis zu diesem Abstand zählt eine Hauptstraße als laut (m)
 QUIET = 1.5               # Gewicht "Hauptstraßen meiden" (bei "Schnellste" 0)
@@ -2266,6 +2270,7 @@ def scan_area(bbox, water=False):
     sizes[0] = 0.0
     return {"lat0": lat0, "lon0": lon0, "kx": kx, "ky": ky, "xmin": xmin, "ymin": ymin, "cell": cell,
             "gdist": gdist, "depth": depth, "noise": noise, "lab": lab, "sizes": sizes,
+            "wdist": _edt(wmask, cell) if wmask.any() else None,
             "geo": {"type": "FeatureCollection", "features": geo} if geo else None,
             "wgeo": {"type": "FeatureCollection", "features": wgeo} if wgeo else None,
             "n_green": n_green, "green_share": float(green.mean())}
@@ -2295,12 +2300,15 @@ def scan_score(sa, coords, buf):
     cum = np.concatenate([[0.0], np.cumsum(seg)])
     total = float(cum[-1])
     if total <= 0:
-        return {"dist": 0.0, "green": 0.0, "noise": 0.0, "rep": 0.0}
+        return {"dist": 0.0, "green": 0.0, "noise": 0.0, "rep": 0.0, "water": None}
     s = np.arange(SCAN_STEP / 2, total, SCAN_STEP)
     px, py = np.interp(s, cum, X), np.interp(s, cum, Y)
     r, c, ok = _cells(sa, px, py)
     gd = np.where(ok, sa["gdist"][r, c], np.inf)
-    g = np.clip(1.0 - gd / buf, 0.0, 1.0)
+    # mitten im Park zählt voll, am Parkrand entlang etwas weniger: so führt die Route durch den Park statt außen herum
+    g = np.where(gd <= 0.0, 1.0, INSIDE_FACTOR * np.clip(1.0 - gd / buf, 0.0, 1.0))
+    wdm = sa.get("wdist")
+    water = None if wdm is None else float(np.mean(np.where(ok, wdm[r, c], np.inf) <= WATER_SCAN_NEAR))
     nz = np.where(ok, sa["noise"][r, c], 0.0)
     first, rep = {}, 0
     for i, k in enumerate(zip(np.round(px / 8).astype(int), np.round(py / 8).astype(int))):
@@ -2308,7 +2316,7 @@ def scan_score(sa, coords, buf):
         if i - j > 5:
             rep += 1
     n = max(len(s), 1)
-    return {"dist": total, "green": float(g.mean()), "noise": float(nz.mean()), "rep": rep / n}
+    return {"dist": total, "green": float(g.mean()), "noise": float(nz.mean()), "rep": rep / n, "water": water}
 
 
 def _green_targets(sa, A, B, k=4, slack=1.0):
@@ -2511,7 +2519,14 @@ def _scan_option(nav, label, sub, hint, sc, extra=None):
     return _option(nav, label, sub, hint, stats)
 
 
-SCAN_NOTE = "🛰️ Grün-Scan (Ersatzdaten aus Kartenkacheln)"
+def scan_water_note(sc):
+    """Hinweisende: Wasseranteil (bei aktiver Wassernähe), sonst nichts. Auch 0 % wird gezeigt."""
+    if not _water():
+        return ""
+    w = sc.get("water")
+    if w is None:
+        return " · kein Gewässer im Gebiet gefunden"
+    return f" · {w:.0%} am Wasser"
 SCAN_ATTRIB = ['Grün-Scan: <a href="https://openfreemap.org">OpenFreeMap</a> © OpenMapTiles, OSM',
                'Routing: <a href="https://routing.openstreetmap.de">FOSSGIS</a>']
 
@@ -2553,7 +2568,7 @@ def scan_ab_view(start_v, dest_v, buf=150, log=lambda *_: None):
             continue
         detour = sc["dist"] / short - 1 if short else 0.0
         options.append(_scan_option(nav, name, f"{fmt_km(sc['dist'])} · {sc['green']:.0%} grün",
-                                    f"{LEVEL_HINT[name]} · Umweg {detour:+.0%} · {SCAN_NOTE}", sc))
+                                    f"{LEVEL_HINT[name]} · Umweg {detour:+.0%}{scan_water_note(sc)}", sc))
     if not options:
         raise ValueError("Start und Ziel liegen zu nah beieinander.")
     order = list(LEVELS)
@@ -2613,7 +2628,7 @@ def scan_loop_view(start_v, end_v, km, level, buf=150, log=lambda *_: None, prog
         diff = c["dist"] / target - 1
         options.append(_scan_option(
             nav, f"Variante {i + 1}", f"{fmt_km(c['dist'])} · {c['green']:.0%} grün",
-            f"Wunschlänge {fmt_km(target)} ({diff:+.0%}) · {1 - c['rep']:.0%} ohne Doppelweg · {SCAN_NOTE}", c))
+            f"Wunschlänge {fmt_km(target)} ({diff:+.0%}) · {1 - c['rep']:.0%} ohne Doppelweg{scan_water_note(c)}", c))
     if not options:
         raise ValueError("Für diesen Startpunkt habe ich keine Runde gefunden.")
     payload = dict(mode="loop", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=sa["geo"], water=sa.get("wgeo"),
@@ -2945,7 +2960,7 @@ def scan_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
             nav = _add_waypoint_steps(nav, c["marks"][:-1], names[1:-1])
             options.append(_scan_option(
                 nav, f"Variante {i + 1}", f"{fmt_km(c['sc']['dist'])} · {c['sc']['green']:.0%} grün",
-                f"Extra {fmt_km(c['got'])} (Wunsch +{extra_km} km) · {1 - c['sc']['rep']:.0%} ohne Doppelweg · {SCAN_NOTE}",
+                f"Extra {fmt_km(c['got'])} (Wunsch +{extra_km} km) · {1 - c['sc']['rep']:.0%} ohne Doppelweg{scan_water_note(c['sc'])}",
                 c["sc"]))
         runs_levels = []
     else:
@@ -2972,7 +2987,7 @@ def scan_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
             continue
         nav = _add_waypoint_steps(nav, marks[:-1], names[1:-1])
         options.append(_scan_option(nav, name, f"{fmt_km(sc['dist'])} · {sc['green']:.0%} grün",
-                                    f"{LEVEL_HINT[name]} · {1 - sc['rep']:.0%} ohne Doppelweg · {SCAN_NOTE}", sc))
+                                    f"{LEVEL_HINT[name]} · {1 - sc['rep']:.0%} ohne Doppelweg{scan_water_note(sc)}", sc))
     if not options:
         raise ValueError("Ich konnte keine Runde mit diesen Zwischenzielen finden.")
     default = next((i for i, o_ in enumerate(options) if o_["label"] == level), 0)
