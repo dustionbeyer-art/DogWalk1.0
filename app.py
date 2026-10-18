@@ -3,53 +3,49 @@
 Start:  pip install -r requirements.txt
         streamlit run app.py
 
-Daten:  OpenStreetMap (Overpass via osmnx, ODbL) für Wegenetz + Grünflächen,
-        Geocoding über Nominatim. Benötigt Internetzugang.
+Daten:  OpenStreetMap (Overpass via osmnx, ODbL) für Wegenetz + Grünflächen.
+        Ortssuche mit Vorschlägen: Photon (photon.komoot.io, OSM-Daten, fehler-
+        tolerant, findet auch Läden/Restaurants), Fallback Nominatim.
 Kosten: kosten(kante) = laenge * (1 + LAMBDA * (1 - gruen(kante)))
 Grün:   Mittel über 8 Abtastpunkte je Kante; 1.0 im Park, linear fallend
         auf 0 im Abstand "Grün-Reichweite".
-
-Geschwindigkeit: nur ein Korridor um Start/Ziel wird geladen, Wegenetz und
-Parks parallel, Parkabstände per räumlichem Index (STRtree). λ und
-Reichweite lassen sich danach live ändern, ohne neu zu laden.
 """
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import geopandas as gpd
 import folium
+import geopandas as gpd
 import networkx as nx
 import numpy as np
 import osmnx as ox
+import requests
 import shapely
 import streamlit as st
+from folium.plugins import AntPath, Fullscreen, LocateControl
 from shapely import STRtree
 from shapely.geometry import LineString, Point
 from streamlit.components.v1 import html as st_html
+from streamlit_searchbox import st_searchbox
 
 ox.settings.use_cache = True
 ox.settings.log_console = False
 ox.settings.requests_timeout = 90
-ox.settings.overpass_rate_limit = False  # spart die Status-Abfrage vor jedem Request
+ox.settings.overpass_rate_limit = False
 
+UA = {"User-Agent": "gruene-route-app/1.0 (privates Hobbyprojekt)"}
 GREEN_TAGS = {
     "leisure": ["park", "garden", "nature_reserve", "recreation_ground"],
     "landuse": ["grass", "forest", "village_green"],
     "natural": ["wood"],
 }
-SAMPLES = 8        # Abtastpunkte pro Kante
-MAX_BUF = 400      # größte einstellbare Reichweite (m)
-MAX_SPAN_M = 9000  # größte erlaubte Ausdehnung des Korridors
-M_PER_MIN = 80     # ca. 4,8 km/h
+SAMPLES = 8
+MAX_BUF = 400
+MAX_SPAN_M = 9000
+M_PER_MIN = 80
 
-LEVELS = {
-    "Schnellste": 0.0,
-    "Leicht grün": 1.0,
-    "Ausgewogen": 3.0,
-    "Sehr grün": 6.0,
-    "Maximal grün": 12.0,
-}
+LEVELS = {"Schnellste": 0.0, "Leicht grün": 1.0, "Ausgewogen": 3.0,
+          "Sehr grün": 6.0, "Maximal grün": 12.0}
 LEVEL_HINT = {
     "Schnellste": "Nur die Distanz zählt.",
     "Leicht grün": "Kleine Umwege für spürbar mehr Grün.",
@@ -59,31 +55,122 @@ LEVEL_HINT = {
 }
 
 
-# ---------------------------------------------------------------- Daten
-@st.cache_data(ttl=86400, show_spinner=False)
-def geocode(q):
-    return ox.geocode(q)
+# ------------------------------------------------------- Ortssuche
+def _icon(p):
+    k, v = p.get("osm_key", ""), p.get("osm_value", "")
+    if v in ("restaurant", "fast_food", "food_court", "biergarten"):
+        return "🍽️"
+    if v in ("cafe", "ice_cream"):
+        return "☕"
+    if v in ("bar", "pub"):
+        return "🍺"
+    if k == "shop":
+        return "🛍️"
+    if k == "leisure" or v in ("park", "garden"):
+        return "🌳"
+    if k == "highway":
+        return "🛣️"
+    if k in ("railway", "public_transport") or v in ("bus_stop", "station"):
+        return "🚉"
+    if k == "tourism":
+        return "🏛️"
+    if k == "amenity":
+        return "📌"
+    return "📍"
 
 
+def _label(p):
+    name = p.get("name")
+    addr = " ".join(x for x in [p.get("street"), p.get("housenumber")] if x)
+    title = name or addr or p.get("city") or p.get("state") or "Ort"
+    loc = " ".join(x for x in [p.get("postcode"),
+                               p.get("city") or p.get("town") or p.get("district") or p.get("county")] if x)
+    parts = ([addr] if (name and addr) else []) + ([loc] if loc else [])
+    return f"{_icon(p)} {title}" + (" · " + ", ".join(parts) if parts else "")
+
+
+def _pack(lat, lon, label):
+    return f"{lat:.6f}|{lon:.6f}|{label}"
+
+
+def _unpack(v):
+    lat, lon, label = v.split("|", 2)
+    return float(lat), float(lon), label
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _photon(q, blat, blon):
+    params = {"q": q, "limit": 8, "lang": "de"}
+    if blat is not None:
+        params.update(lat=blat, lon=blon)
+    r = requests.get("https://photon.komoot.io/api/", params=params, headers=UA, timeout=6)
+    r.raise_for_status()
+    return r.json().get("features", [])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _nominatim(q):
+    r = requests.get("https://nominatim.openstreetmap.org/search", headers=UA, timeout=8,
+                     params={"q": q, "format": "jsonv2", "limit": 6, "accept-language": "de"})
+    r.raise_for_status()
+    out = []
+    for x in r.json():
+        lab = "📍 " + ", ".join(x["display_name"].split(", ")[:3])
+        out.append((lab, _pack(float(x["lat"]), float(x["lon"]), lab)))
+    return out
+
+
+def search_places(term):
+    """Vorschläge während der Eingabe. Fehlertolerant; bei 0 Treffern wird die
+    Eingabe schrittweise gekürzt (ähnliche Treffer), dann Nominatim als Fallback."""
+    term = (term or "").strip()
+    if len(term) < 3:
+        return []
+    bias = st.session_state.get("bias")
+    blat, blon = (round(bias[0], 2), round(bias[1], 2)) if bias else (None, None)
+    q = term
+    for _ in range(3):
+        try:
+            feats = _photon(q, blat, blon)
+        except Exception:
+            feats = []
+        out, seen = [], set()
+        for f in feats:
+            try:
+                lon, lat = f["geometry"]["coordinates"]
+                lab = _label(f["properties"])
+            except Exception:
+                continue
+            if lab in seen:
+                continue
+            seen.add(lab)
+            out.append((lab, _pack(lat, lon, lab)))
+        if out:
+            return out
+        words = q.split()
+        if len(words) <= 1:
+            break
+        q = " ".join(words[:-1])
+    try:
+        return _nominatim(term)
+    except Exception:
+        return []
+
+
+# ------------------------------------------------------- Daten
 def corridor_bbox(p1, p2):
     (lat1, lon1), (lat2, lon2) = p1, p2
     ky = 111_320.0
     kx = ky * math.cos(math.radians((lat1 + lat2) / 2))
     span = max(abs(lon2 - lon1) * kx, abs(lat2 - lat1) * ky)
     pad = max(350.0, 0.25 * span)
-    bbox = (
-        round(min(lon1, lon2) - pad / kx, 4),
-        round(min(lat1, lat2) - pad / ky, 4),
-        round(max(lon1, lon2) + pad / kx, 4),
-        round(max(lat1, lat2) + pad / ky, 4),
-    )
+    bbox = (round(min(lon1, lon2) - pad / kx, 4), round(min(lat1, lat2) - pad / ky, 4),
+            round(max(lon1, lon2) + pad / kx, 4), round(max(lat1, lat2) + pad / ky, 4))
     return bbox, span
 
 
 @st.cache_resource(show_spinner=False, max_entries=4)
 def load_area(bbox):
-    """Wegenetz + Grünflächen laden (parallel) und Kanten-Abstände vorberechnen."""
-
     def get_graph():
         return ox.graph_from_bbox(bbox, network_type="walk", simplify=True)
 
@@ -91,7 +178,13 @@ def load_area(bbox):
         try:
             gdf = ox.features_from_bbox(bbox, tags=GREEN_TAGS)
             gdf = gdf[gdf.geometry.type.isin(["Polygon", "MultiPolygon"])]
-            return gdf[["geometry"]] if len(gdf) else None
+            if not len(gdf):
+                return None
+            gdf = gdf.reset_index(drop=True)
+            if "name" not in gdf:
+                gdf["name"] = None
+            gdf["name"] = gdf["name"].fillna("Grünfläche").astype(str)
+            return gdf[["name", "geometry"]]
         except Exception:
             return None
 
@@ -103,7 +196,6 @@ def load_area(bbox):
     crs = G.graph["crs"]
     pos = {n: (d["x"], d["y"]) for n, d in G.nodes(data=True)}
 
-    # Pro Knotenpaar nur die kürzeste Kante behalten (einfacher, schneller Graph)
     best = {}
     for u, v, d in G.edges(data=True):
         if (u, v) not in best or d["length"] < best[(u, v)][0]:
@@ -117,29 +209,26 @@ def load_area(bbox):
     for i, (u, v) in enumerate(keys):
         H.add_edge(u, v, i=i)
 
-    # Abstand der Abtastpunkte zur nächsten Grünfläche (vektorisiert, räumlicher Index)
     D = np.full((SAMPLES, len(keys)), MAX_BUF, dtype=np.float32)
     parks_json, n_parks = None, 0
     if parks is not None:
-        geoms = parks.to_crs(crs).geometry.simplify(2.0).make_valid()
-        geoms = geoms[geoms.notna() & ~geoms.is_empty]
-        n_parks = len(geoms)
+        pg = parks.to_crs(crs)
+        pg["geometry"] = pg.geometry.simplify(2.0).make_valid()
+        pg = pg[pg.geometry.notna() & ~pg.geometry.is_empty].reset_index(drop=True)
+        n_parks = len(pg)
         if n_parks:
-            tree = STRtree(list(geoms))
+            tree = STRtree(list(pg.geometry))
             for r, f in enumerate((np.arange(SAMPLES) + 0.5) / SAMPLES):
                 pts = shapely.line_interpolate_point(lines, f, normalized=True)
-                idx, dist = tree.query_nearest(
-                    pts, max_distance=MAX_BUF, return_distance=True, all_matches=False
-                )
+                idx, dist = tree.query_nearest(pts, max_distance=MAX_BUF,
+                                               return_distance=True, all_matches=False)
                 D[r, idx[0]] = dist
-            parks_json = gpd.GeoSeries(geoms, crs=crs).to_crs(4326).to_json()
+            parks_json = pg.to_crs(4326).to_json()
 
     node_list = list(pos)
-    return {
-        "crs": crs, "pos": pos, "H": H, "lengths": lengths, "lines": lines, "D": D,
-        "node_list": node_list, "xy": np.array([pos[n] for n in node_list]),
-        "parks_json": parks_json, "n_parks": n_parks, "n_edges": len(keys),
-    }
+    return {"crs": crs, "pos": pos, "H": H, "lengths": lengths, "lines": lines, "D": D,
+            "node_list": node_list, "xy": np.array([pos[n] for n in node_list]),
+            "parks_json": parks_json, "n_parks": n_parks, "n_edges": len(keys)}
 
 
 def nearest_node(area, lat, lon):
@@ -148,15 +237,13 @@ def nearest_node(area, lat, lon):
     return area["node_list"][int(d.argmin())]
 
 
-# ---------------------------------------------------------------- Routing
+# ------------------------------------------------------- Routing
 def solve(area, o, t, lam, buf):
     g = np.clip(1 - area["D"] / buf, 0, 1).mean(axis=0)
     L, H = area["lengths"], area["H"]
+    weights = {"short": lambda u, v, d: L[d["i"]],
+               "green": lambda u, v, d: L[d["i"]] * (1 + lam * (1 - g[d["i"]]))}
     out = {}
-    weights = {
-        "short": lambda u, v, d: L[d["i"]],
-        "green": lambda u, v, d: L[d["i"]] * (1 + lam * (1 - g[d["i"]])),
-    }
     for name, w in weights.items():
         path = nx.shortest_path(H, o, t, weight=w)
         idx = [H[a][b]["i"] for a, b in zip(path[:-1], path[1:])]
@@ -180,31 +267,72 @@ def route_latlon(area, path):
     return [(y, x) for x, y in ll.coords]
 
 
-def build_map(area, res, p1, p2):
-    m = folium.Map(tiles="CartoDB positron", control_scale=True, zoom_control=True)
+def _pin(emoji):
+    return folium.DivIcon(
+        html=f'<div style="font-size:30px;line-height:30px;text-align:center;'
+             f'filter:drop-shadow(0 2px 3px rgba(0,0,0,.45))">{emoji}</div>',
+        icon_size=(32, 32), icon_anchor=(16, 28))
+
+
+def _popup(title, r):
+    mins = max(1, round(r["dist"] / M_PER_MIN))
+    return folium.Popup(f"<b>{title}</b><br>{r['dist']:,.0f} m · ca. {mins} min<br>"
+                        f"{r['green']:.0%} Grünanteil".replace(",", "."), max_width=220)
+
+
+LEGEND = """
+<div style="position:fixed;bottom:24px;left:12px;z-index:9999;background:rgba(255,255,255,.96);
+padding:10px 14px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.25);
+font:13px/1.7 system-ui,-apple-system,sans-serif;color:#222">
+<div><span style="display:inline-block;width:24px;height:5px;background:#0d7a45;border-radius:3px;vertical-align:middle;margin-right:8px"></span>Grüne Route</div>
+<div><span style="display:inline-block;width:24px;border-top:3px dashed #e4572e;vertical-align:middle;margin-right:8px"></span>Kürzeste Route</div>
+<div><span style="display:inline-block;width:14px;height:14px;background:#9fd89a;border:1px solid #4f9d57;border-radius:4px;vertical-align:middle;margin-right:10px"></span>Park / Grünfläche</div>
+</div>"""
+
+
+def build_map(area, res, p1, p2, t1, t2):
+    m = folium.Map(tiles=None, control_scale=True, zoom_control=True)
+    folium.TileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+                     name="Karte", attr="© OpenStreetMap-Mitwirkende © CARTO",
+                     subdomains="abcd", max_zoom=19).add_to(m)
+    folium.TileLayer("CartoDB positron", name="Hell").add_to(m)
+    folium.TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                     name="Satellit", attr="Esri, Maxar, Earthstar Geographics", max_zoom=19).add_to(m)
+
     if area["parks_json"]:
         folium.GeoJson(
-            area["parks_json"],
-            style_function=lambda _: {"color": "#4f9d57", "fillColor": "#9fd89a",
+            area["parks_json"], name="Grünflächen",
+            style_function=lambda _: {"color": "#4f9d57", "fillColor": "#8fd18a",
                                       "fillOpacity": 0.45, "weight": 1},
+            highlight_function=lambda _: {"fillOpacity": 0.7, "weight": 2},
+            tooltip=folium.GeoJsonTooltip(fields=["name"], aliases=["🌳"], labels=True),
         ).add_to(m)
+
     short = route_latlon(area, res["short"]["path"])
     green = route_latlon(area, res["green"]["path"])
+    fs = folium.FeatureGroup(name="Kürzeste Route").add_to(m)
     folium.PolyLine(short, color="#e4572e", weight=4, opacity=0.9, dash_array="8 8",
-                    tooltip="Kürzeste Route").add_to(m)
-    folium.PolyLine(green, color="#0d7a45", weight=7, opacity=0.95,
-                    tooltip="Grüne Route").add_to(m)
-    folium.CircleMarker(p1, radius=8, color="#fff", weight=3, fill=True,
-                        fill_color="#111", fill_opacity=1, tooltip="Start").add_to(m)
-    folium.CircleMarker(p2, radius=8, color="#111", weight=3, fill=True,
-                        fill_color="#fff", fill_opacity=1, tooltip="Ziel").add_to(m)
+                    popup=_popup("Kürzeste Route", res["short"])).add_to(fs)
+    fg = folium.FeatureGroup(name="Grüne Route").add_to(m)
+    folium.PolyLine(green, color="#ffffff", weight=11, opacity=0.9).add_to(fg)  # Kontur
+    AntPath(green, color="#0d7a45", pulse_color="#b9f0cb", weight=7, delay=1600,
+            dash_array=[18, 28], opacity=1, popup=_popup("Grüne Route", res["green"])).add_to(fg)
+
+    folium.Marker(p1, icon=_pin("🚶"), tooltip=f"Start: {t1}").add_to(m)
+    folium.Marker(p2, icon=_pin("🏁"), tooltip=f"Ziel: {t2}").add_to(m)
+
+    Fullscreen(position="topright", title="Vollbild", title_cancel="Beenden").add_to(m)
+    LocateControl(auto_start=False, strings={"title": "Mein Standort"}).add_to(m)
+    folium.LayerControl(collapsed=True, position="topright").add_to(m)
+    m.get_root().html.add_child(folium.Element(LEGEND))
+
     pts = short + green
     m.fit_bounds([[min(p[0] for p in pts), min(p[1] for p in pts)],
-                  [max(p[0] for p in pts), max(p[1] for p in pts)]], padding=(30, 30))
+                  [max(p[0] for p in pts), max(p[1] for p in pts)]], padding=(40, 40))
     return m
 
 
-# ---------------------------------------------------------------- UI
+# ------------------------------------------------------- UI
 st.set_page_config(page_title="Grüne Route", page_icon="🌳", layout="centered")
 st.markdown(
     """
@@ -224,8 +352,11 @@ st.markdown(
 .bar{height:8px;border-radius:6px;background:rgba(127,127,127,.25);margin-top:8px;overflow:hidden}
 .bar>div{height:100%;background:linear-gradient(90deg,#2fa866,#0d7a45);border-radius:6px}
 .hint{opacity:.75;margin:-6px 0 10px;font-size:.92rem}
-div[data-testid="stForm"]{border:none;padding:0}
-.stButton>button,.stFormSubmitButton>button{border-radius:12px;font-weight:600;padding:.6rem 1rem}
+.trip{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 14px}
+.pill{border-radius:999px;padding:6px 14px;background:rgba(47,168,102,.14);
+ border:1px solid rgba(47,168,102,.45);font-size:.92rem}
+.stButton>button{border-radius:12px;font-weight:600;padding:.6rem 1rem}
+iframe{border-radius:16px}
 </style>
 <div class="hero"><h1>🌳 Grüne Route</h1>
 <p>Der schönere Weg zu Fuß: vorbei an Parks und Grün statt nur auf kürzester Strecke.</p></div>
@@ -233,41 +364,54 @@ div[data-testid="stForm"]{border:none;padding:0}
     unsafe_allow_html=True,
 )
 
-with st.form("ziele"):
-    c1, c2 = st.columns(2)
-    start = c1.text_input("Start", "Brandenburger Tor, Berlin", placeholder="Adresse oder Ort")
-    ziel = c2.text_input("Ziel", "Alexanderplatz, Berlin", placeholder="Adresse oder Ort")
-    go = st.form_submit_button("Route finden", type="primary", use_container_width=True)
+start_v = st_searchbox(search_places, key="start_sb", label="Start",
+                       placeholder="Straße, Adresse, Café, Restaurant, Geschäft …",
+                       clear_on_submit=False)
+if start_v:
+    st.session_state["bias"] = _unpack(start_v)[:2]  # Ziel-Vorschläge in der Nähe des Starts
+ziel_v = st_searchbox(search_places, key="ziel_sb", label="Ziel",
+                      placeholder="Straße, Adresse, Café, Restaurant, Geschäft …",
+                      clear_on_submit=False)
+st.caption("Tipp: Tippe mindestens 3 Buchstaben, dann erscheinen Vorschläge. "
+           "Tippfehler sind okay, es werden ähnliche Orte angezeigt.")
+
+go = st.button("Route finden", type="primary", use_container_width=True)
 
 if go:
-    st.session_state.pop("ctx", None)
-    with st.status("Route wird vorbereitet …", expanded=True) as status:
-        try:
-            st.write("📍 Adressen suchen")
-            p1, p2 = geocode(start), geocode(ziel)
-            bbox, span = corridor_bbox(p1, p2)
-            if span > MAX_SPAN_M:
-                status.update(label="Strecke zu lang", state="error")
-                st.error(f"Start und Ziel sind {span / 1000:.1f} km auseinander. "
-                         f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
-                st.stop()
-            st.write("🗺️ Wegenetz und Grünflächen laden (nur der Korridor zwischen Start und Ziel)")
-            t0 = time.time()
-            area = load_area(bbox)
-            took = time.time() - t0
-            st.write(f"✅ {area['n_edges']:,} Wegstücke, {area['n_parks']} Grünflächen "
-                     f"({took:.0f} s)".replace(",", "."))
-            o, t = nearest_node(area, *p1), nearest_node(area, *p2)
-            st.session_state["ctx"] = dict(area=area, p1=p1, p2=p2, o=o, t=t,
-                                           start=start, ziel=ziel)
-            status.update(label="Fertig", state="complete", expanded=False)
-        except Exception as e:
-            status.update(label="Fehler", state="error")
-            st.error(f"Das hat nicht geklappt: {e}")
+    if not (start_v and ziel_v):
+        st.warning("Bitte Start und Ziel jeweils aus den Vorschlägen auswählen.")
+    else:
+        st.session_state.pop("ctx", None)
+        lat1, lon1, lab1 = _unpack(start_v)
+        lat2, lon2, lab2 = _unpack(ziel_v)
+        p1, p2 = (lat1, lon1), (lat2, lon2)
+        with st.status("Route wird vorbereitet …", expanded=True) as status:
+            try:
+                bbox, span = corridor_bbox(p1, p2)
+                if span > MAX_SPAN_M:
+                    status.update(label="Strecke zu lang", state="error")
+                    st.error(f"Start und Ziel sind {span / 1000:.1f} km auseinander. "
+                             f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
+                    st.stop()
+                st.write("🗺️ Wegenetz und Grünflächen laden (nur der Korridor zwischen Start und Ziel)")
+                t0 = time.time()
+                area = load_area(bbox)
+                st.write(f"✅ {area['n_edges']:,} Wegstücke, {area['n_parks']} Grünflächen "
+                         f"({time.time() - t0:.0f} s)".replace(",", "."))
+                st.session_state["ctx"] = dict(
+                    area=area, p1=p1, p2=p2,
+                    o=nearest_node(area, *p1), t=nearest_node(area, *p2),
+                    t1=lab1.split(" · ")[0], t2=lab2.split(" · ")[0])
+                status.update(label="Fertig", state="complete", expanded=False)
+            except Exception as e:
+                status.update(label="Fehler", state="error")
+                st.error(f"Das hat nicht geklappt: {e}")
 
 ctx = st.session_state.get("ctx")
 if ctx:
     area = ctx["area"]
+    st.markdown(f'<div class="trip"><span class="pill">🚶 {ctx["t1"]}</span>'
+                f'<span class="pill">🏁 {ctx["t2"]}</span></div>', unsafe_allow_html=True)
     st.markdown("#### Wie grün soll es sein?")
     level = st.select_slider("Grünstufe", options=list(LEVELS), value="Ausgewogen",
                              label_visibility="collapsed")
@@ -304,16 +448,16 @@ if ctx:
         unsafe_allow_html=True)
 
     st.write("")
-    m = build_map(area, res, ctx["p1"], ctx["p2"])
-    st_html(m._repr_html_(), height=540)
-    st.caption("🟢 grüne Route  ·  🟠 gestrichelt: kürzeste Route  ·  hellgrün: Grünflächen")
+    m = build_map(area, res, ctx["p1"], ctx["p2"], ctx["t1"], ctx["t2"])
+    st_html(m._repr_html_(), height=580)
 
     with st.expander("Datenquellen und Gewichtung"):
         st.markdown(
             "- Wegenetz (Fußwege) und Grünflächen: OpenStreetMap via Overpass (ODbL)\n"
+            "- Ortssuche: Photon (photon.komoot.io) auf OSM-Basis, Fallback Nominatim\n"
+            "- Kartenhintergrund: CARTO / OpenStreetMap, Satellit: Esri\n"
             f"- Grünflächen-Tags: `{GREEN_TAGS}`\n"
             f"- Score je Abtastpunkt: 1,0 im Park, linear fallend auf 0 im Abstand von {buf} m\n"
             f"- Kantenscore: Mittel aus {SAMPLES} Abtastpunkten\n"
             f"- Kosten: Länge × (1 + {LEVELS[level]:g} × (1 − Grünscore))"
         )
-
