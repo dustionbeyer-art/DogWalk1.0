@@ -1956,10 +1956,12 @@ function showOption(i, fit) {
   if (fit) fitRoute();
 }
 
-function snap(xy, from, windowed) {
+function snap(xy, fromAlong, windowed) {
+  // Fortschritt nur im Fenster um die bisherige Strecke (−40 m … +160 m): Kreuzungen und Wegstücke, die später noch
+  // einmal an derselben Stelle vorbeiführen (Ründchen, Rückweg), dürfen nicht zu einem Sprung ans Ende führen.
   let best = null;
-  const lo = windowed ? Math.max(0, from - 5) : 0, hi = windowed ? Math.min(P.length - 1, from + 80) : P.length - 1;
-  for (let i = lo; i < hi; i++) {
+  for (let i = 0; i < P.length - 1; i++) {
+    if (windowed && (cum[i + 1] < fromAlong - 40 || cum[i] > fromAlong + 160)) continue;
     const a = P[i], b = P[i + 1], dx = b[0] - a[0], dy = b[1] - a[1], l2 = dx * dx + dy * dy;
     let t = l2 > 0 ? ((xy[0] - a[0]) * dx + (xy[1] - a[1]) * dy) / l2 : 0; t = Math.max(0, Math.min(1, t));
     const d = Math.hypot(xy[0] - (a[0] + t * dx), xy[1] - (a[1] + t * dy));
@@ -2011,8 +2013,8 @@ function onFix(lat, lon, acc, gpsHeading, speed) {
   if (finished || !navOn) return;
   lastPos = [lat, lon];
   const xy = toXY(lat, lon);
-  let s = snap(xy, lastIdx, true);
-  if (s.off > 60) { const g = snap(xy, 0, false); if (g.off < s.off) s = g; }
+  let s = snap(xy, along, true);
+  if (s.off > 60) { const g = snap(xy, 0, false); if (g.off < s.off * 0.6) s = g; }
   lastIdx = s.i; along = s.along;
   userDot.setLatLng(lastPos); if (!map.hasLayer(userDot)) userDot.addTo(map);
   // Richtung: GPS-Kurs (nur in Bewegung), sonst aus den letzten Positionen, sonst Kompass (onOrient)
@@ -2032,7 +2034,8 @@ function onFix(lat, lon, acc, gpsHeading, speed) {
   const rem = Math.max(0, total - along);
   $('rem').textContent = far ? 'Gesamt ' + fmt(total) : fmt(rem) + ' · ' + Math.max(1, Math.round(rem / WALK)) + ' min · Ankunft ' + eta(rem);
   $('prog').firstElementChild.style.width = (far ? 0 : Math.min(100, 100 * along / total)) + '%';
-  if (!far && rem < 20 && along > total * 0.5) { finish(); return; }
+  const endD = Math.hypot(xy[0] - P[P.length - 1][0], xy[1] - P[P.length - 1][1]);
+  if (!far && rem < 20 && along > total * 0.85 && endD < Math.max(30, (acc || 0) * 1.2)) { finish(); return; }
   if (far) {
     banner('off', '📍', fmt(s.off), 'Du bist noch weit von der Route entfernt. Zum Ausprobieren: 🧪');
   } else if (offCount >= 3) {
