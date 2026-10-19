@@ -9,3 +9,5 @@ font = "sans serif"
 [server]
 enableStaticServing = true
 
+[client]
+toolbarMode = "minimal"   # blendet das Menü mit der Designauswahl (Dunkel) aus
