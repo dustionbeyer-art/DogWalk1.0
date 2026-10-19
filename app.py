@@ -1658,6 +1658,8 @@ def build_nav(area, path, title, loop=False, waypoints=None):
 
 MAP_TEMPLATE = r"""<!DOCTYPE html><html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="only light"><meta name="supported-color-schemes" content="light"><meta name="darkreader-lock">
+<style>:root{color-scheme:only light}</style>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
 <style>
 :root{--top:0px;--moss:#4E6E45;--sage:#9DB38A;--sand:#E9E1D2;--paper:#FBF8F1;--line:#D9CFBC;--text:#3B3A33}
@@ -4314,7 +4316,8 @@ function patch(fav,touch){docs().forEach(function(d){try{var h=d.head;
  [['icon',fav,'64x64'],['shortcut icon',fav,'64x64'],['apple-touch-icon',touch,'180x180']].forEach(function(a){
   var l=d.createElement('link');l.rel=a[0];l.href=a[1];l.sizes=a[2];h.appendChild(l)});
  if(d.title!==TITLE)d.title=TITLE;
- [['apple-mobile-web-app-title',TITLE],['application-name',TITLE],['apple-mobile-web-app-capable','yes']].forEach(function(a){
+ try{d.documentElement.style.colorScheme='only light'}catch(e){}
+ [['apple-mobile-web-app-title',TITLE],['application-name',TITLE],['apple-mobile-web-app-capable','yes'],['color-scheme','only light'],['supported-color-schemes','light'],['darkreader-lock','']].forEach(function(a){
   var m=d.querySelector('meta[name="'+a[0]+'"]');if(!m){m=d.createElement('meta');m.name=a[0];h.appendChild(m)}m.content=a[1]})
  }catch(e){}})}
 var cur=[FAV,TOUCH];
@@ -4372,6 +4375,12 @@ install_icons()
 BASE_CSS = """
 <style>
 :root{--moss:#4E6E45;--sage:#9DB38A;--sand:#E9E1D2;--paper:#FBF8F1;--line:#D9CFBC;--text:#3B3A33}
+html,body,.stApp{color-scheme:only light!important}
+/* Immer hell: auch wenn Browser oder Streamlit ein dunkles Design anbieten, bleibt die App lesbar und bedienbar */
+.stApp,[data-testid="stAppViewContainer"],[data-testid="stMain"]{background:#F4EFE6!important;color:#3B3A33!important}
+.stApp p,.stApp label,.stApp span,.stApp li,.stApp h1,.stApp h2,.stApp h3,.stApp small{color:#3B3A33}
+[data-baseweb="select"] > div,[data-baseweb="input"],[data-baseweb="base-input"],textarea{background:#FBF8F1!important;color:#3B3A33!important}
+[data-baseweb="popover"] [role="listbox"],[data-baseweb="menu"]{background:#FBF8F1!important;color:#3B3A33!important}
 html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp p,.stApp li,.stApp div,
 .stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp [data-baseweb]{font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
 .block-container{padding-top:1.2rem;max-width:680px}
