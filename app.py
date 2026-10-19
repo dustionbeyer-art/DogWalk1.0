@@ -461,11 +461,11 @@ def _op_post(base, q, timeout):
     return r.json()
 
 
-def _overpass_race(q, timeout=8.0):
+def _overpass_race(q, timeout=8.0, mirrors=None):
     """Frage gleichzeitig mehrere Overpass-Server, nimm die erste brauchbare Antwort (ein überlasteter
     Server verzögert die Suche so nicht mehr)."""
     from concurrent.futures import as_completed
-    mirrors = OVERPASS_MIRRORS[:3]
+    mirrors = mirrors or OVERPASS_MIRRORS[:3]
     ex = ThreadPoolExecutor(max_workers=len(mirrors))
     last = None
     try:
@@ -3483,35 +3483,65 @@ SPORT_SPORTS = ("basketball|table_tennis|skateboard|soccer|volleyball|tennis|cli
                 "beachvolleyball|boules|streetball|fitness|multi")
 
 
-def _green_q(lat, lon, r):
-    a = f"(around:{r},{lat:.5f},{lon:.5f})"
-    return ('[out:json][timeout:40];('
-            f'wr["leisure"~"^(park|nature_reserve|common|dog_park)$"]{a};'
-            f'wr["landuse"~"^(forest|recreation_ground|village_green)$"]{a};'
-            f'wr["natural"~"^(wood|heath)$"]{a};);out tags bb center 4000;')
+def _box(lat, lon, r):
+    d = r / 110540.0
+    dx = d / max(math.cos(math.radians(lat)), 0.3)
+    return f"({lat - d:.4f},{lon - dx:.4f},{lat + d:.4f},{lon + dx:.4f})"
 
 
-def _feat_q(lat, lon, r):
-    a = f"(around:{r},{lat:.5f},{lon:.5f})"
-    return ('[out:json][timeout:40];('
-            f'nwr["amenity"="toilets"]{a};'
-            f'nwr["leisure"="playground"]{a};'
-            f'nwr["leisure"~"^(pitch|fitness_station|sports_centre|skate_park|dog_park|track)$"]{a};'
-            f'nwr["amenity"="boat_rental"]{a};'
-            f'nwr["sport"~"{SPORT_SPORTS}"]["leisure"]{a};'
-            f'nwr["natural"="water"]{a};nwr["waterway"~"^(river|canal)$"]{a};'
-            f'nwr["tourism"~"^(attraction|viewpoint|zoo)$"]{a};'
-            f'nwr["historic"~"^(monument|castle|ruins|fort|archaeological_site|tower)$"]{a};'
-            ');out tags bb center 12000;')
+# Mehrere kleine Abfragen statt einer großen: Overpass lehnt große Stadtabfragen oft mit 500/504 ab.
+GREEN_QUERIES = {
+    "park": 'wr["leisure"~"^(park|nature_reserve|common|dog_park)$"]',
+    "wald": 'wr["landuse"~"^(forest|recreation_ground|village_green)$"];wr["natural"~"^(wood|heath)$"]',
+}
+FEAT_QUERIES = {
+    "san": 'nwr["amenity"="toilets"]',
+    "play": 'nwr["leisure"="playground"]',
+    "sport": 'nwr["leisure"~"^(pitch|fitness_station|sports_centre|skate_park|dog_park|track)$"];nwr["amenity"="boat_rental"]',
+    "water": 'wr["natural"="water"];wr["waterway"~"^(river|canal)$"]',
+    "sight": 'nwr["tourism"~"^(attraction|viewpoint|zoo)$"];nwr["historic"~"^(monument|castle|ruins|fort|archaeological_site|tower)$"]',
+}
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def _green_fetch(lat, lon, r):
-    """Grünflächen und Ausstattung in einem Umkreis (beide Abfragen gleichzeitig, je mit mehreren Servern)."""
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f1 = ex.submit(_overpass_race, _green_q(lat, lon, r), 30.0)
-        f2 = ex.submit(_overpass_race, _feat_q(lat, lon, r), 30.0)
-        return f1.result().get("elements", []), f2.result().get("elements", [])
+def _green_part(lat, lon, r, sel):
+    """Eine kleine Abfrage (Bereichsfilter statt Umkreis = schneller). Alle Server werden der Reihe nach probiert."""
+    box = _box(lat, lon, r)
+    body = ";".join(f"{x}{box}" for x in sel.split(";"))
+    q = f"[out:json][timeout:40];({body};);out tags bb center 6000;"
+    last = None
+    for chunk in (OVERPASS_MIRRORS[:3], OVERPASS_MIRRORS[3:6], OVERPASS_MIRRORS[:2]):
+        if not chunk:
+            continue
+        try:
+            return _overpass_race(q, 30.0, chunk)
+        except Exception as e:
+            last = e
+    raise last or RuntimeError("Overpass nicht erreichbar")
+
+
+def _green_fetch(lat, lon, r, cats):
+    """Grünflächen (Pflicht) und die gewählten Ausstattungs-Kategorien (nur diese, spart Last), alles gleichzeitig.
+    Fällt eine Ausstattungs-Abfrage aus, wird sie übersprungen; Rückgabe (greens, feats, ausgefallene Kategorien)."""
+    jobs = {("g", k): v for k, v in GREEN_QUERIES.items()}
+    jobs.update({("f", c): FEAT_QUERIES[c] for c in cats})
+    greens, feats, failed = [], [], []
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {k: ex.submit(_green_part, lat, lon, r, v) for k, v in jobs.items()}
+        for (kind, name), f in futs.items():
+            try:
+                els = f.result().get("elements", [])
+            except Exception as e:
+                if kind == "g":
+                    failed.append(("g", e))
+                else:
+                    failed.append((name, e))
+                continue
+            (greens if kind == "g" else feats).extend(els)
+    if not greens:
+        errs = [e for k, e in failed if k == "g"]
+        raise errs[0] if errs else ValueError("Im Umkreis von 10 km habe ich keine Grünfläche gefunden.")
+    return greens, feats, [k for k, _ in failed if k != "g"]
 
 
 def _bounds(e):
@@ -3645,9 +3675,13 @@ def green_view(start_v, g, prefer, avoid):
 
 def find_green(pos, prefer, avoid, size_range, log=lambda *_: None):
     log("🌳 Grünflächen im Umkreis von 10 km suchen")
-    greens, feats = _green_fetch(round(pos[0], 3), round(pos[1], 3), GREEN_RADIUS)
+    cats = list(dict.fromkeys(list(prefer) + list(avoid)))
+    greens, feats, failed = _green_fetch(round(pos[0], 3), round(pos[1], 3), GREEN_RADIUS, cats)
+    if failed:
+        log("⚠️ Nicht alle Angaben abrufbar: " + ", ".join(GREEN_ICON[c] for c in failed))
     log("🔎 Ausstattung vergleichen")
-    ranked = rank_greens(greens, feats, prefer, avoid, size_range, pos)
+    ranked = rank_greens(greens, feats, [c for c in prefer if c not in failed], [c for c in avoid if c not in failed],
+                         size_range, pos)
     if not ranked:
         raise ValueError("Im Umkreis von 10 km habe ich keine passende Grünfläche gefunden.")
     return ranked
@@ -4371,7 +4405,7 @@ def start_input(label, key):
 
 def show_error(e):
     msg = str(e)
-    if any(x in msg for x in ("502", "503", "504", "überlastet", "Timeout", "timed out", "capacity")):
+    if any(x in msg for x in ("500", "502", "503", "504", "überlastet", "Timeout", "timed out", "capacity")):
         st.error("Die freien Kartenserver (OpenStreetMap/Overpass) sind gerade überlastet. "
                  "Ich habe mehrere Server und mehrere Runden probiert. Bitte in ein paar Minuten noch "
                  "einmal auf den Knopf tippen. Schon geladene Teile sind zwischengespeichert, "
