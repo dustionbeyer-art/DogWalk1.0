@@ -3662,8 +3662,8 @@ def rank_greens(greens, feats, prefer, avoid, size_range, pos, min_ha=0.2, min_d
             fit = max(0.0, 1.0 - abs(math.log10(ha / ref)))
         score = 2.0 * fit - 1.2 * d / GREEN_RADIUS
         for c in prefer:
-            if counts.get(c):
-                score += 1.5 + 0.3 * min(counts[c] - 1, 3)
+            if counts.get(c):  # Barrierefreiheit ist immer das höchste Gut
+                score += 8.0 if c == "access" else 1.5 + 0.3 * min(counts[c] - 1, 3)
         for c in avoid:
             if counts.get(c):
                 score -= 2.5
@@ -3702,15 +3702,16 @@ def green_view(start_v, g, prefer, avoid):
         raise ValueError("Die Grünfläche liegt zu nah.")
     mins = max(1, round(nav["total"] / M_PER_MIN))
     why = green_reasons(g)
-    hint = "Schnellster Weg zur am besten passenden Grünfläche" + (" · " + " · ".join(why) if why else "")
-    bad = [GREEN_ICON[c] for c in avoid if g["counts"].get(c)]
-    if bad:
-        hint += " · ⚠️ enthält auch " + " ".join(bad)
-    miss = [GREEN_ICON[c] for c in g.get("missing", []) if c not in g.get("failed", [])]
-    if miss:
-        hint += " · ℹ️ nicht gefunden: " + " ".join(miss)
+    if g.get("ok") is not None:
+        hint = "Schnellster Weg zu deinem Grün"
+        if g["ok"]:
+            hint += " · ✅ " + " · ".join(g["ok"])
+        if g["dev"]:
+            hint += " · 🔸 Anders als gewünscht: " + " · ".join(g["dev"])
+    else:
+        hint = "Schnellster Weg zur am besten passenden Grünfläche" + (" · " + " · ".join(why) if why else "")
     if g.get("failed"):
-        hint += " · ⚠️ nicht abrufbar: " + " ".join(GREEN_ICON[c] for c in g["failed"])
+        hint += " · ℹ️ nicht abrufbar: " + " ".join(GREEN_ICON[c] for c in g["failed"])
     if g.get("note"):
         hint += " · ⚠️ " + g["note"]
     opt = _option(nav, "Schnellste", f"{fmt_km(nav['total'])} · {mins} min", hint,
@@ -3794,6 +3795,69 @@ def green_inside_point(g, pos):
     if len(pts) < 4:
         return None
     return inside_point_of(pts, pos, g["ha"])
+
+
+CAT_NAME = {"water": "Wasser", "san": "Toilette", "sport": "Sportangebot", "play": "Spielplatz",
+            "sight": "Sehenswürdigkeit", "access": "Barrierefreiheit"}
+SIZE_WORD = {"Klein (bis 2 ha)": "klein", "Mittel (2–15 ha)": "mittel", "Groß (15–100 ha)": "groß",
+             "Sehr groß (ab 100 ha)": "sehr groß"}
+
+
+def size_word(ha):
+    for name, (lo, hi) in GREEN_SIZES.items():
+        if lo <= ha < hi:
+            return SIZE_WORD[name]
+    return "klein" if ha < 2 else "sehr groß"
+
+
+def green_eval(g, prefer, avoid, size_range, size_name):
+    """Was passt, was weicht ab? Ergebnis: ok/dev (Texte), Abweichungs-Schlüssel und Gewicht
+    (Barrierefreiheit wiegt am schwersten)."""
+    ok, dev, keys, cost = [], [], [], 0.0
+    want = SIZE_WORD.get(size_name, "")
+    if g["fit"] >= 0.99:
+        ok.append(f"Größe passt ({fmt_ha(g['ha'])}, {want})")
+    else:
+        dev.append(f"Größe: {fmt_ha(g['ha'])} ({size_word(g['ha'])}) statt {want}")
+        keys.append("size")
+        cost += 0.5 if g["fit"] > 0.5 else 1.0
+    failed = set(g.get("failed", []))
+    for c in prefer:
+        if c in failed:
+            continue
+        if g["counts"].get(c):
+            ok.append(f"{GREEN_ICON[c]} {CAT_NAME[c]} vorhanden")
+        else:
+            dev.append(f"{GREEN_ICON[c]} {CAT_NAME[c]} nicht gefunden")
+            keys.append("p" + c)
+            cost += 100.0 if c == "access" else 1.0
+    for c in avoid:
+        if c in failed:
+            continue
+        if g["counts"].get(c):
+            dev.append(f"{GREEN_ICON[c]} {CAT_NAME[c]} vorhanden (du wolltest das lieber vermeiden)")
+            keys.append("a" + c)
+            cost += 1.0
+        else:
+            ok.append(f"kein {GREEN_ICON[c]} {CAT_NAME[c]}")
+    return {"ok": ok, "dev": dev, "keys": frozenset(keys), "cost": cost}
+
+
+def propose_options(ranked, prefer, avoid, size_range, size_name, limit=3):
+    """Wünsche gegeneinander abwägen: perfekte Treffer zuerst; sonst die besten Kompromisse mit je anderer
+    Abweichung (z. B. „groß, mit Wasser, dafür Spielplatz“ oder „mittel, Wasser, ohne Spielplatz“)."""
+    best = {}
+    for g in ranked[:60]:
+        ev = green_eval(g, prefer, avoid, size_range, size_name)
+        g.update(ok=ev["ok"], dev=ev["dev"], cost=ev["cost"], keys=ev["keys"])
+        cur = best.get(ev["keys"])
+        if cur is None or g["score"] > cur["score"]:
+            best[ev["keys"]] = g
+    groups = sorted(best.values(), key=lambda g: (g["cost"], -g["score"]))
+    if not groups:
+        return []
+    top = groups[0]["cost"]
+    return [g for g in groups if g["cost"] <= top + 2.0 or g["cost"] < 100][:limit] if top < 100 else groups[:limit]
 
 
 class NoGreen(Exception):
@@ -4906,9 +4970,17 @@ def home_green():
     with st.status("Grün wird gesucht …", expanded=True) as status:
         try:
             ranked = find_green(pos, pc, ac, GREEN_SIZES[size], log=ov.log)
+            ov.log("⚖️ Wünsche abwägen")
+            options = propose_options(ranked, pc, ac, GREEN_SIZES[size], size)
+            if options and options[0]["cost"] > 0:
+                # Wünsche passen nicht alle zusammen: erst zur Auswahl stellen
+                st.session_state["green_pending"] = {"start_v": start_v, "options": options, "prefer": pc,
+                                                     "avoid": ac, "size": size, "wishes": (prefer, avoid)}
+                status.update(label="Vorschläge bereit", state="complete", expanded=False)
+                st.rerun()
             ov.log("🚶 Schnellsten Weg berechnen")
             err = None
-            for g in ranked[:5]:
+            for g in (options[:1] + ranked)[:5]:
                 try:
                     view = green_view(start_v, g, pc, ac)
                     break
@@ -4929,6 +5001,46 @@ def home_green():
         open_map(view)
         st.rerun()
     ov.empty()
+
+
+def render_green_pending():
+    """Wünsche passen nicht alle zusammen: freundlich erklären und 2–3 Vorschläge zur Auswahl stellen."""
+    gp = st.session_state["green_pending"]
+    prefer_n, avoid_n = gp["wishes"]
+    st.markdown("### 🌳 Das passt für dich")
+    wishes = [f"Größe: {gp['size'].split(' (')[0].lower()}"] + [f"{GREEN_ICON[GREEN_CAT[x]]} {x}" for x in prefer_n] \
+        + [f"kein {GREEN_ICON[GREEN_CAT[x]]} {x}" for x in avoid_n]
+    st.markdown("**Deine Wünsche:** " + " · ".join(wishes))
+    opts = gp["options"]
+    st.caption("Alles zusammen gibt es hier leider nicht. Ich habe abgewogen und zeige dir die besten Möglichkeiten. "
+               "Such dir die aus, die sich für dich richtig anfühlt.")
+    if "access" in gp["prefer"]:
+        if all("paccess" not in o["keys"] for o in opts):
+            st.success("♿ Barrierefreiheit hat bei der Auswahl Vorrang. Alle Vorschläge erfüllen sie.")
+        else:
+            st.info("♿ Für Barrierefreiheit gibt es in OpenStreetMap oft keine Angaben. Ich konnte keine Fläche "
+                    "sicher bestätigen. Die Vorschläge zeigen, was sonst am besten passt.")
+    for i, g in enumerate(opts):
+        with st.container(border=True):
+            tag = "⭐ Beste Gesamtpassung" if i == 0 else f"Alternative {i}"
+            st.markdown(f"**{tag}: {g['name']}** · {fmt_ha(g['ha'])} · ca. {_fmt_dist(g['d'])} entfernt")
+            for t in g["ok"]:
+                st.markdown(f"✅ {t}")
+            for t in g["dev"]:
+                st.markdown(f"🔸 {t}")
+            if st.button("Hierhin gehen", key=f"gp_pick_{i}", type="primary" if i == 0 else "secondary",
+                         use_container_width=True):
+                try:
+                    with st.spinner("Weg wird berechnet …"):
+                        view = green_view(gp["start_v"], g, gp["prefer"], gp["avoid"])
+                    st.session_state.pop("green_pending", None)
+                    open_map(view)
+                    st.rerun()
+                except Exception as e:
+                    show_error(e)
+    if st.button("← Wünsche ändern", key="gp_back", use_container_width=True):
+        st.session_state.pop("green_pending", None)
+        st.rerun()
 
 
 def home_route():
@@ -5080,5 +5192,7 @@ if st.session_state.get("gw"):
     render_map_view()
 elif st.session_state.get("san_pending"):
     render_san_pending()
+elif st.session_state.get("green_pending"):
+    render_green_pending()
 else:
     render_home()
