@@ -3471,6 +3471,188 @@ def make_tour_view_safe(start_v, stops_v, end_v, level, buf=150, log=lambda *_: 
             raise e
 
 
+# ------------------------------------------------------- „Ins Grün“: passende Grünfläche in der Nähe finden
+GREEN_RADIUS = 10000
+GREEN_PREFS = ["Wassernähe", "Sanitäroption", "Sportangebote", "Spielplätze aller Art", "Sehenswürdigkeiten"]
+GREEN_CAT = {"Wassernähe": "water", "Sanitäroption": "san", "Sportangebote": "sport",
+             "Spielplätze aller Art": "play", "Sehenswürdigkeiten": "sight"}
+GREEN_ICON = {"water": "💧", "san": "🚻", "sport": "⚽", "play": "🛝", "sight": "🏛️"}
+GREEN_SIZES = {"Klein (bis 2 ha)": (0.2, 2.0), "Mittel (2–15 ha)": (2.0, 15.0),
+               "Groß (15–100 ha)": (15.0, 100.0), "Sehr groß (ab 100 ha)": (100.0, 1e9)}
+SPORT_SPORTS = ("basketball|table_tennis|skateboard|soccer|volleyball|tennis|climbing|bmx|handball|"
+                "beachvolleyball|boules|streetball|fitness|multi")
+
+
+def _green_q(lat, lon, r):
+    a = f"(around:{r},{lat:.5f},{lon:.5f})"
+    return ('[out:json][timeout:40];('
+            f'wr["leisure"~"^(park|nature_reserve|common|dog_park)$"]{a};'
+            f'wr["landuse"~"^(forest|recreation_ground|village_green)$"]{a};'
+            f'wr["natural"~"^(wood|heath)$"]{a};);out tags bb center 4000;')
+
+
+def _feat_q(lat, lon, r):
+    a = f"(around:{r},{lat:.5f},{lon:.5f})"
+    return ('[out:json][timeout:40];('
+            f'nwr["amenity"="toilets"]{a};'
+            f'nwr["leisure"="playground"]{a};'
+            f'nwr["leisure"~"^(pitch|fitness_station|sports_centre|skate_park|dog_park|track)$"]{a};'
+            f'nwr["amenity"="boat_rental"]{a};'
+            f'nwr["sport"~"{SPORT_SPORTS}"]["leisure"]{a};'
+            f'nwr["natural"="water"]{a};nwr["waterway"~"^(river|canal)$"]{a};'
+            f'nwr["tourism"~"^(attraction|viewpoint|zoo)$"]{a};'
+            f'nwr["historic"~"^(monument|castle|ruins|fort|archaeological_site|tower)$"]{a};'
+            ');out tags bb center 12000;')
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _green_fetch(lat, lon, r):
+    """Grünflächen und Ausstattung in einem Umkreis (beide Abfragen gleichzeitig, je mit mehreren Servern)."""
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f1 = ex.submit(_overpass_race, _green_q(lat, lon, r), 30.0)
+        f2 = ex.submit(_overpass_race, _feat_q(lat, lon, r), 30.0)
+        return f1.result().get("elements", []), f2.result().get("elements", [])
+
+
+def _bounds(e):
+    b = e.get("bounds")
+    if b:
+        return float(b["minlat"]), float(b["minlon"]), float(b["maxlat"]), float(b["maxlon"])
+    c = e.get("center") or e
+    if "lat" in c:
+        return float(c["lat"]), float(c["lon"]), float(c["lat"]), float(c["lon"])
+    return None
+
+
+def feature_cat(t):
+    """OSM-Tags → Kategorie (water/san/sport/play/sight) oder None."""
+    if t.get("amenity") == "toilets":
+        return None if t.get("access") in ("private", "no", "customers") else "san"
+    if t.get("leisure") == "playground":
+        return "play"
+    if t.get("leisure") in ("pitch", "fitness_station", "sports_centre", "skate_park", "dog_park", "track") \
+            or t.get("amenity") == "boat_rental" or (t.get("leisure") and t.get("sport")):
+        return "sport"
+    if t.get("natural") == "water" or t.get("waterway") in ("river", "canal"):
+        return "water"
+    if t.get("tourism") in ("attraction", "viewpoint", "zoo") or t.get("historic"):
+        return "sight"
+    return None
+
+
+def _area_ha(b):
+    la0, lo0, la1, lo1 = b
+    ky, kx = 110540.0, 111320.0 * math.cos(math.radians((la0 + la1) / 2))
+    return (la1 - la0) * ky * (lo1 - lo0) * kx * 0.6 / 10000.0  # Rechteck → grob auf die echte Fläche
+
+
+def rank_greens(greens, feats, prefer, avoid, size_range, pos):
+    """Grünflächen nach Passung sortieren. greens/feats sind Overpass-Elemente (mit bounds/center)."""
+    lat0, lon0 = pos
+    ky, kx = 110540.0, 111320.0 * math.cos(math.radians(lat0))
+    items = []
+    for e in feats:
+        cat, b = feature_cat(e.get("tags", {})), _bounds(e)
+        if cat and b:
+            items.append((cat, b))
+    lo_ha, hi_ha = size_range
+    out = []
+    for e in greens:
+        b = _bounds(e)
+        if not b:
+            continue
+        ha = _area_ha(b)
+        if ha < 0.2:
+            continue
+        la0, lo0, la1, lo1 = b
+        cla, clo = (la0 + la1) / 2, (lo0 + lo1) / 2
+        tla, tlo = min(max(lat0, la0), la1), min(max(lon0, lo0), lo1)
+        d = math.hypot((tla - lat0) * ky, (tlo - lon0) * kx)
+        target = (tla, tlo)
+        if d < 200:  # Standort liegt im Rechteck der Fläche: Mitte ansteuern
+            target = (cla, clo)
+            d = math.hypot((cla - lat0) * ky, (clo - lon0) * kx)
+        if d < 100 or d > GREEN_RADIUS:
+            continue
+        m = 60.0 / ky
+        mx = m * ky / kx
+        counts = {}
+        for cat, (fa0, fo0, fa1, fo1) in items:
+            pad = 100.0 / ky if cat == "water" else m
+            padx = pad * ky / kx
+            if fa1 >= la0 - pad and fa0 <= la1 + pad and fo1 >= lo0 - padx and fo0 <= lo1 + padx:
+                counts[cat] = counts.get(cat, 0) + 1
+        # Größe: 1 im Wunschbereich, nach außen fallend (je Zehnerpotenz Abweichung -1)
+        if lo_ha <= ha <= hi_ha:
+            fit = 1.0
+        else:
+            ref = lo_ha if ha < lo_ha else hi_ha
+            fit = max(0.0, 1.0 - abs(math.log10(ha / ref)))
+        score = 2.0 * fit - 1.2 * d / GREEN_RADIUS
+        for c in prefer:
+            if counts.get(c):
+                score += 1.5 + 0.3 * min(counts[c] - 1, 3)
+        for c in avoid:
+            if counts.get(c):
+                score -= 2.5
+        t = e.get("tags", {})
+        kind = (t.get("leisure") or t.get("landuse") or t.get("natural") or "")
+        name = t.get("name") or {"park": "Park", "forest": "Wald", "wood": "Wald", "nature_reserve": "Naturschutzgebiet",
+                                  "common": "Grünfläche", "recreation_ground": "Erholungsfläche", "heath": "Heide",
+                                  "village_green": "Grünanlage", "dog_park": "Hundepark"}.get(kind, "Grünfläche")
+        out.append({"name": name, "kind": kind, "ha": ha, "d": d, "target": target, "counts": counts,
+                    "score": score, "fit": fit})
+    out.sort(key=lambda g: -g["score"])
+    return out
+
+
+def green_reasons(g):
+    names = {"water": "Wasser", "san": "Toilette", "sport": "Sportangebot", "play": "Spielplatz", "sight": "Sehenswürdigkeit"}
+    bits = []
+    for c, n in g["counts"].items():
+        bits.append(f"{GREEN_ICON[c]} {names[c]}" + (f" ×{n}" if n > 1 and c != "water" else ""))
+    return bits
+
+
+def fmt_ha(ha):
+    return f"{ha:.0f} ha" if ha >= 10 else f"{ha:.1f} ha".replace(".", ",")
+
+
+def green_view(start_v, g, prefer, avoid):
+    """Schnellster Fußweg zur gewählten Grünfläche, in der Kartenansicht mit Begründung."""
+    lat1, lon1, lab1 = _unpack(start_v)
+    p1, p2 = (lat1, lon1), g["target"]
+    t1 = lab1.split(" · ")[0]
+    t2 = f"{g['name']} ({fmt_ha(g['ha'])})"
+    nav = osrm_nav(osrm_route(p1, p2), f"{t1} → {t2}")
+    if not nav:
+        raise ValueError("Die Grünfläche liegt zu nah.")
+    mins = max(1, round(nav["total"] / M_PER_MIN))
+    why = green_reasons(g)
+    hint = "Schnellster Weg zur am besten passenden Grünfläche" + (" · " + " · ".join(why) if why else "")
+    if g["counts"] and avoid:
+        bad = [GREEN_ICON[c] for c in avoid if g["counts"].get(c)]
+        if bad:
+            hint += " · ⚠️ enthält auch " + " ".join(bad)
+    opt = _option(nav, "Schnellste", f"{fmt_km(nav['total'])} · {mins} min", hint,
+                  [["Länge", fmt_km(nav["total"])], ["Dauer", f"{mins} min"], ["Fläche", fmt_ha(g["ha"])],
+                   ["Passt zu", " ".join(GREEN_ICON[c] for c in g["counts"]) or "–"]])
+    payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=None,
+                   options=[opt], default=0, speed=M_PER_MIN, topPad=TOP_PAD)
+    return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
+            "start": start_v, "dest": _pack(p2[0], p2[1], t2), "area": None, "bbox": None, "buf": 150}
+
+
+def find_green(pos, prefer, avoid, size_range, log=lambda *_: None):
+    log("🌳 Grünflächen im Umkreis von 10 km suchen")
+    greens, feats = _green_fetch(round(pos[0], 3), round(pos[1], 3), GREEN_RADIUS)
+    log("🔎 Ausstattung vergleichen")
+    ranked = rank_greens(greens, feats, prefer, avoid, size_range, pos)
+    if not ranked:
+        raise ValueError("Im Umkreis von 10 km habe ich keine passende Grünfläche gefunden.")
+    return ranked
+
+
 # ------------------------------------------------------- Sanitäroptionen (Toiletten am Weg)
 # Datenquelle: OpenStreetMap (amenity=toilets, Zugang/Gebühr/Rollstuhl/Öffnungszeiten). Die Daten sind
 # freiwillig gepflegt und können unvollständig sein; Kundentoiletten in Gaststätten sind nicht garantiert.
@@ -3810,9 +3992,9 @@ html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp 
 .hero .ico{font-size:36px;line-height:1;width:46px;text-align:center;flex:none}
 .hero h1{margin:0;padding:0;font-size:1.5rem;font-weight:700;line-height:1.1;color:#FBF7EE;letter-spacing:0}
 .hero p{margin:2px 0 0;font-size:1rem;color:#FBF7EE;opacity:.92}
-.st-key-card_route,.st-key-card_loop,.st-key-card_tour{background:rgba(251,248,241,.98);border:1px solid var(--line);border-radius:20px;
+.st-key-card_route,.st-key-card_green,.st-key-card_loop,.st-key-card_tour{background:rgba(251,248,241,.98);border:1px solid var(--line);border-radius:20px;
  padding:14px 14px 12px;box-shadow:0 8px 28px rgba(60,50,30,.18);margin-top:12px}
-.st-key-card_route label p,.st-key-card_loop label p,.st-key-card_tour label p{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;
+.st-key-card_route label p,.st-key-card_green label p,.st-key-card_loop label p,.st-key-card_tour label p{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;
  opacity:.7;font-weight:600}
 .hint{opacity:.7;font-size:.8rem;margin:-4px 0 8px}
 .fld{display:flex;align-items:center;gap:8px;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;font-weight:700;
@@ -3841,13 +4023,13 @@ html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp 
 .stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"]{display:none}
 /* Bewegung: Karten gleiten ein, Bedienelemente reagieren weich */
 @keyframes gwrise{from{opacity:0;transform:translateY(16px) scale(.985)}to{opacity:1;transform:none}}
-.st-key-card_route,.st-key-card_loop,.st-key-card_tour{animation:gwrise .55s cubic-bezier(.2,.8,.2,1) both}
+.st-key-card_route,.st-key-card_green,.st-key-card_loop,.st-key-card_tour{animation:gwrise .55s cubic-bezier(.2,.8,.2,1) both}
 .hero{animation:gwrise .6s cubic-bezier(.2,.8,.2,1) both}
 .stButton button,[data-testid="stButtonGroup"] button{transition:transform .15s,background .25s,border-color .25s,box-shadow .25s}
 .stButton button:active,[data-testid="stButtonGroup"] button:active{transform:scale(.97)}
 .stButton button[kind="primary"]:hover{box-shadow:0 6px 18px rgba(78,110,69,.4);transform:translateY(-1px)}
 [data-testid="stToggle"],[data-testid="stCheckbox"]{transition:opacity .2s}
-@media (prefers-reduced-motion:reduce){.st-key-card_route,.st-key-card_loop,.st-key-card_tour,.hero{animation:none}}
+@media (prefers-reduced-motion:reduce){.st-key-card_route,.st-key-card_green,.st-key-card_loop,.st-key-card_tour,.hero{animation:none}}
 </style>
 """
 
@@ -4473,6 +4655,81 @@ def replan_with_stops(view, cands):
     return new
 
 
+def my_location():
+    """Standort per Browser (kein Adressfeld). Gibt (lat, lon, label) oder None."""
+    skey = "loc_shared"
+    loc = st.session_state.get(skey)
+    if loc is None:
+        raw = get_geolocation(component_key="geo_shared")
+        if isinstance(raw, dict) and raw.get("error"):
+            st.warning("Der Standort ist nicht verfügbar. Bitte die Freigabe im Browser erlauben "
+                       "(Schloss-Symbol in der Adressleiste) und die Seite neu laden.")
+            return None
+        c = raw.get("coords") if isinstance(raw, dict) else None
+        if not c or c.get("latitude") is None:
+            st.info("📡 Standort wird ermittelt … bitte im Browser die Freigabe erlauben.")
+            return None
+        loc = (float(c["latitude"]), float(c["longitude"]), c.get("accuracy"))
+        st.session_state[skey] = loc
+    lat, lon, acc = loc
+    name = reverse_name(round(lat, 5), round(lon, 5))
+    lab = "📍 Mein Standort" + (f" · {name}" if name else "")
+    st.markdown(f'<div class="trip"><span class="pill">{escape(lab)}</span></div>', unsafe_allow_html=True)
+    if st.button("🔄 Standort neu bestimmen", key="green_relocate"):
+        st.session_state.pop(skey, None)
+        st.rerun()
+    st.session_state["bias"] = (lat, lon)
+    return _pack(lat, lon, lab)
+
+
+def home_green():
+    with st.container(key="card_green"):
+        st.markdown("Ich suche vom Standort aus die Grünfläche im Umkreis von 10 km, die am besten passt, "
+                    "und zeige den schnellsten Weg dorthin.")
+        start_v = my_location()
+        prefer = st.multiselect("Bevorzugt", GREEN_PREFS, key="green_prefer", placeholder="Auswählen …",
+                                help="Sportangebote: Fußball, Basketball, Tischtennis, Outdoor-Fitness, Skatepark, "
+                                     "Hundepark, Tretboot u. a. (als Suchabfrage im Umkreis).")
+        avoid = st.multiselect("Vermeiden", GREEN_PREFS, key="green_avoid", placeholder="Auswählen …")
+        size = st.select_slider("Bevorzugte Grünflächengröße", options=list(GREEN_SIZES), value="Mittel (2–15 ha)",
+                                key="green_size")
+        go = st.button("Los, das Grün finden", type="primary", use_container_width=True, key="go_green")
+    if not go:
+        return
+    if not start_v:
+        st.warning("Ohne Standort kann ich nicht suchen. Bitte die Freigabe im Browser erlauben.")
+        return
+    both = set(prefer) & set(avoid)
+    if both:
+        st.warning("„" + "“, „".join(sorted(both)) + "“ steht bei Bevorzugt und Vermeiden. Bitte nur eins wählen.")
+        return
+    pos = _unpack(start_v)[:2]
+    pc, ac = [GREEN_CAT[x] for x in prefer], [GREEN_CAT[x] for x in avoid]
+    view = None
+    ov = loading_overlay(start_v, "Wassernähe" in prefer)
+    with st.status("Grün wird gesucht …", expanded=True) as status:
+        try:
+            ranked = find_green(pos, pc, ac, GREEN_SIZES[size], log=ov.log)
+            ov.log("🚶 Schnellsten Weg berechnen")
+            err = None
+            for g in ranked[:5]:
+                try:
+                    view = green_view(start_v, g, pc, ac)
+                    break
+                except Exception as e:
+                    err = e
+            if not view:
+                raise err or ValueError("Keine erreichbare Grünfläche gefunden.")
+            status.update(label="Fertig", state="complete", expanded=False)
+        except Exception as e:
+            status.update(label="Fehler", state="error")
+            show_error(e)
+    if view:
+        open_map(view)
+        st.rerun()
+    ov.empty()
+
+
 def home_route():
     with st.container(key="card_route"):
         start_v = start_input("Start", "start_sb")
@@ -4604,7 +4861,7 @@ def render_home():
                 '<p>Der grüne Weg statt nur der kürzeste.</p></div></div>',
                 unsafe_allow_html=True)
     # Nur der gewählte Reiter wird aufgebaut (st.tabs würde alle drei samt Suchfeldern laden = langsam)
-    pages = {"route": "🧭 Route", "loop": "🔄 Ründchen", "tour": "🛍️ Ründchen mit Zwischenziel"}
+    pages = {"route": "🧭 Route", "green": "🌳 Ins Grün", "loop": "🔄 Ründchen", "tour": "🛍️ Ründchen mit Zwischenziel"}
     try:
         page = st.segmented_control("Ansicht", list(pages), format_func=pages.get, default="route",
                                     key="page_sel", label_visibility="collapsed")
@@ -4613,7 +4870,7 @@ def render_home():
                         label_visibility="collapsed")
     page = page or st.session_state.get("page_last", "route")
     st.session_state["page_last"] = page
-    {"route": home_route, "loop": home_loop, "tour": home_tour}[page]()
+    {"route": home_route, "green": home_green, "loop": home_loop, "tour": home_tour}[page]()
     with st.expander("Datenquellen und Gewichtung"):
         st.markdown(sources_text(150, LEVELS["Ausgewogen"]))
 
