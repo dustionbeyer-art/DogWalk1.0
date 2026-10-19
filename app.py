@@ -216,8 +216,8 @@ MAX_BUF = 400
 MAX_SPAN_M = 9000
 M_PER_MIN = 80
 
-LEVELS = {"Schnellste": 0.0, "Leicht grün": 1.0, "Ausgewogen": 3.0,
-          "Sehr grün": 6.0, "Maximal grün": 12.0, "Grünster Umweg": 40.0}
+LEVELS = {"Schnellste": 0.0, "Leicht grün": 1.5, "Ausgewogen": 4.0,
+          "Sehr grün": 8.0, "Maximal grün": 14.0, "Grünster Umweg": 40.0}
 # Hauptstraßen-Gewicht und Breiten-Gewicht je Stufe. „Maximal grün“ und „Grünster Umweg“ meiden
 # Hauptstraßen und breite Straßen stark: bevorzugt kleine Gassen und Nebenstraßen.
 LEVEL_QUIET = {"Maximal grün": (4.0, 6.0), "Grünster Umweg": (6.0, 10.0)}
@@ -225,7 +225,7 @@ LEVEL_QUIET = {"Maximal grün": (4.0, 6.0), "Grünster Umweg": (6.0, 10.0)}
 
 def level_quiet(name):
     lam = LEVELS[name]
-    return LEVEL_QUIET.get(name, (1.5 if lam > 0 else 0.0, 0.0))
+    return LEVEL_QUIET.get(name, (1.0 if lam > 0 else 0.0, 0.0))
 
 
 LEVEL_HINT = {
@@ -837,7 +837,9 @@ def overpass_query(bbox):
     """Eine einzige Abfrage für Fußwege und Grünflächen (statt zwei getrennter)."""
     w, s, e, n = bbox
     b = f"({s},{w},{n},{e})"
-    parts = [f"way{WALK_FILTER}{b};"]
+    parts = [f"way{WALK_FILTER}{b};",
+             # Hauptverkehrsstraßen immer mitladen (auch wenn ihre Gehwege getrennt erfasst sind): Grundlage für „laut“
+             f'way["highway"~"^(trunk|primary|secondary|tertiary)(_link)?$"]{b};']
     for k, vals in GREEN_TAGS.items():
         rx = "|".join(vals)
         parts += [f'way["{k}"~"^({rx})$"]{b};', f'relation["{k}"~"^({rx})$"]{b};']
@@ -917,7 +919,7 @@ def fetch_osm(bbox, deadline):
     auf der Festplatte zwischengespeichert."""
     from concurrent.futures import FIRST_COMPLETED, wait
     os.makedirs(OSM_CACHE_DIR, exist_ok=True)
-    path = os.path.join(OSM_CACHE_DIR, hashlib.md5((repr(bbox) + "|v3-zufahrt").encode()).hexdigest() + ".osm")
+    path = os.path.join(OSM_CACHE_DIR, hashlib.md5((repr(bbox) + "|v4-strassen").encode()).hexdigest() + ".osm")
     if os.path.exists(path) and time.time() - os.path.getmtime(path) < OSM_CACHE_DAYS * 86400:
         return path
     query, last = overpass_query(bbox), "keine Antwort"
@@ -977,19 +979,31 @@ def _walkable(el):
         return False
     # Privatgrundstücke, Hofeinfahrten und Parkplatzgassen sind keine Spazierwege (Durchgänge zwischen Straßen
     # führen so nicht mehr über fremde Grundstücke)
+    if any("separate" in str(tags.get(k, "")) for k in ("sidewalk", "sidewalk:both", "sidewalk:left", "sidewalk:right")):
+        return False  # Straße mit getrennt erfasstem Gehweg: der Gehweg ist der Weg, nicht die Fahrbahn
     return (tags.get("foot") not in ("no", "private")
             and tags.get("access") not in ("private", "no", "customers", "delivery", "permit")
             and tags.get("service") not in ("private", "driveway", "parking_aisle", "drive-through"))
 
 
+ROAD_CLASSES = {"trunk", "trunk_link", "primary", "primary_link", "secondary", "secondary_link", "tertiary", "tertiary_link"}
+
+
+def roads_path(path):
+    return path[:-4] + ".roads.json"
+
+
 def walk_xml(path):
     """Schreibt eine zweite Datei nur mit Knoten und Fußwegen (osmnx macht aus jedem Weg eine Kante,
-    Parkränder dürfen also nicht mit hinein). Arbeitet gestreamt, damit der Speicher klein bleibt."""
+    Parkränder dürfen also nicht mit hinein). Arbeitet gestreamt, damit der Speicher klein bleibt.
+    Nebenbei werden die Mittellinien aller Hauptverkehrsstraßen in eine Zusatzdatei geschrieben (auch die,
+    deren Gehwege getrennt erfasst sind und die deshalb kein Fußweg sind)."""
     out = path[:-4] + ".walk2.osm"
-    if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(path):
+    if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(path) and os.path.exists(roads_path(path)):
         return out
     tmp = out + f".{os.getpid()}.part"
     depth = 0
+    nodes, roads = {}, []
     with open(tmp, "wb") as f:
         f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n<osm version="0.6" generator="green-walker">\n')
         for ev, el in ET.iterparse(path, events=("start", "end")):
@@ -999,13 +1013,70 @@ def walk_xml(path):
             depth -= 1
             if depth != 1:
                 continue
+            if el.tag == "node":
+                try:
+                    nodes[el.get("id")] = (float(el.get("lon")), float(el.get("lat")))
+                except Exception:
+                    pass
+            elif el.tag == "way":
+                hw = next((t.get("v") for t in el.iter("tag") if t.get("k") == "highway"), None)
+                if hw in ROAD_CLASSES:
+                    pts = [nodes[n.get("ref")] for n in el.iter("nd") if n.get("ref") in nodes]
+                    if len(pts) >= 2:
+                        roads.append([hw, [[round(x, 6), round(y, 6)] for x, y in pts]])
             if el.tag == "node" or (el.tag == "way" and _walkable(el)):
                 el.tail = "\n"
                 f.write(ET.tostring(el, encoding="unicode").encode("utf-8"))
             el.clear()
         f.write(b"</osm>\n")
+    try:
+        import json as _json
+        with open(roads_path(path) + ".part", "w", encoding="utf-8") as g:
+            _json.dump(roads, g)
+        os.replace(roads_path(path) + ".part", roads_path(path))
+    except Exception:
+        pass
     os.replace(tmp, out)
     return out
+
+
+ROAD_NOISE_W = {"trunk": 1.0, "primary": 1.0, "secondary": 0.85, "tertiary": 0.5}
+
+
+def main_road_lines(path, crs):
+    """[(Gewicht, LineString im Projektions-KS)] der Hauptverkehrsstraßen aus der Zusatzdatei."""
+    import json as _json
+    try:
+        with open(roads_path(path), encoding="utf-8") as g:
+            raw = _json.load(g)
+    except Exception:
+        return []
+    if not raw:
+        return []
+    geoms = [LineString(pts) for _, pts in raw]
+    ws = [ROAD_NOISE_W.get(hw.replace("_link", ""), 0.5) for hw, _ in raw]
+    gs = gpd.GeoSeries(geoms, crs=4326).to_crs(crs)
+    return list(zip(ws, gs))
+
+
+def road_noise(lines, roads, dist):
+    """Je Kante 0..1: Anteil der Kante (nach Stichproben), der innerhalb von dist m einer Hauptstraße liegt
+    (gewichtet nach Straßenklasse)."""
+    noise = np.zeros(len(lines), dtype=np.float32)
+    if not roads:
+        return noise
+    groups = {}
+    for w, g in roads:
+        groups.setdefault(w, []).append(g)
+    trees = [(w, STRtree(gs)) for w, gs in groups.items()]
+    for f in (np.arange(SAMPLES) + 0.5) / SAMPLES:
+        pts = shapely.line_interpolate_point(lines, f, normalized=True)
+        best = np.zeros(len(lines), dtype=np.float32)
+        for w, tr in trees:
+            idx = tr.query_nearest(pts, max_distance=dist, return_distance=False, all_matches=False)
+            best[idx[0]] = np.maximum(best[idx[0]], w)
+        noise += best
+    return noise / SAMPLES
 
 
 @st.cache_resource(show_spinner=False, max_entries=2, ttl=3600)
@@ -1083,18 +1154,28 @@ def load_area(bbox):
     for i, (u, v) in enumerate(keys):
         H.add_edge(u, v, i=i)
 
-    # Hauptstraßen-Nähe je Kante (0 = ruhig, 1 = an/auf einer Hauptstraße)
+    # Hauptstraßen-Nähe je Kante (0 = ruhig, 1 = an/auf einer Hauptstraße). Grundlage sind die Mittellinien der
+    # Hauptverkehrsstraßen aus den Kartendaten, nicht nur die Fußwege: Gehwege laufen oft getrennt neben der Fahrbahn.
     noise = np.zeros(len(keys), dtype=np.float32)
-    wts = np.array([OSM_ROAD_W.get(best[k][4], 0.0) for k in keys], dtype=np.float32)
-    main = np.nonzero(wts > 0)[0]
-    if len(main):
-        rtree = STRtree(list(lines[main]))
-        acc = np.zeros(len(keys), dtype=np.float32)
-        for f in (np.arange(SAMPLES) + 0.5) / SAMPLES:
-            pts = shapely.line_interpolate_point(lines, f, normalized=True)
-            idx, _ = rtree.query_nearest(pts, max_distance=NOISE_DIST, return_distance=True, all_matches=False)
-            acc[idx[0]] += wts[main][idx[1]]
-        noise = acc / SAMPLES
+    roads_ok = False
+    try:
+        roads = main_road_lines(path, crs)
+        if roads:
+            noise = road_noise(lines, roads, NOISE_DIST)
+            roads_ok = True
+    except Exception:
+        roads_ok = False
+    if not roads_ok:  # Zusatzdatei fehlt: wie früher aus den Straßen im Wegenetz
+        wts = np.array([OSM_ROAD_W.get(best[k][4], 0.0) for k in keys], dtype=np.float32)
+        main = np.nonzero(wts > 0)[0]
+        if len(main):
+            rtree = STRtree(list(lines[main]))
+            acc = np.zeros(len(keys), dtype=np.float32)
+            for f in (np.arange(SAMPLES) + 0.5) / SAMPLES:
+                pts = shapely.line_interpolate_point(lines, f, normalized=True)
+                idx, _ = rtree.query_nearest(pts, max_distance=NOISE_DIST, return_distance=True, all_matches=False)
+                acc[idx[0]] += wts[main][idx[1]]
+            noise = acc / SAMPLES
 
     wide = np.array([best[k][5] for k in keys], dtype=np.float32)
     accp = np.array([best[k][6] for k in keys], dtype=np.float32)
@@ -1219,7 +1300,7 @@ def edge_green(area, buf, water=None):
     """Attraktivität je Kante: Grünscore; bei aktiver Wassernähe zählt Wasser genauso (das Bessere gilt)."""
     D = area["D"]
     # im Park (Abstand 0) zählt voll, am Parkrand entlang etwas weniger: Wege führen durch Parks statt außen herum
-    g = np.where(D <= 0.5, 1.0, INSIDE_FACTOR * np.clip(1 - D / buf, 0, 1)).mean(axis=0)
+    g = np.where(D <= 0.5, 1.0, INSIDE_FACTOR * np.clip(1 - D / buf, 0, 1) ** GREEN_FALLOFF).mean(axis=0)
     if _water() if water is None else water:
         w = edge_water(area)
         if w is not None:
@@ -1575,7 +1656,7 @@ def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None):
         if progress:
             progress((k + 1) / LOOP_BEARINGS)
     for c in cands:
-        c["score"] = (c["green"] - 0.8 * c["rep"] - 0.4 * ((quiet[0] if quiet else QUIET) if lam > 0 else 0) * c["noise"]
+        c["score"] = (c["green"] - REP_W * c["rep"] - 0.4 * ((quiet[0] if quiet else QUIET) if lam > 0 else 0) * c["noise"]
                       - 2.0 * abs(c["dist"] / target - 1))
     cands.sort(key=lambda c: -c["score"])
     picked = []
@@ -2554,11 +2635,13 @@ def make_ab_view_safe(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda
 # Jede Wegvariante wird alle paar Meter abgetastet und bewertet; die beste je Grünstufe gewinnt.
 OFM_TILEJSON = "https://tiles.openfreemap.org/planet"
 VT_ZOOM = 14
-INSIDE_FACTOR = 0.85      # Wert für „nur am Parkrand entlang“ gegenüber „im Park“ (1.0)
+INSIDE_FACTOR = 0.8       # Wert für „nur am Parkrand entlang“ gegenüber „im Park“ (1.0)
+GREEN_FALLOFF = 1.5       # >1: Grün zählt nur nahe am Park viel, nicht schon 100 m davon entfernt
+REP_W = 1.4               # Gewicht für Doppelwege (Strecke zweimal gehen) bei der Auswahl von Runden
 WATER_SCAN_NEAR = 70.0    # m: so nah am Gewässer gilt ein Wegstück im Scan als „am Wasser“
 SCAN_STEP = 10.0          # Abtastabstand entlang einer Route (m)
-NOISE_DIST = 20.0         # bis zu diesem Abstand zählt eine Hauptstraße als laut (m)
-QUIET = 1.5               # Gewicht "Hauptstraßen meiden" (bei "Schnellste" 0)
+NOISE_DIST = 28.0         # bis zu diesem Abstand zählt eine Hauptstraße als laut (m)
+QUIET = 1.0               # Gewicht "Hauptstraßen meiden" (bei "Schnellste" 0)
 PARK_MIN_M2 = 3000        # kleinere Grünflächen werden nicht gezielt angesteuert
 ROAD_W = {"motorway": 1.0, "trunk": 1.0, "primary": 1.0, "secondary": 0.8, "tertiary": 0.4}
 OSM_ROAD_W = {"trunk": 1.0, "trunk_link": 1.0, "primary": 1.0, "primary_link": 1.0,
@@ -2932,7 +3015,7 @@ def scan_score(sa, coords, buf):
     r, c, ok = _cells(sa, px, py)
     gd = np.where(ok, sa["gdist"][r, c], np.inf)
     # mitten im Park zählt voll, am Parkrand entlang etwas weniger: so führt die Route durch den Park statt außen herum
-    g = np.where(gd <= 0.0, 1.0, INSIDE_FACTOR * np.clip(1.0 - gd / buf, 0.0, 1.0))
+    g = np.where(gd <= 0.0, 1.0, INSIDE_FACTOR * np.clip(1.0 - gd / buf, 0.0, 1.0) ** GREEN_FALLOFF)
     wdm = sa.get("wdist")
     water = None if wdm is None else float(np.mean(np.where(ok, wdm[r, c], np.inf) <= WATER_SCAN_NEAR))
     nz = np.where(ok, sa["noise"][r, c], 0.0)
@@ -3114,7 +3197,7 @@ def scan_loop_candidates(sa, p1, p2, target, buf, progress=None):
         if progress:
             progress((k + 1) / total_steps)
     # die drei vielversprechendsten Richtungen auf die Wunschlänge nachjustieren
-    first.sort(key=lambda c: -(c["green"] - 0.8 * c["rep"] - abs(c["dist"] / target - 1)))
+    first.sort(key=lambda c: -(c["green"] - REP_W * c["rep"] - abs(c["dist"] / target - 1)))
     for j, c in enumerate(first[:3]):
         ratio = c["dist"] / target if target else 1
         if abs(ratio - 1) > 0.07 and ratio > 0:
@@ -3225,7 +3308,7 @@ def scan_loop_view(start_v, end_v, km, level, buf=150, log=lambda *_: None, prog
     mu = level_quiet(level)[0]
     w_green = 0.15 + lam / 12.0
     for c in cands:
-        c["score"] = (w_green * c["green"] - 0.8 * c["rep"] - 0.25 * mu * c["noise"]
+        c["score"] = (w_green * c["green"] - REP_W * c["rep"] - 0.25 * mu * c["noise"]
                       - 2.0 * abs(c["dist"] / target - 1))
     cands.sort(key=lambda c: -c["score"])
     picked = []
@@ -3373,7 +3456,7 @@ def tour_extra_variants(area, g, lam, mu, wq, nodes, extra_m):
                     break
                 rho *= min(max(extra_m / max(got, 0.2 * extra_m), 0.5), 2.0)
     for c in cands:
-        c["score"] = c["green"] - 0.8 * c["rep"] - 0.4 * mu * c["noise"] - 2.0 * abs(c["got"] / extra_m - 1)
+        c["score"] = c["green"] - REP_W * c["rep"] - 0.4 * mu * c["noise"] - 2.0 * abs(c["got"] / extra_m - 1)
     cands.sort(key=lambda c: -c["score"])
     picked = []
     for c in cands:
@@ -3509,7 +3592,7 @@ def _scan_tour_extra(sa, pts, legs, chosen, lam, mu, buf, extra_m, log):
             return None
         c = {"merged": merged, "marks": marks, "sc": sc, "got": sc["dist"] - base_len, "pos": pos,
              "theta": theta, "rho": rho}
-        c["score"] = (sc["green"] - 0.8 * sc["rep"] - 0.25 * mu * sc["noise"] - 2.0 * abs(c["got"] / extra_m - 1))
+        c["score"] = (sc["green"] - REP_W * sc["rep"] - 0.25 * mu * sc["noise"] - 2.0 * abs(c["got"] / extra_m - 1))
         return c
 
     for pos in sorted({0, len(chosen) - 1}):
@@ -4578,10 +4661,12 @@ OVERLAY_HTML = """
 #gwload{position:fixed;inset:0;z-index:99999;background:#F4EFE6;display:flex;flex-direction:column;align-items:center;
  justify-content:center;gap:16px;animation:gwfade .35s ease both;overflow:hidden;font-family:system-ui,-apple-system,sans-serif;padding:0 22px}
 @keyframes gwfade{from{opacity:0}to{opacity:1}}
-#gwload .cbg{position:absolute;inset:-24px;background-size:cover;background-position:center;filter:blur(7px) saturate(.85);
+#gwload .cbg{position:absolute;inset:-24px;background-size:cover;background-position:center;filter:blur(4px) saturate(.9);
  transform:scale(1.04);animation:gwbgin 1.2s ease both}
-#gwload .cmilk{position:absolute;inset:0;background:linear-gradient(rgba(244,239,230,.66),rgba(244,239,230,.74))}
+#gwload .cmilk{position:absolute;inset:0;background:linear-gradient(rgba(244,239,230,.42),rgba(244,239,230,.58))}
 @keyframes gwbgin{from{opacity:0}to{opacity:1}}
+#gwload.hasbg .b{opacity:.3}
+#gwload .credit{position:absolute;right:10px;bottom:6px;font-size:.62rem;color:#3B3A33;opacity:.55;z-index:2}
 #gwload .b{position:absolute;border-radius:50%;filter:blur(34px);background:radial-gradient(closest-side,rgba(255,255,255,.95),rgba(255,255,255,.5) 55%,rgba(255,255,255,0));
  animation:gwdrift 9s ease-in-out infinite alternate}
 #gwload .b:nth-child(1){width:70vmax;height:44vmax;left:-20vmax;top:-8vmax}
@@ -4606,7 +4691,7 @@ OVERLAY_HTML = """
 @media (prefers-reduced-motion:reduce){#gwload *{animation-duration:0s!important}#gwload .fact p:first-of-type{opacity:1}}
 __FACTCSS__
 </style>
-<div id="gwload">__CITYBG__<i class="b"></i><i class="b"></i><i class="b"></i><i class="b"></i>
+<div id="gwload" class="__BGCLS__">__CITYBG__<i class="b"></i><i class="b"></i><i class="b"></i><i class="b"></i>
 <div class="logo"><img src="data:image/svg+xml;base64,__LOGO__" alt=""></div>
 <div class="st">__STAGE__</div><div class="bar"></div>
 <div class="fact"><small>__LABEL__</small>__FACTS__</div></div>
@@ -4823,24 +4908,27 @@ def _city_image(city):
 
 
 def city_background(lat, lon):
-    """(Stadt, Bild-URL) zum Ort; im Hintergrund geladen, damit nichts blockiert. Leer, wenn nichts gefunden."""
+    """(Stadt, Bild-URL) zum Ort; leer, wenn nichts gefunden. Treffer werden gemerkt, Fehlschläge nur kurz
+    (2 Minuten), damit ein einmaliger Netzfehler das Bild nicht dauerhaft verhindert."""
     key = (round(lat, 2), round(lon, 2))
+    now = time.time()
     with _BG_LOCK:
-        if key in _BG_CACHE:
-            return _BG_CACHE[key]
+        hit = _BG_CACHE.get(key)
+        if hit and (hit[1] or now - hit[2] < 120):
+            return hit[:2]
     try:
         city = _city_name(lat, lon)
         with _BG_LOCK:
-            for k, v in _BG_CACHE.items():  # gleiche Stadt schon bekannt
+            for v in _BG_CACHE.values():  # gleiche Stadt schon bekannt
                 if v[0] == city and v[1]:
                     _BG_CACHE[key] = v
-                    return v
-        res = (city, _city_image(city) if city else "")
+                    return v[:2]
+        res = (city, _city_image(city) if city else "", now)
     except Exception:
-        return ("", "")  # nicht merken: nächster Versuch möglich
+        return ("", "")
     with _BG_LOCK:
         _BG_CACHE[key] = res
-    return res
+    return res[:2]
 
 
 class Overlay:
@@ -4887,7 +4975,7 @@ class Overlay:
             html = (OVERLAY_HTML.replace("__FACTCSS__", css + self._bg_css()).replace("__LOGO__", logo)
                     .replace("__STAGE__", escape(self.stage)).replace("__FACTS__", facts)
                     .replace("__LABEL__", "Wusstest du?")
-                    .replace("__CITYBG__", self._bg_html()))
+                    .replace("__CITYBG__", self._bg_html()).replace("__BGCLS__", "hasbg" if self._bg_css() else ""))
             self.ph.markdown(html, unsafe_allow_html=True)
         except Exception:
             pass
@@ -4899,7 +4987,7 @@ class Overlay:
         return f'#gwload .cbg{{background-image:url("{u}")}}'
 
     def _bg_html(self):
-        return "<div class='cbg'></div><div class='cmilk'></div>" if self._bg_css() else ""
+        return "<div class='cbg'></div><div class='cmilk'></div><div class='credit'>Foto: Wikimedia Commons</div>" if self._bg_css() else ""
 
     def log(self, msg):
         """Schritt anzeigen (und weiter ins versteckte Statusfeld schreiben)."""
