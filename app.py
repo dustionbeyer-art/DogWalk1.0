@@ -956,6 +956,10 @@ def walk_xml(path):
 
 @st.cache_resource(show_spinner=False, max_entries=2, ttl=3600)
 def load_area(bbox):
+    try:  # osmnx behält sonst nur wenige Wegtags: für Barrierefreiheit zusätzlich Belag, Steigung usw.
+        ox.settings.useful_tags_way = sorted(set(ox.settings.useful_tags_way) | {"surface", "smoothness", "wheelchair", "incline"})
+    except Exception:
+        pass
     path = fetch_osm(bbox, time.time() + LOAD_DEADLINE_S)
     try:
         G0 = ox.graph_from_xml(walk_xml(path), bidirectional=True, simplify=True, retain_all=False)
@@ -1013,7 +1017,7 @@ def load_area(bbox):
             hw = d.get("highway")
             hw = (hw[0] if hw else "") if isinstance(hw, (list, tuple)) else (hw or "")
             best[(u, v)] = (d["length"], d.get("geometry") or LineString([pos[u], pos[v]]), *edge_label(d), hw,
-                            edge_wide(d, hw))
+                            edge_wide(d, hw), edge_access_pen(d, hw))
     keys = list(best)
     lengths = np.array([best[k][0] for k in keys], dtype=float)
     names = [best[k][2] for k in keys]
@@ -1039,6 +1043,7 @@ def load_area(bbox):
         noise = acc / SAMPLES
 
     wide = np.array([best[k][5] for k in keys], dtype=np.float32)
+    accp = np.array([best[k][6] for k in keys], dtype=np.float32)
 
     D = np.full((SAMPLES, len(keys)), MAX_BUF, dtype=np.float32)
     parks_json, n_parks = None, 0
@@ -1082,7 +1087,7 @@ def load_area(bbox):
             "water_json": water_json,
             "node_list": node_list, "xy": np.array([pos[n] for n in node_list]),
             "eu": np.array([nidx[u] for u, v in keys]), "ev": np.array([nidx[v] for u, v in keys]),
-            "names": names, "kinds": kinds, "noise": noise, "wide": wide,
+            "names": names, "kinds": kinds, "noise": noise, "wide": wide, "accp": accp,
             "parks_json": parks_json, "n_parks": n_parks, "n_edges": len(keys)}
 
 
@@ -1099,6 +1104,53 @@ def _water():
         return bool(st.session_state.get("_water", False))
     except Exception:
         return False
+
+
+def _access():
+    """Ist „Barrierefreiheit“ aktiv? (Treppen, steile Stücke und schlechte Beläge werden gemieden)"""
+    try:
+        return bool(st.session_state.get("_access", False))
+    except Exception:
+        return False
+
+
+_UNPAVED = {"sand", "mud", "dirt", "ground", "grass", "gravel", "fine_gravel", "pebblestone", "unpaved", "earth",
+            "woodchips", "compacted", "grass_paver", "rock", "snow", "ice", "clay"}
+_BUMPY = {"cobblestone", "sett", "unhewn_cobblestone", "cobblestone:flattened"}
+_BAD_SMOOTH = {"bad", "very_bad", "horrible", "very_horrible"}
+
+
+def edge_access_pen(d, hw):
+    """Zuschlag (auf die Wegkosten) für Rollstuhl/Rollator/Kinderwagen: Treppen und „wheelchair=no“ praktisch gesperrt,
+    schlechter Belag und starke Steigung teurer. Nur was in OpenStreetMap erfasst ist, kann berücksichtigt werden."""
+    def one(k):
+        v = d.get(k)
+        return (v[0] if isinstance(v, (list, tuple)) and v else v) or ""
+    if hw == "steps" or one("wheelchair") == "no":
+        return 60.0
+    pen = 0.0
+    surf, smooth = str(one("surface")), str(one("smoothness"))
+    if smooth == "impassable":
+        return 60.0
+    if surf in _UNPAVED:
+        pen += 1.5
+    elif surf in _BUMPY:
+        pen += 0.8
+    elif not surf and hw in ("path", "track", "bridleway"):
+        pen += 0.6
+    if smooth in _BAD_SMOOTH:
+        pen += 1.5
+    m = re.match(r"^\s*-?(\d+(?:[.,]\d+)?)\s*%", str(one("incline")))
+    if m:
+        pct = float(m.group(1).replace(",", "."))
+        pen += 2.0 if pct >= 8 else (0.8 if pct >= 6 else 0.0)
+    return min(pen, 60.0)
+
+
+def area_accp(area):
+    """Kostenzuschlag je Kante für Barrierefreiheit (Nullen, wenn der Schalter aus ist)."""
+    a = area.get("accp")
+    return a if (a is not None and _access()) else np.zeros(len(area["lengths"]), dtype=np.float32)
 
 
 def edge_water(area):
@@ -1389,6 +1441,7 @@ def build_loop_path(area, g, ng, lam, o, t, theta, rho, mu=None, wq=0.0):
     nz = np.zeros(len(L)) if nz is None else nz
     wd = area.get("wide")
     wd = np.zeros(len(L)) if wd is None else wd
+    ap = area_accp(area)
     mu = (QUIET if lam > 0 else 0.0) if mu is None else mu
     ax, ay = area["pos"][o]
     cx, cy = ax + rho * math.cos(theta), ay + rho * math.sin(theta)
@@ -1405,7 +1458,7 @@ def build_loop_path(area, g, ng, lam, o, t, theta, rho, mu=None, wq=0.0):
 
         def w(u, v, d, used=used):
             i = d["i"]
-            c = L[i] * (1 + lam * (1 - g[i]) + mu * nz[i] + wq * wd[i])
+            c = L[i] * (1 + lam * (1 - g[i]) + mu * nz[i] + wq * wd[i] + ap[i])
             return c * LOOP_REUSE_PENALTY if (usedm[i] or (u, v) in used or (v, u) in used) else c
 
         p = nx.shortest_path(H, s, e, weight=w)
@@ -2125,6 +2178,7 @@ def solve_levels(area, o, t, buf):
     nz = np.zeros(len(L)) if nz is None else nz
     wd = area.get("wide")
     wd = np.zeros(len(L)) if wd is None else wd
+    ap = area_accp(area)
 
     def run(w):
         path = nx.shortest_path(H, o, t, weight=w)
@@ -2136,9 +2190,9 @@ def solve_levels(area, o, t, buf):
         return {"path": path, "dist": dist, "green": share, "noise": noise, "narrow": narrow}
 
     def cost(lam, mu, wq):
-        return lambda u, v, d: L[d["i"]] * (1 + lam * (1 - g[d["i"]]) + mu * nz[d["i"]] + wq * wd[d["i"]])
+        return lambda u, v, d: L[d["i"]] * (1 + lam * (1 - g[d["i"]]) + mu * nz[d["i"]] + wq * wd[d["i"]] + ap[d["i"]])
 
-    short = run(lambda u, v, d: L[d["i"]])
+    short = run(lambda u, v, d: L[d["i"]] * (1 + ap[d["i"]]))
     out = []
     for name, lam in LEVELS.items():
         mu, wq = level_quiet(name)
@@ -3193,13 +3247,14 @@ def tour_path(area, g, lam, mu, wq, nodes):
     nz = np.zeros(len(L)) if nz is None else nz
     wd = area.get("wide")
     wd = np.zeros(len(L)) if wd is None else wd
+    ap = area_accp(area)
     used, full, marks = set(), [nodes[0]], []
     usedm = np.zeros(len(L), dtype=bool)
     for s_, e in zip(nodes[:-1], nodes[1:]):
         if s_ != e:
             def w(u, v, d, used=used):
                 i = d["i"]
-                c = L[i] * (1 + lam * (1 - g[i]) + mu * nz[i] + wq * wd[i])
+                c = L[i] * (1 + lam * (1 - g[i]) + mu * nz[i] + wq * wd[i] + ap[i])
                 return c * LOOP_REUSE_PENALTY if (usedm[i] or (u, v) in used or (v, u) in used) else c
             p = nx.shortest_path(H, s_, e, weight=w)
             full += p[1:]
@@ -4747,7 +4802,7 @@ def close_map():
 
 # Eingaben der Startseite bleiben beim Wechsel in die Karte und zurück erhalten (Streamlit verwirft sonst
 # den Zustand von Widgets, die in einem Durchlauf nicht gezeichnet werden).
-_KEEP_KEYS = ("page_sel", "water_", "san_", "green_prefer", "green_avoid", "green_size", "level_", "loop_km",
+_KEEP_KEYS = ("page_sel", "water_", "acc_", "san_", "green_prefer", "green_avoid", "green_size", "level_", "loop_km",
               "loop_same", "tour_same", "tour_extra", "n_stops")
 
 
@@ -4799,6 +4854,12 @@ def bump_km(delta):
 
 def _san_carry(old, new):
     """Sanitäroptionen bleiben beim Neuberechnen in der Karte aktiv."""
+    new["access"] = old.get("access", False)
+    if new["access"]:
+        try:
+            access_hint(new)
+        except Exception:
+            pass
     reach = old.get("san_reach")
     if not reach:
         return
@@ -4815,6 +4876,7 @@ def render_map_view():
     st.markdown(MAP_CSS, unsafe_allow_html=True)
     st.session_state["bias"] = gw["p1"]
     st.session_state["_water"] = bool(gw.get("water", False))
+    st.session_state["_access"] = bool(gw.get("access", False))
     dest_new = add_new = None
     with st.container(key="gwtop"):
         if gw["mode"] == "ab":
@@ -4911,6 +4973,26 @@ def render_map_view():
 
 
 # ---------- Startseite
+def access_toggle(prefix):
+    """Schalter „Barrierefreiheit“ (wie Wassernähe): plant ohne Treppen, steile Stücke und schlechte Beläge."""
+    return st.toggle("♿ Barrierefreiheit", key=f"acc_{prefix}", value=False,
+                     help="Plant stufenfrei: Treppen, sehr steile Stücke und schlechte Beläge (Sand, grober Schotter, "
+                          "Kopfsteinpflaster) werden gemieden. Es zählt, was in OpenStreetMap erfasst ist.")
+
+
+def access_hint(view):
+    """Hinweis zur Barrierefreiheit an jeder Routenvariante (im Ersatzmodus ehrlich: nicht prüfbar)."""
+    if not view.get("access"):
+        return view
+    payload = payload_from_html(view["html"])
+    note = (" · ♿ im Ersatzmodus nicht prüfbar, Treppen bitte selbst beachten" if view.get("fallback")
+            else " · ♿ stufenfrei geplant: Treppen und schlechte Beläge gemieden")
+    for o in payload["options"]:
+        o["hint"] = (o.get("hint") or "") + note
+    view["html"] = map_html(payload)
+    return view
+
+
 def san_settings(prefix):
     """Schalter wie bei der Wassernähe. Rückgabe: Reichweite in m (fest 150) oder None."""
     on = st.toggle("🚻 Sanitäroptionen", key=f"san_{prefix}", value=False,
@@ -4934,6 +5016,11 @@ def san_finish(view, reach, ov):
 
 def san_gate(view, reach, ov):
     """Karte öffnen – oder bei fehlenden Toiletten zuerst die Warnung zeigen."""
+    view["access"] = _access()
+    try:
+        access_hint(view)
+    except Exception:
+        pass
     view, wait = san_finish(view, reach, ov)
     if wait:
         st.session_state["san_pending"] = view
@@ -4996,6 +5083,7 @@ def replan_with_stops(view, cands):
     """Toiletten bzw. Gaststätten als Zwischenziele einplanen und neu rechnen (Typ je nach Modus)."""
     stops_new = [_pack(c["lat"], c["lon"], "🚻 " + c["name"] + ("" if c.get("kind") == "pub" else " (Gäste-WC)")) for c in cands]
     st.session_state["_water"] = bool(view.get("water"))
+    st.session_state["_access"] = bool(view.get("access"))
     reach = view.get("san_reach")
     lvl = view.get("level") if view.get("level") in TOUR_LEVELS else "Sehr grün"
     if view["mode"] == "ab":
@@ -5011,6 +5099,11 @@ def replan_with_stops(view, cands):
         new = make_tour_view_safe(view["start"], list(view["stops_v"]) + stops_new[:room], view.get("end_v"),
                                   view["level"], extra_km=view.get("extra_km", 0))
     new["san_reach"] = reach
+    new["access"] = bool(view.get("access"))
+    try:
+        access_hint(new)
+    except Exception:
+        pass
     if reach:
         try:
             add_sanitary(new, reach)
@@ -5132,6 +5225,7 @@ def home_route():
         water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_route", value=False,
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         san_reach = san_settings("route")
+        acc_on = access_toggle("route")
         go = st.button("Route finden", type="primary", use_container_width=True, key="go_ab")
     if not go:
         return
@@ -5140,6 +5234,7 @@ def home_route():
         return
     view = None
     st.session_state["_water"] = bool(water_on)
+    st.session_state["_access"] = bool(acc_on)
     ov = loading_overlay(start_v, water_on)
     with st.status("Route wird vorbereitet …", expanded=True) as status:
         try:
@@ -5169,6 +5264,7 @@ def home_loop():
         water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_loop", value=False,
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         san_reach = san_settings("loop")
+        acc_on = access_toggle("loop")
         go = st.button("Ründchen finden", type="primary", use_container_width=True, key="go_loop")
     if not go:
         return
@@ -5177,6 +5273,7 @@ def home_loop():
         return
     view, holder = None, {}
     st.session_state["_water"] = bool(water_on)
+    st.session_state["_access"] = bool(acc_on)
 
     def prog(f):
         txt = "🔄 Runden in verschiedene Richtungen probieren …"
@@ -5227,6 +5324,7 @@ def home_tour():
         water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_tour", value=False,
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         san_reach = san_settings("tour")
+        acc_on = access_toggle("tour")
         go = st.button("Ründchen mit Zwischenziel finden", type="primary", use_container_width=True, key="go_tour")
     if not go:
         return
@@ -5235,6 +5333,7 @@ def home_tour():
         return
     view = None
     st.session_state["_water"] = bool(water_on)
+    st.session_state["_access"] = bool(acc_on)
     ov = loading_overlay(a_v, water_on)
     with st.status("Runde mit Zwischenzielen wird berechnet …", expanded=True) as status:
         try:
