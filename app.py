@@ -213,7 +213,7 @@ def edge_wide(d, hw):
 
 SAMPLES = 8
 MAX_BUF = 400
-MAX_SPAN_M = 9000
+MAX_SPAN_M = 10000
 M_PER_MIN = 80
 
 LEVELS = {"Schnellste": 0.0, "Leicht grün": 1.5, "Ausgewogen": 4.0,
@@ -723,6 +723,16 @@ def coord_from_text(term):
 
 
 def search_places(term):
+    """Ziel-/Zwischenziel-Suche: zuerst im 10-km-Umfeld des Startpunkts."""
+    return _search_places(term, False)
+
+
+def search_start(term):
+    """Start-Suche: überall in Deutschland, ohne Umkreisgrenze (der Standort dient nur als sanfter Hinweis)."""
+    return _search_places(term, True)
+
+
+def _search_places(term, free):
     """Vorschläge während der Eingabe.
     - "Bahnhof Ehrenfeld" findet Bahnhöfe/Haltestellen mit "Ehrenfeld" im Namen
       (OSM nennt sie oft "Köln-Ehrenfeld", ohne das Wort Bahnhof).
@@ -758,7 +768,7 @@ def search_places(term):
     plz_in = _PLZ.search(term)
     addr_like = bool(plz_in) or bool(re.search(r"\d", term))
     # 1) im 10-km-Umfeld (Spaziergänge bleiben meist nah), 2) danach ohne Gebietsgrenze
-    for boxed in ((True, False) if blat is not None else (False,)):
+    for boxed in ((True, False) if (blat is not None and not free) else (False,)):
         for k, q in enumerate(variants[:7]):
             _add(ask(q, None, boxed), seen, out)
             if len(out) >= 5 or (k >= 3 and out):
@@ -767,12 +777,12 @@ def search_places(term):
             break
     if not out and len(words) > 1:
         for q in (" ".join(words[:-1]), " ".join(words[1:])):
-            _add(ask(q, None, blat is not None), seen, out)
+            _add(ask(q, None, blat is not None and not free), seen, out)
             if out:
                 break
     if not out:
         for q in variants[:3]:
-            for bb in ((blat, blon), (None, None)) if blat is not None else ((None, None),):
+            for bb in ((None, None),) if (free or blat is None) else ((blat, blon), (None, None)):
                 try:
                     out = _nominatim(q, *bb)
                 except Exception:
@@ -781,7 +791,13 @@ def search_places(term):
                     break
             if out:
                 break
-    if bias and out:
+    if bias and out and free:
+        # freie Startsuche: Reihenfolge der Relevanz behalten, Entfernung nur anzeigen, wenn sie überschaubar ist
+        def dist_f(item):
+            la, lo, _ = _unpack(item[1])
+            return dist_m((bias[0], bias[1]), (la, lo))
+        out = [(f"{lab}  ·  {_fmt_dist(dist_f((lab, val)))}" if dist_f((lab, val)) <= 50000 else lab, val) for lab, val in out]
+    elif bias and out:
         def dist_of(item):
             la, lo, _ = _unpack(item[1])
             return dist_m((bias[0], bias[1]), (la, lo))
@@ -5333,7 +5349,8 @@ st.markdown(BASE_CSS, unsafe_allow_html=True)
 PLACEHOLDER = "Straße, Adresse, Café, Restaurant, Geschäft …"
 SEARCH_TIP = ("Tipp: Tippe mindestens 3 Buchstaben, dann erscheinen Vorschläge. "
               "Tippfehler sind okay, es werden ähnliche Orte angezeigt. "
-              "Du kannst auch Adressen einfügen. Gesucht wird zuerst im Umkreis von ca. 10 km.")
+              "Du kannst auch Adressen einfügen. Der Start lässt sich überall in Deutschland setzen (am besten mit Stadt, z. B. „Torstraße Berlin“), "
+              "das Ziel sollte höchstens 10 km vom Start entfernt sein und wird zuerst dort gesucht.")
 
 
 SEARCH_STYLE = {
@@ -5351,10 +5368,11 @@ def place_input(label, key):
     dot = "s" if label.startswith("Start") else "z"
     st.markdown(f'<div class="fld"><i class="dot {dot}"></i>{escape(label)}</div>', unsafe_allow_html=True)
     kw = dict(key=key, placeholder=PLACEHOLDER, clear_on_submit=False)
+    fn = search_start if label.startswith("Start") else search_places
     try:
-        v = st_searchbox(search_places, style_overrides=SEARCH_STYLE, **kw)
+        v = st_searchbox(fn, style_overrides=SEARCH_STYLE, **kw)
     except TypeError:  # ältere Version ohne style_overrides
-        v = st_searchbox(search_places, **kw)
+        v = st_searchbox(fn, **kw)
     return v
 
 
