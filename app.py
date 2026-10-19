@@ -1607,6 +1607,91 @@ def edge_set(path):
     return frozenset((min(a, b), max(a, b)) for a, b in zip(path[:-1], path[1:]))
 
 
+def undouble(area, path, keep=(), target=None, extra_cap=60.0):
+    """Hin-und-zurück-Stücke (Stichstraße: ein Stück hinein und auf demselben Weg wieder heraus) beseitigen.
+    Zwei Möglichkeiten je Stück: (A) kürzen, die Stichstraße entfällt, oder (B) verlängern, ein kurzer Bogen um
+    den Block statt hin und zurück. Bei vorgegebener Länge (target) gewinnt, was näher dran liegt. Knoten in
+    keep (Zwischenziele) bleiben immer erhalten."""
+    H, L = area["H"], area["lengths"]
+    keep = set(keep)
+
+    def elen(a, b):
+        return float(L[H[a][b]["i"]])
+
+    def plen(q):
+        return sum(elen(a, b) for a, b in zip(q[:-1], q[1:]))
+
+    p = list(path)
+    for _ in range(16):
+        hit = None
+        for i in range(1, len(p) - 1):
+            if p[i - 1] != p[i + 1]:
+                continue
+            m = 1
+            while i - m - 1 >= 0 and i + m + 1 < len(p) and p[i - m - 1] == p[i + m + 1]:
+                m += 1
+            stem = p[i - m:i + 1]  # a, ..., t
+            if set(stem[1:]) & keep:
+                continue
+            hit = (i, m, stem)
+            break
+        if hit is None:
+            break
+        i, m, stem = hit
+        a = stem[0]
+        spur = plen(stem)
+        total0 = plen(p)
+        dA = total0 - 2 * spur
+        banned = set(zip(stem[:-1], stem[1:])) | set(zip(stem[1:], stem[:-1]))
+        used = edge_set(p)
+        best = None
+        try:
+            for x in list(H.successors(a)):
+                ex = (min(a, x), max(a, x))
+                if (a, x) in banned or ex in used:
+                    continue
+
+                def w(u, v, d, x=x):
+                    if (u, v) in banned or (min(u, v), max(u, v)) in used or (u, v) == (x, a):
+                        return None
+                    return d.get("length", 1.0) if "length" in d else float(L[d["i"]])
+
+                try:
+                    back = nx.shortest_path(H, x, a, weight=w)
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    continue
+                cyc = [a] + back
+                if len(set(cyc[:-1])) != len(cyc) - 1:
+                    continue
+                cl = plen(cyc)
+                if cl <= 2 * spur + extra_cap and (best is None or cl < best[0]):
+                    best = (cl, cyc)
+        except Exception:
+            best = None
+        use_b = False
+        if best is not None and target:
+            dB = total0 - 2 * spur + best[0]
+            use_b = abs(dB - target) < abs(dA - target) - 20.0
+        if use_b:
+            p = p[:i - m] + best[1] + p[i + m + 1:]
+        else:
+            p = p[:i - m + 1] + p[i + m + 1:]
+    return p
+
+
+def marks_for(path, nodes):
+    """Positionen der Zwischenziele (nodes[1:-1]) in path, in Reihenfolge."""
+    marks, pos = [], 0
+    for n in nodes[1:-1]:
+        try:
+            k = path.index(n, pos)
+        except ValueError:
+            k = min(pos, len(path) - 1)
+        marks.append(k)
+        pos = k
+    return marks
+
+
 def loop_stats(area, g, path):
     H, Ls = area["H"], area["lengths"]
     pairs = list(zip(path[:-1], path[1:]))
@@ -1642,6 +1727,7 @@ def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None):
         for _ in range(3):
             try:
                 path = build_loop_path(area, g, ng, lam, o, t, theta, rho, *(quiet or (None, 0.0)))
+                path = undouble(area, path, target=target)
             except (nx.NetworkXNoPath, nx.NodeNotFound):
                 break
             st_ = loop_stats(area, g, path)
@@ -3110,9 +3196,22 @@ def osrm_request(points, alternatives=False):
         params["alternatives"] = "3"
     if len(points) > 2:
         params["continue_straight"] = "true"
-    r = requests.get(OSRM_FOOT + coords, headers=UA, timeout=10, params=params)
-    r.raise_for_status()
-    js = r.json()
+    js, err = None, None
+    for attempt in range(3):  # der freie Routenserver ist gelegentlich kurz überlastet (429/50x/Zeitüberschreitung)
+        try:
+            r = requests.get(OSRM_FOOT + coords, headers=UA, timeout=12, params=params)
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise RuntimeError(f"Routenserver antwortet mit {r.status_code}")
+            r.raise_for_status()
+            js = r.json()
+            break
+        except ValueError:
+            raise
+        except Exception as e:
+            err = e
+            time.sleep(1.5 + attempt)
+    if js is None:
+        raise RuntimeError(f"Der Routenserver antwortet gerade nicht ({type(err).__name__}).")
     if js.get("code") != "Ok" or not js.get("routes"):
         raise ValueError("Für diese Punkte habe ich keinen Fußweg gefunden.")
     return js["routes"]
@@ -3182,7 +3281,7 @@ def scan_loop_candidates(sa, p1, p2, target, buf, progress=None):
         sc = scan_score(sa, _route_ll(rt), buf)
         return {"route": rt, **sc}
 
-    cands, first = [], []
+    cands, first, errs = [], [], []
     bearings = [2 * math.pi * k / 6 for k in range(6)]
     rho0 = target / (2 * math.pi * 1.3)
     total_steps = len(bearings) + 3
@@ -3192,10 +3291,14 @@ def scan_loop_candidates(sa, p1, p2, target, buf, progress=None):
             c["theta"], c["rho"] = th, rho0
             cands.append(c)
             first.append(c)
-        except Exception:
-            pass
+        except Exception as e:
+            errs.append(e)
+            if len(errs) >= 3 and not cands:  # Routenserver offenbar down: nicht weiter warten
+                break
         if progress:
             progress((k + 1) / total_steps)
+    if not cands and errs:
+        raise ValueError(f"{errs[-1]} Bitte in ein bis zwei Minuten noch einmal versuchen.")
     # die drei vielversprechendsten Richtungen auf die Wunschlänge nachjustieren
     first.sort(key=lambda c: -(c["green"] - REP_W * c["rep"] - abs(c["dist"] / target - 1)))
     for j, c in enumerate(first[:3]):
@@ -3422,6 +3525,12 @@ def tour_path(area, g, lam, mu, wq, nodes):
             used.update(zip(p[:-1], p[1:]))
             mark_used(area, usedm, p)
         marks.append(len(full) - 1)
+    try:
+        cleaned = undouble(area, full, keep=set(nodes))
+        if len(cleaned) != len(full):
+            return cleaned, marks_for(cleaned, nodes)
+    except Exception:
+        pass
     return full, marks[:-1]
 
 
@@ -4831,6 +4940,76 @@ def pick_facts(lat=None, lon=None, water=False, month=None, seen=None):
     return out
 
 
+# ---- Eigene Stadtsilhouetten (immer verfügbar, auch ohne Netz): liegen unter dem Foto und springen ein,
+# wenn kein Foto geladen werden kann.
+SKY_COL = ("#cfe0ec", "#e8eef0", "#f4efe6")
+
+
+def _landmark(city):
+    """SVG-Teile des Wahrzeichens (Grundlinie y=430, Mitte x=450)."""
+    c = "#6f8798"
+    if city == "Köln":  # Dom mit zwei Türmen
+        return (f'<rect x="330" y="300" width="240" height="130" fill="{c}"/>'
+                f'<polygon points="330,300 450,250 570,300" fill="{c}"/>'
+                + "".join(f'<polygon points="{x},300 {x + 24},60 {x + 48},300" fill="{c}"/>'
+                          f'<rect x="{x - 4}" y="240" width="56" height="190" fill="{c}"/>' for x in (340, 512))
+                + "".join(f'<rect x="{x}" y="{y}" width="8" height="28" fill="#e8eef0" opacity=".5"/>' for x in (356, 528) for y in (290, 340)))
+    if city in ("Düsseldorf", "Stuttgart"):  # Fernsehturm
+        return (f'<polygon points="438,430 450,150 462,430" fill="{c}"/>'
+                f'<ellipse cx="450" cy="190" rx="34" ry="14" fill="{c}"/><rect x="444" y="190" width="12" height="40" fill="{c}"/>'
+                f'<rect x="448" y="40" width="4" height="120" fill="{c}"/>')
+    if city == "Berlin":
+        return (f'<polygon points="438,430 450,170 462,430" fill="{c}"/><circle cx="450" cy="170" r="30" fill="{c}"/>'
+                f'<rect x="448" y="40" width="4" height="100" fill="{c}"/>')
+    if city in ("Dresden", "Aachen"):  # Kuppelbau (Frauenkirche) bzw. Dom mit Kuppel
+        return (f'<rect x="350" y="320" width="200" height="110" fill="{c}"/>'
+                f'<path d="M365 320 Q450 150 535 320 Z" fill="{c}"/>'
+                f'<rect x="440" y="120" width="20" height="60" fill="{c}"/><polygon points="438,120 450,60 462,120" fill="{c}"/>'
+                + "".join(f'<rect x="{x}" y="250" width="22" height="70" fill="{c}"/>'
+                          f'<polygon points="{x - 2},250 {x + 11},212 {x + 24},250" fill="{c}"/>' for x in (330, 548)))
+    if city == "München":  # zwei Türme mit Hauben
+        return (f'<rect x="340" y="290" width="220" height="140" fill="{c}"/>'
+                + "".join(f'<rect x="{x}" y="170" width="50" height="130" fill="{c}"/>'
+                          f'<path d="M{x - 4} 170 Q{x + 25} 90 {x + 54} 170 Z" fill="{c}"/>'
+                          f'<rect x="{x + 22}" y="70" width="6" height="40" fill="{c}"/>' for x in (350, 500)))
+    if city == "Frankfurt":  # Hochhäuser
+        return "".join(f'<rect x="{x}" y="{y}" width="{w}" height="{430 - y}" fill="{c}"/>'
+                       for x, y, w in ((330, 200, 50), (390, 110, 56), (456, 160, 50), (516, 230, 44), (300, 290, 34)))
+    # Kirchturm mit Spitze (Rathaus/Kirche) als Allgemeinmotiv
+    return (f'<rect x="410" y="210" width="80" height="220" fill="{c}"/><polygon points="404,210 450,90 496,210" fill="{c}"/>'
+            f'<rect x="446" y="40" width="8" height="60" fill="{c}"/><rect x="300" y="320" width="110" height="110" fill="{c}"/>'
+            f'<polygon points="296,320 355,270 414,320" fill="{c}"/><rect x="490" y="340" width="120" height="90" fill="{c}"/>')
+
+
+def city_art(city):
+    """Data-URI einer weichen Stadtsilhouette mit Wahrzeichen, Fluss und Bäumen."""
+    rnd = random.Random(sum(ord(ch) for ch in (city or "x")))
+    far = ""
+    x = -20
+    while x < 920:
+        w, h = rnd.randint(34, 80), rnd.randint(50, 150)
+        far += f'<rect x="{x}" y="{430 - h}" width="{w}" height="{h}" fill="#9db0bf" opacity=".55"/>'
+        x += w + rnd.randint(0, 6)
+    river = ""
+    if city in ("Köln", "Düsseldorf", "Bonn", "Frankfurt", "Dresden", "Hamburg", "Bremen"):
+        river = ('<rect x="0" y="430" width="900" height="70" fill="#a9c4d6"/>'
+                 + "".join(f'<rect x="{rnd.randint(0, 800)}" y="{440 + 11 * k}" width="{rnd.randint(60, 140)}" height="3" '
+                           f'fill="#e8f0f4" opacity=".7"/>' for k in range(6)))
+    trees = ""
+    for k in range(14):
+        tx = rnd.randint(-20, 920)
+        ty = 500 + rnd.randint(0, 70)
+        r = rnd.randint(26, 52)
+        trees += (f'<circle cx="{tx}" cy="{ty}" r="{r}" fill="#9DB38A" opacity=".85"/>'
+                  f'<circle cx="{tx + r // 2}" cy="{ty - r // 3}" r="{int(r * .7)}" fill="#7f9c6e" opacity=".85"/>')
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 600" preserveAspectRatio="xMidYMid slice">'
+           f'<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{SKY_COL[0]}"/>'
+           f'<stop offset=".6" stop-color="{SKY_COL[1]}"/><stop offset="1" stop-color="{SKY_COL[2]}"/></linearGradient></defs>'
+           f'<rect width="900" height="600" fill="url(#g)"/>{far}{_landmark(city)}'
+           f'<rect x="0" y="430" width="900" height="170" fill="#c9d6bd"/>{river}{trees}</svg>')
+    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()
+
+
 _BG_CACHE = {}  # gerundete Koordinaten -> (Stadt, Bild-URL oder "")
 _BG_LOCK = threading.Lock()
 
@@ -4947,11 +5126,12 @@ class Overlay:
             seen = None
         self.facts = pick_facts(lat, lon, water, seen=seen)
         self.bg = ""
+        self.city = ""
         self._bgt = None
         if lat is not None:
             def work():
                 try:
-                    self.bg = city_background(lat, lon)[1]
+                    self.city, self.bg = city_background(lat, lon)
                 except Exception:
                     pass
             self._bgt = threading.Thread(target=work, daemon=True)
@@ -4975,19 +5155,28 @@ class Overlay:
             html = (OVERLAY_HTML.replace("__FACTCSS__", css + self._bg_css()).replace("__LOGO__", logo)
                     .replace("__STAGE__", escape(self.stage)).replace("__FACTS__", facts)
                     .replace("__LABEL__", "Wusstest du?")
-                    .replace("__CITYBG__", self._bg_html()).replace("__BGCLS__", "hasbg" if self._bg_css() else ""))
+                    .replace("__CITYBG__", self._bg_html()).replace("__BGCLS__", "hasbg"))
             self.ph.markdown(html, unsafe_allow_html=True)
         except Exception:
             pass
 
-    def _bg_css(self):
+    def _photo(self):
         u = self.bg or ""
-        if not u.startswith("https://upload.wikimedia.org/") or any(c in u for c in "\"'<> \\{};"):
-            return ""
-        return f'#gwload .cbg{{background-image:url("{u}")}}'
+        if u.startswith("https://upload.wikimedia.org/") and not any(c in u for c in "\"'<> \\{};"):
+            return u
+        return ""
+
+    def _bg_css(self):
+        """Foto (falls vorhanden) über der eigenen Silhouette; die Silhouette ist immer da."""
+        layers = []
+        if self._photo():
+            layers.append(f'url("{self._photo()}")')
+        layers.append(f'url("{city_art(self.city)}")')
+        return "#gwload .cbg{background-image:" + ",".join(layers) + "}"
 
     def _bg_html(self):
-        return "<div class='cbg'></div><div class='cmilk'></div><div class='credit'>Foto: Wikimedia Commons</div>" if self._bg_css() else ""
+        credit = "<div class='credit'>Foto: Wikimedia Commons</div>" if self._photo() else ""
+        return "<div class='cbg'></div><div class='cmilk'></div>" + credit
 
     def log(self, msg):
         """Schritt anzeigen (und weiter ins versteckte Statusfeld schreiben)."""
