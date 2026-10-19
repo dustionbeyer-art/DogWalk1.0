@@ -4347,10 +4347,18 @@ def tile_pois(option_coords, reach):
     Vektorkacheln von OpenFreeMap (POI-Ebene). Liefert Einträge im Format von classify_sanitary."""
     s_, w_, n_, e_ = _san_bbox(option_coords, reach)
     tpl = _ofm_template()
-    x0, y0 = _tile_of(n_, w_, VT_ZOOM)
-    x1, y1 = _tile_of(s_, e_, VT_ZOOM)
-    tiles = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
-    if len(tiles) > 40:
+    # nur die Kacheln, die die Route(n) samt Randstreifen berühren (nicht das ganze Rechteck)
+    dlat = reach / 110540.0
+    dlon = dlat / max(math.cos(math.radians((s_ + n_) / 2)), 0.3)
+    tset = set()
+    for coords in option_coords:
+        a = np.asarray(coords, float)
+        for la, lo in a[::max(1, len(a) // 400)]:
+            for dy in (-dlat, 0.0, dlat):
+                for dx in (-dlon, 0.0, dlon):
+                    tset.add(_tile_of(float(la) + dy, float(lo) + dx, VT_ZOOM))
+    tiles = sorted(tset)
+    if len(tiles) > 60:
         raise ValueError("Gebiet zu groß")
     with ThreadPoolExecutor(max_workers=6) as ex:
         datas = list(ex.map(lambda t: _fetch_tile(tpl, VT_ZOOM, t[0], t[1]), tiles))
@@ -4403,6 +4411,50 @@ def sweep_gastro(coords, step_m=450.0, max_pts=12):
             try:
                 for la, lo, name, *_ in f.result():
                     if name:
+                        out.append({"kind": "gastro", "lat": la, "lon": lo, "name": name, "info": "", "kv": "restaurant"})
+            except Exception:
+                pass
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _sweep_photon_point(lat, lon, word, tag):
+    r = requests.get("https://photon.komoot.io/api/", headers=UA, timeout=6,
+                     params={"q": word, "lat": lat, "lon": lon, "limit": 25, "lang": "de", "osm_tag": tag,
+                             "location_bias_scale": 0.1})
+    r.raise_for_status()
+    out = []
+    for f in r.json().get("features", []):
+        pr = f.get("properties", {})
+        co = (f.get("geometry") or {}).get("coordinates") or []
+        if pr.get("name") and len(co) == 2:
+            out.append((float(co[1]), float(co[0]), pr["name"]))
+    return out
+
+
+def sweep_photon(coords, step_m=450.0, max_pts=14):
+    """Zusätzliche Quelle (Photon): an Punkten entlang der Route nach Restaurants, Cafés und Kneipen im Umfeld fragen."""
+    a = np.asarray(coords, float)
+    lat0, lon0, kx, ky = _route_frame(coords)
+    X, Y = (a[:, 1] - lon0) * kx, (a[:, 0] - lat0) * ky
+    cum = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(X), np.diff(Y)))])
+    total = float(cum[-1])
+    n = max(2, min(max_pts, int(total // step_m) + 1))
+    pts = []
+    for sdist in np.linspace(0, total, n):
+        k = min(int(np.searchsorted(cum, sdist)), len(a) - 1)
+        pts.append((round(float(a[k, 0]), 3), round(float(a[k, 1]), 3)))
+    jobs = [(la, lo, w, t) for la, lo in pts
+            for w, t in (("Restaurant", "amenity:restaurant"), ("Café", "amenity:cafe"), ("Kneipe", "amenity:pub"))]
+    out, seen = [], set()
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = [ex.submit(_sweep_photon_point, *j) for j in jobs]
+        for f in futs:
+            try:
+                for la, lo, name in f.result():
+                    k = (_norm_name(name), round(la, 4), round(lo, 4))
+                    if k not in seen:
+                        seen.add(k)
                         out.append({"kind": "gastro", "lat": la, "lon": lo, "name": name, "info": "", "kv": "restaurant"})
             except Exception:
                 pass
@@ -4502,11 +4554,33 @@ def add_sanitary(view, reach=150, log=lambda *_: None):
     opts = payload["options"]
     default = int(payload.get("default") or 0)
     log("🚻 Toiletten entlang der Route suchen")
-    failed, items = False, []
-    try:
-        items = classify_sanitary(fetch_sanitary([o["coords"] for o in opts], SAN_WIDE + 60))
-    except Exception:
-        failed = True
+    coords_all = [o["coords"] for o in opts]
+    failed_op, items, items_t = False, [], []
+
+    def _op():
+        return classify_sanitary(fetch_sanitary(coords_all, SAN_WIDE + 60))
+
+    def _tiles():
+        return tile_pois(coords_all, SAN_WIDE + 60)
+
+    # Zwei voneinander unabhängige Quellen gleichzeitig: Overpass (Toiletten + Gaststätten) und die POI-Ebene der
+    # Vektorkacheln (Gaststätten). Fällt eine aus oder ist sie lückenhaft, trägt die andere.
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_op, f_t = ex.submit(_op), ex.submit(_tiles)
+        try:
+            items = f_op.result()
+        except Exception:
+            failed_op = True
+        try:
+            items_t = f_t.result()
+        except Exception:
+            items_t = []
+    known = {(_norm_name(it["name"]), round(it["lat"], 3), round(it["lon"], 3)) for it in items if it["kind"] == "gastro"}
+    for it in items_t:
+        if it["kind"] == "gastro" and (_norm_name(it["name"]), round(it["lat"], 3), round(it["lon"], 3)) in known:
+            continue
+        items.append(it)
+    failed = failed_op and not items_t
 
     def measure(items_):
         pts_ = [(it["lat"], it["lon"]) for it in items_]
@@ -4517,18 +4591,26 @@ def add_sanitary(view, reach=150, log=lambda *_: None):
         return res
 
     per_wide = measure(items)
-    if not any(m["kind"] in ("pub", "gastro") for m in per_wide[default]):
-        log("🍽️ Zweite Kartenquelle wird befragt")
+
+    def n_gastro():
+        return sum(1 for m in per_wide[default] if m["kind"] in ("cust", "gastro", "pub") and m["d"] <= SAN_GASTRO_REACH)
+
+    a_ = np.asarray(opts[default]["coords"], float)
+    _lat0, _, _kx, _ky = _route_frame(opts[default]["coords"])
+    route_m = float(np.hypot(np.diff(a_[:, 1]) * _kx, np.diff(a_[:, 0]) * _ky).sum())
+    # Auf einer Stadtstrecke liegen viele Lokale. Sind es auffällig wenige, ist eine Quelle lückenhaft: weitere befragen.
+    if n_gastro() < max(5, route_m / 1000 * 4):
+        log("🍽️ Weitere Quelle: Cafés und Restaurants entlang der Route")
         try:
-            extra = tile_pois([o["coords"] for o in opts], SAN_WIDE + 60)
+            extra = sweep_photon(opts[default]["coords"])
             if extra:
                 failed = False
                 items = items + extra
                 per_wide = measure(items)
         except Exception:
             pass
-    if not any(m["kind"] in ("pub", "gastro") for m in per_wide[default]):
-        log("🍽️ Keine Treffer im Kartenabruf, ich laufe die Route nach Cafés und Restaurants ab")
+    if n_gastro() < max(3, route_m / 1000 * 2):
+        log("🍽️ Noch eine Quelle: ich laufe die Route nach Cafés und Restaurants ab")
         try:
             extra = sweep_gastro(opts[default]["coords"])
             if extra:
