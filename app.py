@@ -4542,6 +4542,7 @@ def _near_route(coords, pts, reach):
     return [(float(d[k]), float(s[idx[k]])) for k in range(len(pts))]
 
 
+SAN_SHORT_M = 3000  # Strecken bis hierher brauchen nur eine Toilette (etwa in der Mitte)
 SAN_GASTRO_REACH = 250  # so weit abseits der Route zählt ein Café/Restaurant als Toilettenmöglichkeit (m)
 SAN_WIDE = 500  # so weit abseits der Route werden Ausweichziele (Toilette/Gaststätte) angeboten
 SAN_MAX_STOPS = 7
@@ -4556,6 +4557,10 @@ def san_zones(total, stop_s):
     for i, (lo, hi) in enumerate(zip(bounds, bounds[1:])):
         seg = hi - lo
         if seg < 500:
+            continue
+        if seg <= SAN_SHORT_M:  # bis 3 km reicht eine Toilette etwa in der Mitte
+            label = f"Abschnitt {i + 1} · Mitte" if multi else "Mitte der Route"
+            zones.append({"label": label, "center": lo + seg / 2.0, "tol": min(700.0, max(300.0, 0.25 * seg))})
             continue
         for k, frac in ((1, "⅓"), (2, "⅔")):
             label = (f"Abschnitt {i + 1} · {frac}" if multi else f"{frac} der Route")
@@ -4667,12 +4672,12 @@ def add_sanitary(view, reach=150, log=lambda *_: None):
         elif not zs:
             note = " · 🚻 kurze Strecke, keine Toilette nötig"
         elif ok == len(zs) and n_pz == len(zs):
-            note = f" · 🚻 Toilette je Drittel vorhanden ({ok}/{len(zs)})"
+            note = f" · 🚻 Toilette auf der Route vorhanden ({ok}/{len(zs)})"
         elif ok == len(zs):
-            note = (f" · 🚻 Toilette je Drittel: {n_pz} öffentlich, {ok - n_pz} über Cafés/Restaurants "
+            note = (f" · 🚻 Toilette auf der Route: {n_pz} öffentlich, {ok - n_pz} über Cafés/Restaurants "
                     f"(nur für Gäste)")
         else:
-            note = f" · 🚻 Toiletten an {ok} von {len(zs)} Stellen (je Drittel)"
+            note = f" · 🚻 Toiletten an {ok} von {len(zs)} Stellen"
         o["hint"] = (o.get("hint") or "") + note
     zones = all_zones[default]
     wide_def = per_wide[default]
