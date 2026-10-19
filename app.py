@@ -1615,6 +1615,11 @@ html,body{margin:0;height:100%;overflow:hidden;font-family:system-ui,-apple-syst
 button{font-family:inherit;cursor:pointer}
 #banner{position:fixed;z-index:1000;top:calc(var(--top) + 8px);left:10px;right:10px;max-width:620px;margin:0 auto;display:none;gap:12px;align-items:center;background:var(--moss);color:#FBF7EE;border-radius:16px;padding:10px 14px;box-shadow:0 6px 18px rgba(60,50,30,.3)}
 body.nav #banner{display:flex}
+#thanks{position:fixed;z-index:1100;left:16px;right:16px;top:46%;transform:translateY(-50%);max-width:400px;margin:0 auto;display:none;background:var(--paper);border:1px solid var(--line);border-radius:20px;padding:20px 20px 16px;box-shadow:0 14px 40px rgba(60,50,30,.35);text-align:center}
+#thanks.on{display:block;animation:thxin .9s cubic-bezier(.25,.1,.25,1) both}
+#thx{font-size:1.08rem;line-height:1.45;color:var(--text);margin-bottom:14px}
+#thxb{border:0;border-radius:12px;background:var(--moss);color:#FBF7EE;padding:10px 22px;font-size:1rem}
+@keyframes thxin{0%{opacity:0;transform:translateY(-46%)}100%{opacity:1;transform:translateY(-50%)}}
 #banner.off{background:#B07A35}#banner.done{background:#3F5B3A}
 #ico{font-size:36px;line-height:1;width:46px;text-align:center;flex:none}
 #dist{font-size:1.5rem;font-weight:700;line-height:1.1}
@@ -1663,6 +1668,7 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
 </style></head><body>
 <div id="map"></div>
 <div id="clouds"></div>
+<div id="thanks"><div id="thx"></div><button id="thxb">Danke, gern</button></div>
 <div id="banner"><div id="ico">🧭</div><div><div id="dist"></div><div id="ins"></div></div></div>
 <div id="side"><button id="layers" title="Kartenstil wechseln">🗺️</button><button id="sat" title="Satellit / Luftbild">🛰️</button><button id="fit" title="Ganze Route zeigen">⤢</button><button id="wcbtn" title="Toiletten ein-/ausblenden" style="display:none">🚻</button></div>
 <div id="sheet">
@@ -1906,8 +1912,35 @@ function snap(xy, from, windowed) {
   }
   return best || {i: 0, off: 0, along: 0};
 }
+const THX_WALK = [
+  'Geschafft! Dein Körper sagt Danke: Grün senkt den Puls und hebt die Laune.',
+  'Schön gewesen. Ein Weg im Grünen ist Balsam für Kopf und Beine.',
+  'Frische Luft getankt, Akku geladen. Mehr Grün, mehr Gelassenheit.',
+  'Deine Beine sind zufrieden, dein Kopf auch. Das war grün gedacht.',
+  'Ziel erreicht. Lunge, Herz und Laune klatschen leise im Hintergrund.',
+  'Danke fürs Grünwandern! Jeder Schritt zwischen Bäumen tut dir gut.',
+  'Gut gemacht. Der Weg war grün, jetzt darfst du auf dem Sofa angeben.',
+  'Schon ein paar Minuten im Grünen entspannen messbar. Du hast mehr geschafft.'];
+const THX_GREEN = [
+  'Angekommen! Jetzt viel Spaß im Grün. Schuhe aus, wenn der Rasen es erlaubt.',
+  'Da bist du. Hier darf getrödelt, getobt und gestaunt werden.',
+  'Willkommen im Grünen! Für Bänke, Enten und gute Laune ist ab jetzt Zeit.',
+  'Ziel erreicht. Ab hier zählt nur noch Spaß. Viel Freude im Grün!',
+  'Grün erreicht. Tief durchatmen, losziehen, Spaß haben.',
+  'Geschafft, jetzt beginnt der schöne Teil. Viel Spaß da draußen!'];
+function showThanks() {
+  const list = D.kind === 'green' ? THX_GREEN : THX_WALK;
+  let i = Math.floor(Math.random() * list.length), last = -1;
+  try { last = +(localStorage.getItem('gw_thx_' + (D.kind || 'walk')) || -1); } catch (e) {}
+  if (i === last) i = (i + 1) % list.length;
+  try { localStorage.setItem('gw_thx_' + (D.kind || 'walk'), String(i)); } catch (e) {}
+  $('thx').textContent = list[i];
+  $('thanks').classList.add('on');
+}
+$('thxb').addEventListener('click', () => $('thanks').classList.remove('on'));
 function finish() {
   finished = true; stopWatch();
+  setTimeout(showThanks, 1800);
   banner('done', '🏁', 'Geschafft!', steps[steps.length - 1].t); say(steps[steps.length - 1].t);
   $('rem').textContent = 'Ziel erreicht'; $('prog').firstElementChild.style.width = '100%';
 }
@@ -1975,7 +2008,7 @@ function enterNav() {
   banner('', '📡', '…', 'Standort wird gesucht');
 }
 function exitNav() {
-  stopWatch(); navOn = false; finished = false;
+  stopWatch(); navOn = false; finished = false; $('thanks').classList.remove('on');
   document.body.classList.remove('nav'); $('go').textContent = GO;
   if (!map.hasLayer(startPin)) startPin.addTo(map);
   [userDot, userAcc, userCone].forEach(l => { if (map.hasLayer(l)) map.removeLayer(l); });
@@ -3716,7 +3749,7 @@ def green_view(start_v, g, prefer, avoid):
     opt = _option(nav, "Schnellste", f"{fmt_km(nav['total'])} · {mins} min", hint,
                   [["Länge", fmt_km(nav["total"])], ["Dauer", f"{mins} min"], ["Fläche", fmt_ha(g["ha"])],
                    ["Passt zu", " ".join(GREEN_ICON[c] for c in g["counts"]) or "–"]])
-    payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=None,
+    payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=None, kind="green",
                    options=[opt], default=0, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
             "start": start_v, "dest": _pack(p2[0], p2[1], t2), "area": None, "bbox": None, "buf": 150}
@@ -4737,11 +4770,18 @@ def restore_widgets():
 
 
 BACK_CSS = """<style>
-@keyframes gwback{0%{opacity:1}100%{opacity:0;visibility:hidden}}
+@keyframes gwback{0%{opacity:1}35%{opacity:.85}100%{opacity:0;visibility:hidden}}
+@keyframes gwbackin{0%{opacity:0;transform:translateY(8px)}100%{opacity:1;transform:none}}
 .stApp::after{content:"";position:fixed;inset:0;background:#F3EEE5;z-index:99999;pointer-events:none;
- animation:gwback .65s cubic-bezier(.3,.1,.2,1) forwards}
-@media (prefers-reduced-motion:reduce){.stApp::after{display:none}}
+ animation:gwback 1.25s cubic-bezier(.4,0,.2,1) forwards}
+.block-container{animation:gwbackin 1.1s cubic-bezier(.25,.1,.25,1) both}
+@media (prefers-reduced-motion:reduce){.stApp::after{display:none}.block-container{animation:none}}
 </style>"""
+
+
+def back_fx():
+    if st.session_state.pop("_back", False):
+        st.markdown(BACK_CSS, unsafe_allow_html=True)
 
 
 def set_retry():
@@ -4903,6 +4943,7 @@ def san_gate(view, reach, ov):
 
 
 def render_san_pending():
+    back_fx()
     view = st.session_state["san_pending"]
     san = view.get("san", {})
     reach = san.get("reach", 150)
@@ -4938,13 +4979,11 @@ def render_san_pending():
         try:
             with st.spinner("Route mit Toiletten-Stopps wird berechnet …"):
                 new = replan_with_stops(view, chosen)
-            st.session_state.pop("san_pending", None)
             open_map(new)
             st.rerun()
         except Exception as e:
             st.error(f"Einplanen nicht möglich: {e}")
     if c2.button("Route trotzdem anzeigen", use_container_width=True, key="san_show"):
-        st.session_state.pop("san_pending", None)
         open_map(view)
         st.rerun()
     if c3.button("Abbrechen", use_container_width=True, key="san_cancel"):
@@ -5043,6 +5082,7 @@ def home_green():
 
 def render_green_pending():
     """Wünsche passen nicht alle zusammen: freundlich erklären und 2–3 Vorschläge zur Auswahl stellen."""
+    back_fx()
     gp = st.session_state["green_pending"]
     prefer_n, avoid_n = gp["wishes"]
     st.markdown("### Das passt für dich")
@@ -5058,10 +5098,13 @@ def render_green_pending():
         else:
             st.info("♿ Für Barrierefreiheit gibt es in OpenStreetMap oft keine Angaben. Ich konnte keine Fläche "
                     "sicher bestätigen. Die Vorschläge zeigen, was sonst am besten passt.")
+    dmin = min(o["d"] for o in opts)
     for i, g in enumerate(opts):
         with st.container(border=True):
             tag = "Beste Gesamtpassung" if i == 0 else f"Alternative {i}"
             st.markdown(f"**{tag}: {g['name']}** · {fmt_ha(g['ha'])} · ca. {_fmt_dist(g['d'])} entfernt")
+            if len(opts) > 1 and g["d"] <= dmin and any(o["d"] > dmin * 1.05 for o in opts):
+                st.markdown("✓ Kürzeste Entfernung")
             for t in g["ok"]:
                 st.markdown(f"✓ {t}")
             for t in g["dev"]:
@@ -5071,7 +5114,6 @@ def render_green_pending():
                 try:
                     with st.spinner("Weg wird berechnet …"):
                         view = green_view(gp["start_v"], g, gp["prefer"], gp["avoid"])
-                    st.session_state.pop("green_pending", None)
                     open_map(view)
                     st.rerun()
                 except Exception as e:
@@ -5209,8 +5251,7 @@ def home_tour():
 def render_home():
     restore_widgets()
     snap_widgets()
-    if st.session_state.pop("_back", False):
-        st.markdown(BACK_CSS, unsafe_allow_html=True)
+    back_fx()
     logo = base64.b64encode(LOGO_SVG.encode()).decode()
     st.markdown('<div class="hero"><div class="ico"><img src="data:image/svg+xml;base64,' + logo +
                 '" width="46" height="46" alt=""></div><div><h1>GreenWalker</h1>'
