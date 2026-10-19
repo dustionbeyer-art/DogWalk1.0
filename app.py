@@ -1670,6 +1670,8 @@ button{font-family:inherit;cursor:pointer}
 body.nav #banner{display:flex}
 #thanks{position:fixed;z-index:1100;left:16px;right:16px;top:46%;transform:translateY(-50%);max-width:400px;margin:0 auto;display:none;background:var(--paper);border:1px solid var(--line);border-radius:20px;padding:20px 20px 16px;box-shadow:0 14px 40px rgba(60,50,30,.35);text-align:center}
 #thanks.on{display:block;animation:thxin .9s cubic-bezier(.25,.1,.25,1) both}
+#sheet,#banner{transition:opacity .7s ease}
+body.fin #sheet,body.fin #banner,body.thx #side{opacity:0;pointer-events:none}
 #thx{font-size:1.08rem;line-height:1.45;color:var(--text);margin-bottom:14px}
 #thxb{border:0;border-radius:12px;background:var(--moss);color:#FBF7EE;padding:10px 22px;font-size:1rem}
 @keyframes thxin{0%{opacity:0;transform:translateY(-46%)}100%{opacity:1;transform:translateY(-50%)}}
@@ -1981,7 +1983,15 @@ const THX_GREEN = [
   'Ziel erreicht. Ab hier zählt nur noch Spaß. Viel Freude im Grün!',
   'Grün erreicht. Tief durchatmen, losziehen, Spaß haben.',
   'Geschafft, jetzt beginnt der schöne Teil. Viel Spaß da draußen!'];
+function doneFlag(on) {  // merkt sich im Adressfeld der App: Strecke beendet (Python liest es beim Zurückgehen)
+  try {
+    const u = new parent.URL(parent.location.href);
+    if (on) u.searchParams.set('gwdone', '1'); else u.searchParams.delete('gwdone');
+    parent.history.replaceState(null, '', u.toString());
+  } catch (e) {}
+}
 function showThanks() {
+  document.body.classList.add('fin', 'thx'); doneFlag(true);
   const list = D.kind === 'green' ? THX_GREEN : THX_WALK;
   let i = Math.floor(Math.random() * list.length), last = -1;
   try { last = +(localStorage.getItem('gw_thx_' + (D.kind || 'walk')) || -1); } catch (e) {}
@@ -1990,7 +2000,7 @@ function showThanks() {
   $('thx').textContent = list[i];
   $('thanks').classList.add('on');
 }
-$('thxb').addEventListener('click', () => $('thanks').classList.remove('on'));
+$('thxb').addEventListener('click', () => { $('thanks').classList.remove('on'); document.body.classList.remove('thx'); });
 function finish() {
   finished = true; stopWatch();
   setTimeout(showThanks, 1800);
@@ -2062,6 +2072,7 @@ function enterNav() {
 }
 function exitNav() {
   stopWatch(); navOn = false; finished = false; $('thanks').classList.remove('on');
+  document.body.classList.remove('fin', 'thx'); doneFlag(false);
   document.body.classList.remove('nav'); $('go').textContent = GO;
   if (!map.hasLayer(startPin)) startPin.addTo(map);
   [userDot, userAcc, userCone].forEach(l => { if (map.hasLayer(l)) map.removeLayer(l); });
@@ -4784,6 +4795,11 @@ def sources_text(buf, lam):
 
 # ---------- Wechsel zwischen Startseite und Kartenansicht
 def open_map(view):
+    try:
+        if "gwdone" in st.query_params:
+            del st.query_params["gwdone"]
+    except Exception:
+        pass
     st.session_state["gw_sid"] = st.session_state.get("gw_sid", 0) + 1
     view["sid"] = st.session_state["gw_sid"]
     st.session_state["gw"] = view
@@ -4796,8 +4812,20 @@ def soft_back():
 
 
 def close_map():
+    """Zurück aus der Karte. Nach einer beendeten Strecke geht es direkt zur Startseite, nicht zur Vorauswahl."""
     st.session_state.pop("gw", None)
     soft_back()
+    try:
+        if st.query_params.get("gwdone"):
+            st.session_state.pop("green_pending", None)
+            st.session_state.pop("san_pending", None)
+    except Exception:
+        pass
+    try:
+        if "gwdone" in st.query_params:
+            del st.query_params["gwdone"]
+    except Exception:
+        pass
 
 
 # Eingaben der Startseite bleiben beim Wechsel in die Karte und zurück erhalten (Streamlit verwirft sonst
