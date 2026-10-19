@@ -272,10 +272,14 @@ STATION_TAGS = ["railway:station", "railway:halt", "public_transport:station"]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _photon(q, blat, blon, tag=None):
+def _photon(q, blat, blon, tag=None, box=False):
     params = {"q": q, "limit": 12, "lang": "de"}
     if blat is not None:
         params.update(lat=blat, lon=blon)
+        if box:  # nur im Umfeld von ca. 10 km um den Standort/Startpunkt suchen
+            dlat = 0.095
+            dlon = dlat / max(math.cos(math.radians(blat)), 0.3)
+            params["bbox"] = f"{blon - dlon:.4f},{blat - dlat:.4f},{blon + dlon:.4f},{blat + dlat:.4f}"
     if tag:
         params["osm_tag"] = tag
     r = requests.get("https://photon.komoot.io/api/", params=params, headers=UA, timeout=6)
@@ -284,9 +288,13 @@ def _photon(q, blat, blon, tag=None):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _nominatim(q):
-    r = requests.get("https://nominatim.openstreetmap.org/search", headers=UA, timeout=8,
-                     params={"q": q, "format": "jsonv2", "limit": 6, "accept-language": "de"})
+def _nominatim(q, blat=None, blon=None):
+    params = {"q": q, "format": "jsonv2", "limit": 6, "accept-language": "de"}
+    if blat is not None:
+        dlat = 0.095
+        dlon = dlat / max(math.cos(math.radians(blat)), 0.3)
+        params.update(viewbox=f"{blon - dlon:.4f},{blat + dlat:.4f},{blon + dlon:.4f},{blat - dlat:.4f}", bounded=1)
+    r = requests.get("https://nominatim.openstreetmap.org/search", headers=UA, timeout=8, params=params)
     r.raise_for_status()
     out = []
     for x in r.json():
@@ -447,48 +455,105 @@ def _cat_defs(term):
     return defs[:KW_MAX_CATS + 1]
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def _nearby(selectors, lat, lon, radius=KW_RADIUS_M):
-    """Orte einer Kategorie rund um (lat, lon); Overpass mit kurzem Limit."""
-    body = "".join(f"nwr{s}(around:{radius},{lat},{lon});" for s in selectors)
-    q = f"[out:json][timeout:8];({body});out center 40;"
+def _op_post(base, q, timeout):
+    r = requests.post(base + "/interpreter", data={"data": q}, headers=UA, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def _overpass_race(q, timeout=8.0):
+    """Frage gleichzeitig mehrere Overpass-Server, nimm die erste brauchbare Antwort (ein überlasteter
+    Server verzögert die Suche so nicht mehr)."""
+    from concurrent.futures import as_completed
+    mirrors = OVERPASS_MIRRORS[:3]
+    ex = ThreadPoolExecutor(max_workers=len(mirrors))
     last = None
-    for base in OVERPASS_MIRRORS[:3]:
-        try:
-            r = requests.post(base + "/interpreter", data={"data": q}, headers=UA, timeout=7)
-            r.raise_for_status()
-            els = r.json().get("elements", [])
-            res = []
-            for e in els:
-                c = e.get("center") or e
-                if "lat" not in c:
-                    continue
-                t = e.get("tags", {})
-                res.append((float(c["lat"]), float(c["lon"]), t.get("name") or t.get("brand") or t.get("operator") or "",
-                            t.get("addr:street", ""), t.get("addr:housenumber", "")))
-            return res
-        except Exception as ex:
-            last = ex
+    try:
+        futs = [ex.submit(_op_post, m, q, timeout) for m in mirrors]
+        for f in as_completed(futs, timeout=timeout + 2):
+            try:
+                return f.result()
+            except Exception as e:
+                last = e
+    except Exception as e:
+        last = e
+    finally:
+        ex.shutdown(wait=False)
     raise last or RuntimeError("Overpass nicht erreichbar")
 
 
+def _sel_kv(sel):
+    m = re.match(r'^\["([a-z_]+)"="([a-z_]+)"\]$', sel)
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _nearby_multi(selectors, lat, lon, radius):
+    """Alle Orte, die einer der Auswahlen (Tags) entsprechen, rund um (lat, lon): eine einzige Abfrage.
+    Ergebnis: Liste (lat, lon, name, straße, nr, (schlüssel, wert))."""
+    body = "".join(f"nwr{s}(around:{radius},{lat},{lon});" for s in selectors)
+    js = _overpass_race(f"[out:json][timeout:8];({body});out center 400;")
+    kvs = [_sel_kv(x) for x in selectors]
+    res = []
+    for e in js.get("elements", []):
+        c = e.get("center") or e
+        if "lat" not in c:
+            continue
+        t = e.get("tags", {})
+        kv = next(((k, v) for k, v in kvs if k and t.get(k) == v), None)
+        if not kv:
+            continue
+        res.append((float(c["lat"]), float(c["lon"]), t.get("name") or t.get("brand") or t.get("operator") or "",
+                    t.get("addr:street", ""), t.get("addr:housenumber", ""), kv))
+    return res
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _nominatim_poi(word, lat, lon, half_deg=0.05):
+    """Ersatz, wenn Overpass nicht antwortet: Nominatim kennt Begriffe wie „Restaurant“ oder „Apotheke“."""
+    box = f"{lon - half_deg / max(math.cos(math.radians(lat)), 0.3):.4f},{lat + half_deg:.4f}," \
+          f"{lon + half_deg / max(math.cos(math.radians(lat)), 0.3):.4f},{lat - half_deg:.4f}"
+    r = requests.get("https://nominatim.openstreetmap.org/search", headers=UA, timeout=8,
+                     params={"q": word, "format": "jsonv2", "limit": 20, "accept-language": "de",
+                             "viewbox": box, "bounded": 1})
+    r.raise_for_status()
+    return [(float(x["lat"]), float(x["lon"]), x.get("name") or "", "", "") for x in r.json()]
+
+
 def keyword_places(term, bias):
-    """Schlagwort -> nahe Orte als Vorschläge (nach Entfernung)."""
+    """Schlagwort -> nahe Orte als Vorschläge (nach Entfernung). Erst 1 km, dann 2,5 km, dann 6 km Umkreis."""
     if not bias:
         return []
     defs = _cat_defs(term)
+    if not defs:
+        return []
+    lat, lon = round(bias[0], 3), round(bias[1], 3)
+    allsel = tuple(sorted({sel for _, _, sels in defs for sel in sels}))
+    items = []
+    try:
+        for radius in (1000, 2500, 6000):
+            items = [it for it in _nearby_multi(allsel, lat, lon, radius) if it[2]]
+            if len(items) >= 6:
+                break
+    except Exception:
+        items = []
+        # Ersatz: Nominatim (andere Server, anderer Zugang)
+        for _, label, _s in defs[:2]:
+            try:
+                items += [it + ((None, None),) for it in _nominatim_poi(label, lat, lon) if it[2]]
+            except Exception:
+                continue
     out = []
     for icon, label, sels in defs:
-        try:
-            items = _nearby(tuple(sels), round(bias[0], 3), round(bias[1], 3))
-        except Exception:
-            continue
-        items = sorted((it for it in items if it[2]), key=lambda it: dist_m((bias[0], bias[1]), (it[0], it[1])))[:4]
-        for la, lo, name, street, nr in items:
-            title = name or label
+        kvs = {_sel_kv(x) for x in sels}
+        mine = [it for it in items if it[5] in kvs or it[5] == (None, None)] if items else []
+        if items and items[0][5] == (None, None):
+            mine = items  # Nominatim-Ersatz kennt keine Tags
+        mine = sorted(mine, key=lambda it: dist_m((bias[0], bias[1]), (it[0], it[1])))[:4]
+        for la, lo, name, street, nr, _kv in mine:
             addr = (street + (" " + nr if nr else "")) if street else ""
-            lab = f"{icon} {title} · {label}" + (f" · {addr}" if addr and name else "")
-            out.append((lab, _pack(la, lo, f"{icon} {title}")))
+            lab = f"{icon} {name} · {label}" + (f" · {addr}" if addr else "")
+            out.append((lab, _pack(la, lo, f"{icon} {name}")))
     return out
 
 
@@ -590,9 +655,9 @@ def search_places(term):
     bias = st.session_state.get("bias")
     blat, blon = (round(bias[0], 2), round(bias[1], 2)) if bias else (None, None)
 
-    def ask(q, tag=None):
+    def ask(q, tag=None, box=False):
         try:
-            return _photon(q, blat, blon, tag)
+            return _photon(q, blat, blon, tag, box and blat is not None)
         except Exception:
             return []
 
@@ -606,25 +671,32 @@ def search_places(term):
     core = [w for w in words if w.lower().strip(".,") not in STATION_WORDS]
     if core and len(core) < len(words):
         for tag in STATION_TAGS:
-            _add(ask(" ".join(core), tag), seen, out)
+            _add(ask(" ".join(core), tag, True), seen, out)
     variants = query_variants(term)
     plz_in = _PLZ.search(term)
     addr_like = bool(plz_in) or bool(re.search(r"\d", term))
-    for k, q in enumerate(variants[:7]):
-        _add(ask(q), seen, out)
-        if len(out) >= 5 or (k >= 3 and out):
+    # 1) im 10-km-Umfeld (Spaziergänge bleiben meist nah), 2) danach ohne Gebietsgrenze
+    for boxed in ((True, False) if blat is not None else (False,)):
+        for k, q in enumerate(variants[:7]):
+            _add(ask(q, None, boxed), seen, out)
+            if len(out) >= 5 or (k >= 3 and out):
+                break
+        if len(out) >= 3:
             break
     if not out and len(words) > 1:
         for q in (" ".join(words[:-1]), " ".join(words[1:])):
-            _add(ask(q), seen, out)
+            _add(ask(q, None, blat is not None), seen, out)
             if out:
                 break
     if not out:
         for q in variants[:3]:
-            try:
-                out = _nominatim(q)
-            except Exception:
-                out = []
+            for bb in ((blat, blon), (None, None)) if blat is not None else ((None, None),):
+                try:
+                    out = _nominatim(q, *bb)
+                except Exception:
+                    out = []
+                if out:
+                    break
             if out:
                 break
     if bias and out:
@@ -673,8 +745,8 @@ def corridor_bbox(p1, p2):
 # Fußwege wie bei osmnx (network_type="walk")
 WALK_EXCLUDE = ("abandoned|bus_guideway|construction|cycleway|motor|no|planned|platform|proposed|"
                 "raceway|razed|rest_area|services")
-WALK_FILTER = ('["highway"]["area"!~"yes"]["access"!~"private"]'
-               f'["highway"!~"{WALK_EXCLUDE}"]["foot"!~"no"]["service"!~"private"]'
+WALK_FILTER = ('["highway"]["area"!~"yes"]["access"!~"private|no|customers|delivery|permit"]'
+               f'["highway"!~"{WALK_EXCLUDE}"]["foot"!~"no|private"]["service"!~"private|driveway|parking_aisle|drive-through"]'
                '["sidewalk"!~"separate"]["sidewalk:both"!~"separate"]'
                '["sidewalk:left"!~"separate"]["sidewalk:right"!~"separate"]')
 _WALK_EXCLUDE_RE = re.compile(WALK_EXCLUDE)
@@ -730,7 +802,7 @@ def fetch_osm(bbox, deadline):
     """Lädt OSM-Daten mit harter Zeitgrenze. Kein endloses Warten: überlastete Server (429/50x)
     werden sofort übersprungen. Ergebnis wird einige Tage auf der Festplatte zwischengespeichert."""
     os.makedirs(OSM_CACHE_DIR, exist_ok=True)
-    path = os.path.join(OSM_CACHE_DIR, hashlib.md5((repr(bbox) + "|v2-wasser").encode()).hexdigest() + ".osm")
+    path = os.path.join(OSM_CACHE_DIR, hashlib.md5((repr(bbox) + "|v3-zufahrt").encode()).hexdigest() + ".osm")
     if os.path.exists(path) and time.time() - os.path.getmtime(path) < OSM_CACHE_DAYS * 86400:
         return path
     query, last = overpass_query(bbox), "keine Antwort"
@@ -782,14 +854,17 @@ def _walkable(el):
     hw = tags.get("highway")
     if not hw or tags.get("area") == "yes" or _WALK_EXCLUDE_RE.search(hw):
         return False
-    return (tags.get("foot") != "no" and tags.get("access") != "private"
-            and tags.get("service") != "private")
+    # Privatgrundstücke, Hofeinfahrten und Parkplatzgassen sind keine Spazierwege (Durchgänge zwischen Straßen
+    # führen so nicht mehr über fremde Grundstücke)
+    return (tags.get("foot") not in ("no", "private")
+            and tags.get("access") not in ("private", "no", "customers", "delivery", "permit")
+            and tags.get("service") not in ("private", "driveway", "parking_aisle", "drive-through"))
 
 
 def walk_xml(path):
     """Schreibt eine zweite Datei nur mit Knoten und Fußwegen (osmnx macht aus jedem Weg eine Kante,
     Parkränder dürfen also nicht mit hinein). Arbeitet gestreamt, damit der Speicher klein bleibt."""
-    out = path[:-4] + ".walk.osm"
+    out = path[:-4] + ".walk2.osm"
     if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(path):
         return out
     tmp = out + f".{os.getpid()}.part"
@@ -1614,7 +1689,7 @@ if (D.parks) {
 }
 const pin = e => L.divIcon({html: '<div style="font-size:30px;line-height:30px;filter:drop-shadow(0 2px 3px rgba(0,0,0,.45))">' + e + '</div>',
   className: '', iconSize: [32, 32], iconAnchor: [16, 28]});
-L.marker(D.p1, {icon: pin('🚶')}).addTo(map);
+const startPin = L.marker(D.p1, {icon: pin('🚶')}).addTo(map);  // nur vor dem Start sichtbar (in der Navigation wäre er doppelt zum Standortpunkt)
 if (D.p1[0] !== D.p2[0] || D.p1[1] !== D.p2[1]) L.marker(D.p2, {icon: pin('🏁')}).addTo(map);
 (D.stops || []).forEach(s => L.marker([s[0], s[1]], {icon: pin('📍')}).addTo(map).bindTooltip(s[2], {direction: 'top'}));
 const userDot = L.circleMarker([0, 0], {radius: 9, color: '#fff', weight: 3, fillColor: '#2F6F8F', fillOpacity: 1});
@@ -1827,6 +1902,7 @@ function stopWatch() {
 function enterNav() {
   navOn = true; finished = false; said = {}; hadFix = false; lastIdx = 0; along = 0; offCount = 0;
   document.body.classList.add('nav'); $('go').textContent = '⏹ Beenden';
+  if (map.hasLayer(startPin)) map.removeLayer(startPin);
   try { if (navigator.wakeLock) navigator.wakeLock.request('screen').then(l => { wake = l; }).catch(() => {}); } catch (e) {}
   say('Navigation gestartet.');
   banner('', '📡', '…', 'Standort wird gesucht');
@@ -1834,6 +1910,7 @@ function enterNav() {
 function exitNav() {
   stopWatch(); navOn = false; finished = false;
   document.body.classList.remove('nav'); $('go').textContent = GO;
+  if (!map.hasLayer(startPin)) startPin.addTo(map);
   [userDot, userAcc, userCone].forEach(l => { if (map.hasLayer(l)) map.removeLayer(l); });
   if (done) done.setLatLngs([]);
   showOption(cur, true);
@@ -3509,13 +3586,21 @@ CITY_FACTS = [
 ]
 SEASON_FACTS = {
     "winter": ["Im Winter lassen sich Vögel leichter beobachten: Ohne Laub sieht man Nester, Misteln und Spechthöhlen.",
-               "Rotkehlchen singen auch im Winter, denn sie verteidigen ihr Revier das ganze Jahr."],
+               "Rotkehlchen singen auch im Winter, denn sie verteidigen ihr Revier das ganze Jahr.",
+               "Meisen schließen sich im Winter zu gemischten Trupps zusammen und suchen gemeinsam nach Futter.",
+               "Raureif und Frost lassen Spinnennetze und Gräser sichtbar werden. Ein Winterspaziergang hat seine eigene Schönheit."],
     "spring": ["Im April und Mai singen die Vögel am lautesten: Der Morgenchor beginnt schon vor Sonnenaufgang.",
-               "Bärlauch und Buschwindröschen färben im Frühjahr Auwälder und Parkränder weiß."],
+               "Bärlauch und Buschwindröschen färben im Frühjahr Auwälder und Parkränder weiß.",
+               "Ab Ende April kehren die Mauersegler aus Afrika zurück und kreisen schreiend um die Häuser.",
+               "Im Frühjahr treiben Bäume aus: Zuerst blühen oft Weiden und Haselsträucher, wichtige erste Nahrung für Insekten."],
     "summer": ["Linden blühen im Juni und Juli, und ihr Duft lockt Bienen und Hummeln an.",
-               "An Hitzetagen sind Parks und Wälder oft mehrere Grad kühler als versiegelte Straßen."],
+               "An Hitzetagen sind Parks und Wälder oft mehrere Grad kühler als versiegelte Straßen.",
+               "Im Juni und Juli leuchten in der Dämmerung an Wegrändern manchmal Glühwürmchen, die Leuchtkäfer.",
+               "Auf Wiesen am Wegrand blühen Wildblumen wie Wiesen-Salbei und Margerite, ein Buffet für Schmetterlinge."],
     "autumn": ["Das Herbstlaub wird nicht „bunt“: Blattgrün wird abgebaut, darunter kommen Gelb und Orange zum Vorschein.",
-               "Eichelhäher vergraben im Herbst Tausende Eicheln. Viele vergessen sie, und so entstehen neue Eichen."],
+               "Eichelhäher vergraben im Herbst Tausende Eicheln. Viele vergessen sie, und so entstehen neue Eichen.",
+               "Im Herbst ziehen Kraniche in Keilformation über das Land. Ihr Rufen hört man oft, bevor man sie sieht.",
+               "Pilze sind nur der Fruchtkörper: Ihr eigentlicher Organismus liegt als feines Geflecht im Boden."],
 }
 GENERAL_FACTS = [
     "Schon etwa 20 Minuten im Grünen können das Stresshormon Cortisol messbar senken.",
@@ -3526,11 +3611,27 @@ GENERAL_FACTS = [
     "Fledermäuse jagen in der Dämmerung gern über Wegen und Gewässern, ein einzelnes Tier frisst viele Mücken pro Nacht.",
     "Auf Nebenstraßen und Gassen ist die Luft meist spürbar besser als an Hauptverkehrsstraßen.",
     "Ein Eichhörnchen findet viele seiner Verstecke wieder, und die vergessenen werden zu Bäumen.",
+    "Gehen kann das kreative Denken fördern: Eine Stanford-Studie fand beim Spazieren deutlich mehr Ideen als im Sitzen.",
+    "Moos kann ein Vielfaches seines Trockengewichts an Wasser speichern und wirkt wie ein kleiner Schwamm.",
+    "Efeu schadet gesunden Bäumen meist nicht: Er klettert nur und zapft den Baum nicht an.",
+    "Regenwürmer ziehen Laub in die Erde und lockern so den Boden, ein Gartenhelfer ohne Gehalt.",
+    "Hummeln fliegen schon bei Temperaturen, bei denen Honigbienen im Stock bleiben.",
+    "Platanen werfen ihre Rinde in großen Platten ab. So entsteht das typische Tarnmuster am Stamm.",
+    "Krähen erkennen menschliche Gesichter und merken sich, wer ihnen freundlich oder feindlich begegnet ist.",
+    "Der Mauersegler verbringt fast sein ganzes Leben in der Luft, er frisst, trinkt und schläft im Flug.",
+    "Eine alte Eiche kann mehrere hundert Insektenarten beherbergen, ein ganzes Dorf in einem Baum.",
+    "Brennnesseln sind wichtige Futterpflanzen für die Raupen von Tagpfauenauge und Kleinem Fuchs.",
+    "Die Linde war in vielen Dörfern der Treffpunkt, an dem Feste gefeiert und Recht gesprochen wurde.",
+    "Spechte hacken Höhlen in Bäume, die später Meisen, Stare und Fledermäuse als Wohnung nutzen.",
+    "Totholz ist Lebensraum: Käfer, Pilze und Vögel leben von abgestorbenen Ästen und Stämmen.",
+    "Eine einzelne Hecke kann Nistplatz, Windschutz und Futterquelle für Dutzende Vogelarten sein.",
 ]
 WATER_FACTS = [
     "„Blaue Räume“: Wasser in Sichtweite macht Spaziergänge nach Studien erholsamer als reines Grün.",
     "Libellen gibt es seit über 300 Millionen Jahren. Ihre Larven leben im Wasser und zeigen saubere Gewässer an.",
     "Flüsse und Seen kühlen ihre Umgebung im Sommer spürbar. Am Ufer ist es oft ein paar Grad angenehmer.",
+    "Graureiher stehen oft stundenlang regungslos im Flachwasser und warten auf Fische.",
+    "Das Plätschern von Wasser überdeckt Verkehrslärm und wird von vielen Menschen als beruhigend empfunden.",
 ]
 
 
@@ -3544,24 +3645,35 @@ def region_facts(lat, lon):
     return best
 
 
-def pick_facts(lat=None, lon=None, water=False, month=None):
+def pick_facts(lat=None, lon=None, water=False, month=None, seen=None):
+    """Zufällige Auswahl aus allen Fakten (Ort, Jahreszeit, allgemein). Schon gezeigte Fakten kommen erst
+    wieder, wenn alle durch sind; mindestens ein Ortsfakt ist unter den ersten drei, wenn es einen gibt."""
     month = month or time.localtime().tm_mon
     season = ("winter", "winter", "spring", "spring", "spring", "summer", "summer", "summer", "autumn", "autumn", "autumn", "winter")[month - 1]
     rnd = random.Random()
-    out = []
+    local = []
     if lat is not None:
         reg = region_facts(lat, lon)
         if reg:
             local = list(reg[1])
-            rnd.shuffle(local)
-            out += local[:3]
-    if water:
-        out += rnd.sample(WATER_FACTS, 2)
-    out += rnd.sample(SEASON_FACTS[season], 1)
-    gen = list(GENERAL_FACTS)
-    rnd.shuffle(gen)
-    out += gen[: max(2, 6 - len(out))]
-    return out[:7]
+    pool = list(dict.fromkeys(local + SEASON_FACTS[season] + GENERAL_FACTS + (WATER_FACTS if water else [])))
+    seen = seen if seen is not None else set()
+    fresh = [f for f in pool if f not in seen]
+    if len(fresh) < 8:  # fast alles gezeigt: von vorn beginnen
+        seen.clear()
+        fresh = list(pool)
+    rnd.shuffle(fresh)
+    out = fresh[:8]
+    loc_new = [f for f in local if f in out[:3]]
+    if local and not loc_new:
+        cand = [f for f in local if f in fresh] or local
+        f = rnd.choice(cand)
+        if f in out:
+            out.remove(f)
+        out.insert(rnd.randrange(0, 3), f)
+        out = out[:8]
+    seen.update(out)
+    return out
 
 
 class Overlay:
@@ -3574,7 +3686,11 @@ class Overlay:
             lat, lon, _ = _unpack(start)
         except Exception:
             pass
-        self.facts = pick_facts(lat, lon, water)
+        try:
+            seen = st.session_state.setdefault("_facts_seen", set())
+        except Exception:
+            seen = None
+        self.facts = pick_facts(lat, lon, water, seen=seen)
         self.stage = "Ich suche den grünsten Weg" + (" am Wasser entlang" if water else "") + " …"
         self.ph = st.empty()
         self.render()
@@ -3645,7 +3761,7 @@ st.markdown(BASE_CSS, unsafe_allow_html=True)
 PLACEHOLDER = "Straße, Adresse, Café, Restaurant, Geschäft …"
 SEARCH_TIP = ("Tipp: Tippe mindestens 3 Buchstaben, dann erscheinen Vorschläge. "
               "Tippfehler sind okay, es werden ähnliche Orte angezeigt. "
-              "Adressen kannst du auch unten einfügen.")
+              "Du kannst auch Adressen einfügen. Gesucht wird zuerst im Umkreis von ca. 10 km.")
 
 
 SEARCH_STYLE = {
@@ -3659,25 +3775,6 @@ SEARCH_STYLE = {
 }
 
 
-def paste_input(key):
-    """Zuverlässiges Eingabefeld zum Einfügen (Strg/Cmd+V, „Einfügen“ am Handy): normales Textfeld mit
-    gleicher fehlertoleranter Suche; die Trefferliste erscheint darunter."""
-    with st.expander("📋 Adresse einfügen oder Koordinaten eingeben"):
-        txt = st.text_input("Adresse", key=f"{key}_paste", label_visibility="collapsed",
-                            placeholder="z. B. Hauptstraße 12, 50667 Köln · oder 50.9375, 6.9603")
-        if txt and len(txt.strip()) >= 3:
-            try:
-                res = search_places(txt)
-            except Exception:
-                res = []
-            if res:
-                i = st.selectbox("Treffer", list(range(len(res))), format_func=lambda k: res[k][0],
-                                 key=f"{key}_pick", label_visibility="collapsed")
-                return res[i][1]
-            st.caption("Dazu habe ich nichts gefunden. Probiere es ohne Postleitzahl oder mit weniger Wörtern.")
-    return None
-
-
 def place_input(label, key):
     dot = "s" if label.startswith("Start") else "z"
     st.markdown(f'<div class="fld"><i class="dot {dot}"></i>{escape(label)}</div>', unsafe_allow_html=True)
@@ -3686,8 +3783,7 @@ def place_input(label, key):
         v = st_searchbox(search_places, style_overrides=SEARCH_STYLE, **kw)
     except TypeError:  # ältere Version ohne style_overrides
         v = st_searchbox(search_places, **kw)
-    pasted = paste_input(key)
-    return pasted or v
+    return v
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
