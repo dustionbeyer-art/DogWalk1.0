@@ -3497,18 +3497,54 @@ def _thin(coords, n=70):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def _san_overpass(q):
-    return _overpass_race(q, timeout=14.0)
+    return _overpass_race(q, timeout=26.0)
 
 
 def fetch_sanitary(option_coords, reach):
-    """Toiletten und Gaststätten in einem Schlauch um die Routen (Overpass „around“ entlang der Linie)."""
-    body = ""
-    for coords in option_coords:
-        line = ",".join(f"{la:.5f},{lo:.5f}" for la, lo in _thin(coords))
-        a = f"(around:{int(reach)},{line})"
-        body += f'nwr["amenity"="toilets"]{a};nwr["amenity"~"^({SAN_GASTRO})$"]["name"]{a};'
-    js = _san_overpass(f"[out:json][timeout:14];({body});out center tags 900;")
-    return js.get("elements", [])
+    """Toiletten und Gaststätten im Rechteck um alle Routen (ein schneller Bereichsabruf; die genaue Entfernung
+    zum Weg wird danach hier berechnet – lange „around“-Linien sind für Overpass in Großstädten oft zu langsam)."""
+    allp = [c for coords in option_coords for c in coords]
+    la0, la1 = min(c[0] for c in allp), max(c[0] for c in allp)
+    lo0, lo1 = min(c[1] for c in allp), max(c[1] for c in allp)
+    pad = reach / 110540.0
+    padx = pad / max(math.cos(math.radians((la0 + la1) / 2)), 0.3)
+    bb = f"({la0 - pad:.5f},{lo0 - padx:.5f},{la1 + pad:.5f},{lo1 + padx:.5f})"
+    q = (f'[out:json][timeout:25];(nwr["amenity"="toilets"]{bb};'
+         f'nwr["amenity"~"^({SAN_GASTRO})$"]["name"]{bb};);out center tags 8000;')
+    return _san_overpass(q).get("elements", [])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _sweep_point(lat, lon, word):
+    return _nominatim_poi(word, lat, lon, half_deg=0.005)
+
+
+def sweep_gastro(coords, step_m=450.0, max_pts=12):
+    """Notlösung, wenn der Kartenabruf nichts liefert: die Route ablaufen und an Punkten entlang des Wegs
+    nach Restaurants und Cafés im Umfeld fragen (Nominatim)."""
+    a = np.asarray(coords, float)
+    lat0, lon0, kx, ky = _route_frame(coords)
+    X, Y = (a[:, 1] - lon0) * kx, (a[:, 0] - lat0) * ky
+    cum = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(X), np.diff(Y)))])
+    total = float(cum[-1])
+    n = max(2, min(max_pts, int(total // step_m) + 1))
+    pts = []
+    for sdist in np.linspace(0, total, n):
+        k = int(np.searchsorted(cum, sdist))
+        k = min(k, len(a) - 1)
+        pts.append((round(float(a[k, 0]), 4), round(float(a[k, 1]), 4)))
+    jobs = [(la, lo, w) for la, lo in pts for w in ("Restaurant", "Café")]
+    out = []
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futs = [ex.submit(_sweep_point, *j) for j in jobs]
+        for f in futs:
+            try:
+                for la, lo, name, *_ in f.result():
+                    if name:
+                        out.append({"kind": "gastro", "lat": la, "lon": lo, "name": name, "info": "", "kv": "restaurant"})
+            except Exception:
+                pass
+    return out
 
 
 def _san_info(t, kind):
@@ -3576,28 +3612,48 @@ def _near_route(coords, pts, reach):
     return [(float(d[k]), float(s[idx[k]])) for k in range(len(pts))]
 
 
+SAN_WIDE = 500  # so weit abseits der Route werden Ausweichziele (Toilette/Gaststätte) angeboten
+
+
 def add_sanitary(view, reach=150, log=lambda *_: None):
     """Sanitäroptionen in eine fertige Kartenansicht einarbeiten: Toiletten am Weg, Hinweis je Route, Marker.
-    Rückgabe: {"n_public": …, "cands": [...]} für die Standardroute (Warnung vor der Anzeige)."""
+    Rückgabe: Zusammenfassung für die Standardroute (Warnung vor der Anzeige)."""
     payload = payload_from_html(view["html"])
     opts = payload["options"]
-    log("🚻 Toiletten entlang der Route suchen")
-    elements = fetch_sanitary([o["coords"] for o in opts], reach + 60)
-    items = classify_sanitary(elements)
-    pts = [(it["lat"], it["lon"]) for it in items]
-    per_opt = []
-    for o in opts:
-        info = _near_route(o["coords"], pts, reach)
-        mine = []
-        for it, (d, s_) in zip(items, info):
-            if d <= reach:
-                mine.append({**it, "d": d, "s": s_})
-        per_opt.append(mine)
     default = int(payload.get("default") or 0)
+    log("🚻 Toiletten entlang der Route suchen")
+    failed, items = False, []
+    try:
+        items = classify_sanitary(fetch_sanitary([o["coords"] for o in opts], SAN_WIDE + 60))
+    except Exception:
+        failed = True
+
+    def measure(items_):
+        pts_ = [(it["lat"], it["lon"]) for it in items_]
+        res = []
+        for o in opts:
+            info = _near_route(o["coords"], pts_, SAN_WIDE)
+            res.append([{**it, "d": d, "s": s_} for it, (d, s_) in zip(items_, info) if d <= SAN_WIDE])
+        return res
+
+    per_wide = measure(items)
+    if not any(m["kind"] in ("pub", "gastro") for m in per_wide[default]):
+        log("🍽️ Keine Treffer im Kartenabruf, ich laufe die Route nach Cafés und Restaurants ab")
+        try:
+            extra = sweep_gastro(opts[default]["coords"])
+            if extra:
+                failed = False
+                items = items + extra
+                per_wide = measure(items)
+        except Exception:
+            pass
+    per_opt = [[m for m in mine if m["d"] <= reach] for mine in per_wide]
     for o, mine in zip(opts, per_opt):
-        pub = sorted((m for m in mine if m["kind"] in ("pub",)), key=lambda m: m["s"])
+        pub = sorted((m for m in mine if m["kind"] == "pub"), key=lambda m: m["s"])
         cust = [m for m in mine if m["kind"] == "cust"]
-        if pub:
+        if failed:
+            o["hint"] = (o.get("hint") or "") + " · 🚻 Toilettendaten nicht abrufbar"
+        elif pub:
             first = f", erste bei {_fmt_dist(pub[0]['s'])}" if pub[0]["s"] > 20 else ""
             o["hint"] = (o.get("hint") or "") + f" · 🚻 {len(pub)} öffentliche Toilette{'n' if len(pub) != 1 else ''} am Weg{first}"
         elif cust:
@@ -3607,8 +3663,6 @@ def add_sanitary(view, reach=150, log=lambda *_: None):
     mine_def = per_opt[default] if per_opt else []
     n_public = sum(1 for m in mine_def if m["kind"] == "pub")
     n_cust = sum(1 for m in mine_def if m["kind"] == "cust")
-    gastro = sorted((m for m in mine_def if m["kind"] == "gastro"), key=lambda m: (m["d"], m["s"]))
-    # Marker für die Karte: alle Toiletten an irgendeiner Route; Gaststätten nur, wenn keine öffentliche da ist
     seen, pubs, custs = set(), [], []
     for mine in per_opt:
         for m in mine:
@@ -3623,16 +3677,18 @@ def add_sanitary(view, reach=150, log=lambda *_: None):
                               (m["info"] + " · " if m["info"] else "") + SAN_NOTE])
     payload["san"] = {"pub": pubs[:80], "cust": custs[:40]}
     view["html"] = map_html(payload)
-    cands = [{"name": m["name"], "lat": m["lat"], "lon": m["lon"], "d": m["d"], "s": m["s"], "kv": m["kv"]}
-             for m in gastro]
-    seen_n, uniq = set(), []
-    for c in cands:  # gleiche Gaststätte nur einmal
-        k = _norm_name(c["name"])
-        if k in seen_n:
-            continue
-        seen_n.add(k)
-        uniq.append(c)
-    view["san"] = {"n_public": n_public, "n_cust": n_cust, "cands": uniq[:8], "reach": reach}
+    # Ausweichziele für die Standardroute: öffentliche Toiletten zuerst, dann Gaststätten, je nach Abstand zum Weg
+    wide_def = per_wide[default] if per_wide else []
+    cands, seen_k = [], set()
+    for kind in ("pub", "gastro"):
+        for m in sorted((m for m in wide_def if m["kind"] == kind), key=lambda m: (m["d"], m["s"])):
+            k = (kind, _norm_name(m["name"]) if kind == "gastro" else (round(m["lat"], 4), round(m["lon"], 4)))
+            if k in seen_k:
+                continue
+            seen_k.add(k)
+            cands.append({"name": m["name"], "lat": m["lat"], "lon": m["lon"], "d": m["d"], "s": m["s"],
+                          "kind": kind, "info": m["info"]})
+    view["san"] = {"n_public": n_public, "n_cust": n_cust, "cands": cands[:10], "reach": reach, "failed": failed}
     return view["san"]
 
 
@@ -4264,14 +4320,11 @@ def render_map_view():
 
 # ---------- Startseite
 def san_settings(prefix):
-    """Feineinstellungen (Startseite): Sanitäroptionen. Rückgabe: Reichweite in m oder None."""
-    with st.expander("⚙️ Feineinstellungen"):
-        on = st.toggle("🚻 Sanitäroptionen", key=f"san_{prefix}", value=False,
-                       help="Zeigt öffentliche Toiletten entlang der Route (Daten: OpenStreetMap) und warnt, "
-                            "wenn keine in der Nähe ist.")
-        reach = st.select_slider("Höchstabstand der Toilette zum Weg", options=SAN_REACHES, value=150,
-                                 key=f"sanr_{prefix}", format_func=lambda m: f"{m} m", disabled=not on)
-    return reach if on else None
+    """Schalter wie bei der Wassernähe. Rückgabe: Reichweite in m (fest 150) oder None."""
+    on = st.toggle("🚻 Sanitäroptionen", key=f"san_{prefix}", value=False,
+                   help="Zeigt öffentliche Toiletten entlang der Route (Daten: OpenStreetMap) und warnt vor der "
+                        "Route, wenn keine in der Nähe ist. Alternativ lässt sich eine Gaststätte einplanen.")
+    return SAN_REACHES[1] if on else None
 
 
 def san_finish(view, reach, ov):
@@ -4315,17 +4368,19 @@ def render_san_pending():
     cands = san.get("cands", [])
     choice = None
     if cands:
-        st.markdown("**Alternative:** Eine Gaststätte oder ein Café einplanen, die vermutlich eine Gästetoilette hat.")
-        labels = [f"{c['name']} · {_fmt_dist(c['d'])} vom Weg" for c in cands]
-        pick = st.selectbox("Gaststätte auf dem Weg", range(len(cands)), format_func=lambda i: labels[i],
-                            key="san_pick")
+        st.markdown("**Alternative:** Die Route so anpassen, dass sie an einer Toilette oder einer Gaststätte "
+                    "mit Gästetoilette vorbeiführt (kleiner Umweg).")
+        labels = [("🚻 " if c["kind"] == "pub" else "🍽️ ") + f"{c['name']} · {_fmt_dist(c['d'])} vom Weg"
+                  + (" · öffentlich" if c["kind"] == "pub" else " · private Sanitäranlagen") for c in cands]
+        pick = st.selectbox("Ausweichziel", range(len(cands)), format_func=lambda i: labels[i], key="san_pick")
         choice = cands[pick]
-        st.caption("🚻 Private Sanitäranlagen. " + SAN_NOTE)
+        if choice["kind"] != "pub":
+            st.caption("🚻 Private Sanitäranlagen. " + SAN_NOTE)
     else:
-        st.caption("Keine Gaststätte in der Nähe des Wegs gefunden. Tipp: Route mit größerem Höchstabstand "
-                   "neu berechnen oder ein Café als Zwischenziel wählen.")
+        st.caption("Auch im weiteren Umkreis habe ich weder Toilette noch Gaststätte gefunden. Tipp: ein Café "
+                   "als Zwischenziel wählen.")
     c1, c2, c3 = st.columns(3)
-    if choice and c1.button("Gaststätte einplanen", type="primary", use_container_width=True, key="san_plan"):
+    if choice and c1.button("Route anpassen", type="primary", use_container_width=True, key="san_plan"):
         try:
             with st.spinner("Route mit Zwischenstopp wird berechnet …"):
                 new = replan_with_stop(view, choice)
@@ -4345,7 +4400,7 @@ def render_san_pending():
 
 def replan_with_stop(view, cand):
     """Gaststätte als Zwischenziel einplanen und neu rechnen (Typ je nach Modus)."""
-    stop = _pack(cand["lat"], cand["lon"], "🍽️ " + cand["name"])
+    stop = _pack(cand["lat"], cand["lon"], ("🚻 " if cand.get("kind") == "pub" else "🍽️ ") + cand["name"])
     st.session_state["_water"] = bool(view.get("water"))
     reach = view.get("san_reach")
     lvl = view.get("level") if view.get("level") in TOUR_LEVELS else "Sehr grün"
