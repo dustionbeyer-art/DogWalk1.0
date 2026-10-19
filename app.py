@@ -90,12 +90,26 @@ OVERPASS_MIRRORS = [
 LOAD_DEADLINE_S = 16  # harte Zeitgrenze für Overpass; danach übernimmt der Grün-Scan
 OSM_CACHE_DIR = os.path.join(tempfile.gettempdir(), "green_walker_osm")
 OSM_CACHE_DAYS = 7
+_MIRROR_CACHE = {"t": 0.0, "v": None}
+
+
 def rank_mirrors():
+    """Server nach Auslastung sortiert; das Ergebnis gilt 2 Minuten (die Statusabfrage kostete sonst bei jeder
+    Berechnung mehrere Sekunden)."""
+    now = time.time()
+    if _MIRROR_CACHE["v"] and now - _MIRROR_CACHE["t"] < 120:
+        return list(_MIRROR_CACHE["v"])
+    v = _rank_mirrors_uncached()
+    _MIRROR_CACHE.update(t=time.time(), v=list(v))
+    return v
+
+
+def _rank_mirrors_uncached():
     """Fragt den Status aller Overpass-Server kurz und parallel ab: Server mit freien Plätzen zuerst,
     nicht erreichbare Server werden übersprungen. Spart das lange Warten auf überlastete Server."""
     def probe(base):
         try:
-            r = requests.get(base + "/status", headers=UA, timeout=4)
+            r = requests.get(base + "/status", headers=UA, timeout=2.5)
             if r.status_code != 200:
                 return base, 9.0
             t = r.text
@@ -865,54 +879,94 @@ def _cut(resp):
         pass
 
 
+def _download_osm(base, query, deadline, tmp, cancel):
+    """Lädt die Daten von einem Server in eine Datei. None = fertig, sonst Fehlertext."""
+    host = base.split("/")[2]
+    try:
+        left = deadline - time.time()
+        if left < 3:
+            return f"{host}: keine Zeit mehr"
+        with requests.post(base + "/interpreter", data={"data": query}, headers=UA,
+                           timeout=(4, min(25, left)), stream=True) as r:
+            if r.status_code != 200:
+                return f"{host}: {r.status_code} {r.reason}"
+            # Wächter: kappt die Verbindung an der Zeitgrenze, auch wenn Daten nur tröpfeln
+            guard = threading.Timer(max(0.5, deadline - time.time()), _cut, args=(r,))
+            guard.daemon = True
+            guard.start()
+            try:
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(1 << 14):
+                        if cancel.is_set():
+                            return f"{host}: abgebrochen"
+                        f.write(chunk)
+            finally:
+                guard.cancel()
+            if time.time() > deadline:
+                return f"{host}: zu langsam"
+        if not _osm_complete(tmp):
+            return f"{host}: Abfrage abgebrochen"
+        return None
+    except Exception as e:
+        return f"{host}: {type(e).__name__}"
+
+
 def fetch_osm(bbox, deadline):
-    """Lädt OSM-Daten mit harter Zeitgrenze. Kein endloses Warten: überlastete Server (429/50x)
-    werden sofort übersprungen. Ergebnis wird einige Tage auf der Festplatte zwischengespeichert."""
+    """Lädt OSM-Daten mit harter Zeitgrenze. Zwei Server gleichzeitig: die schnellere Antwort gewinnt, der andere
+    Abruf wird abgebrochen. Überlastete Server (429/50x) werden sofort übersprungen. Ergebnis wird einige Tage
+    auf der Festplatte zwischengespeichert."""
+    from concurrent.futures import FIRST_COMPLETED, wait
     os.makedirs(OSM_CACHE_DIR, exist_ok=True)
     path = os.path.join(OSM_CACHE_DIR, hashlib.md5((repr(bbox) + "|v3-zufahrt").encode()).hexdigest() + ".osm")
     if os.path.exists(path) and time.time() - os.path.getmtime(path) < OSM_CACHE_DAYS * 86400:
         return path
     query, last = overpass_query(bbox), "keine Antwort"
-    tmp = path + f".{os.getpid()}.part"
+    mirrors = rank_mirrors()
     for rnd in range(2):
-        for base in rank_mirrors():
-            left = deadline - time.time()
-            if left < 4:
-                break
-            try:
-                with requests.post(base + "/interpreter", data={"data": query}, headers=UA,
-                                   timeout=(4, min(25, left)), stream=True) as r:
-                    if r.status_code != 200:
-                        last = f"{base.split('/')[2]}: {r.status_code} {r.reason}"
-                        continue
-                    # Wächter: kappt die Verbindung an der Zeitgrenze, auch wenn Daten nur tröpfeln
-                    guard = threading.Timer(max(0.5, deadline - time.time()), _cut, args=(r,))
-                    guard.daemon = True
-                    guard.start()
-                    try:
-                        with open(tmp, "wb") as f:
-                            for chunk in r.iter_content(1 << 14):
-                                f.write(chunk)
-                    finally:
-                        guard.cancel()
-                    if time.time() > deadline:
-                        raise TimeoutError("Download dauert zu lange")
-                if not _osm_complete(tmp):
-                    last = f"{base.split('/')[2]}: Abfrage abgebrochen"
-                    continue
-                os.replace(tmp, path)
-                return path
-            except Exception as e:
-                last = f"{base.split('/')[2]}: {type(e).__name__}"
-            finally:
-                if os.path.exists(tmp):
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
+        pending = list(mirrors)
+        cancel = threading.Event()
+        ex = ThreadPoolExecutor(max_workers=3)
+        inflight, tmps, n = {}, {}, 0
+
+        def launch():
+            nonlocal n
+            b = pending.pop(0)
+            n += 1
+            tmps[b] = f"{path}.{os.getpid()}.{threading.get_ident()}.{rnd}.{n}.part"
+            inflight[ex.submit(_download_osm, b, query, deadline, tmps[b], cancel)] = b
+
+        winner = None
+        try:
+            while len(inflight) < 2 and pending and deadline - time.time() >= 3:
+                launch()
+            while inflight and not winner:
+                done, _ = wait(list(inflight), timeout=max(1.0, deadline - time.time() + 2), return_when=FIRST_COMPLETED)
+                if not done:
+                    break
+                for f in done:
+                    b = inflight.pop(f)
+                    err = f.result()
+                    if err is None and not winner:
+                        winner = b
+                    elif err:
+                        last = err
+                # ein Server ist ausgefallen: sofort den nächsten nachrücken lassen
+                while not winner and len(inflight) < 2 and pending and deadline - time.time() >= 3:
+                    launch()
+        finally:
+            cancel.set()
+            ex.shutdown(wait=False)
+        if winner:
+            os.replace(tmps[winner], path)
+            for b, t in tmps.items():
+                if b != winner:
+                    threading.Timer(5.0, lambda t=t: os.path.exists(t) and os.remove(t)).start()
+            return path
+        for t in tmps.values():
+            threading.Timer(5.0, lambda t=t: os.path.exists(t) and os.remove(t)).start()
         if deadline - time.time() < 6:
             break
-        time.sleep(2)
+        time.sleep(1)
     raise RuntimeError(f"Alle Kartenserver sind gerade überlastet ({last}).")
 
 
@@ -4322,6 +4376,12 @@ function patch(fav,touch){docs().forEach(function(d){try{var h=d.head;
  }catch(e){}})}
 var cur=[FAV,TOUCH];
 patch(FAV,TOUCH);
+/* Gespeichertes dunkles Streamlit-Design einmalig verwerfen (Streamlit merkt sich die Wahl im Browser) */
+try{var PW=window.parent,LS=PW.localStorage,SS=PW.sessionStorage,hit=false;
+ for(var i=LS.length-1;i>=0;i--){var kk=LS.key(i);
+  if(kk&&kk.indexOf('stActiveTheme')===0){var vv=LS.getItem(kk)||'';
+   if(vv.toLowerCase().indexOf('dark')>-1||vv.indexOf('"base":1')>-1){LS.removeItem(kk);hit=true}}}
+ if(hit&&!SS.getItem('gwTheme')){SS.setItem('gwTheme','1');PW.location.reload()}}catch(e){}
 /* Echte Dateien aus static/ bevorzugen (iOS liest sie zuverlässiger als eingebettete Daten) */
 try{var P=window.parent,base=P.location.origin+P.location.pathname.replace(/[^/]*$/,'')+'app/static/';
  fetch(base+'apple-touch-icon.png',{method:'HEAD'}).then(function(r){
@@ -4376,6 +4436,16 @@ BASE_CSS = """
 <style>
 :root{--moss:#4E6E45;--sage:#9DB38A;--sand:#E9E1D2;--paper:#FBF8F1;--line:#D9CFBC;--text:#3B3A33}
 html,body,.stApp{color-scheme:only light!important}
+body,.stApp,.stApp *:not(svg):not(path):not(.hero):not(.hero *):not(.stButton>button[kind="primary"]):not(.stButton>button[kind="primary"] *){--text-color:#3B3A33}
+.stApp [data-testid="stMarkdownContainer"] *,.stApp [data-testid="stWidgetLabel"] *,.stApp [data-testid="stCaptionContainer"] *,
+.stApp [data-testid="stToggle"] *,.stApp [data-testid="stCheckbox"] *,.stApp [data-baseweb="tab"] *,.stApp [data-testid="stExpander"] summary *{color:#3B3A33!important}
+.stApp .hero,.stApp .hero *{color:#FBF7EE!important}
+.stApp [data-testid="stToggle"] [role="switch"][aria-checked="false"]+div,.stApp [data-testid="stToggle"] label>div:first-child{background-color:#CFC6B2}
+.stApp [data-testid="stToggle"] input:checked+div,.stApp [data-testid="stToggle"] [aria-checked="true"]{background-color:#5E7F52!important}
+.stApp .stButton>button,.stApp [data-testid="stButtonGroup"] button{background:#fff!important;color:#3B3A33!important}
+.stApp .stButton>button[kind="primary"]{background:#5E7F52!important;color:#FBF7EE!important}
+.stApp .stButton>button[kind="primary"] *{color:#FBF7EE!important}
+[data-testid="stHeader"]{background:transparent!important}
 /* Immer hell: auch wenn Browser oder Streamlit ein dunkles Design anbieten, bleibt die App lesbar und bedienbar */
 .stApp,[data-testid="stAppViewContainer"],[data-testid="stMain"]{background:#F4EFE6!important;color:#3B3A33!important}
 .stApp p,.stApp label,.stApp span,.stApp li,.stApp h1,.stApp h2,.stApp h3,.stApp small{color:#3B3A33}
@@ -4716,7 +4786,7 @@ def place_input(label, key):
 def reverse_name(lat, lon):
     """Adresse zu Koordinaten (Photon), nur zur Anzeige."""
     try:
-        r = requests.get("https://photon.komoot.io/reverse", headers=UA, timeout=6,
+        r = requests.get("https://photon.komoot.io/reverse", headers=UA, timeout=3.5,
                          params={"lat": lat, "lon": lon, "lang": "de"})
         p = r.json()["features"][0]["properties"]
         street = " ".join(x for x in [p.get("street") or p.get("name"), p.get("housenumber")] if x)
