@@ -5369,15 +5369,38 @@ SEARCH_STYLE = {
 }
 
 
+def _forget_place(key):
+    st.session_state.pop(f"_keep_{key}", None)
+    st.session_state.pop(key, None)
+
+
 def place_input(label, key):
+    """Ortseingabe. Die gewählte Adresse wird gemerkt (auch wenn man in die Karte und zurück geht) und als
+    Feld mit „Ändern“ angezeigt, damit Start und Ziel nicht erneut eingegeben werden müssen."""
     dot = "s" if label.startswith("Start") else "z"
     st.markdown(f'<div class="fld"><i class="dot {dot}"></i>{escape(label)}</div>', unsafe_allow_html=True)
+    keep = f"_keep_{key}"
+    saved = st.session_state.get(keep)
+    if saved:
+        try:
+            lab = _unpack(saved)[2]
+        except Exception:
+            lab = ""
+            st.session_state.pop(keep, None)
+            saved = None
+        if saved:
+            st.markdown(f'<div class="trip"><span class="pill">📍 {escape(lab)}</span></div>', unsafe_allow_html=True)
+            st.button("✏️ Ändern", key=f"{key}_chg", on_click=_forget_place, args=(key,))
+            return saved
     kw = dict(key=key, placeholder=PLACEHOLDER, clear_on_submit=False)
     fn = search_start if label.startswith("Start") else search_places
     try:
         v = st_searchbox(fn, style_overrides=SEARCH_STYLE, **kw)
     except TypeError:  # ältere Version ohne style_overrides
         v = st_searchbox(fn, **kw)
+    if v:
+        st.session_state[keep] = v
+        st.rerun()
     return v
 
 
@@ -5512,7 +5535,8 @@ def close_map():
 # Eingaben der Startseite bleiben beim Wechsel in die Karte und zurück erhalten (Streamlit verwirft sonst
 # den Zustand von Widgets, die in einem Durchlauf nicht gezeichnet werden).
 _KEEP_KEYS = ("page_sel", "water_", "acc_", "san_", "green_prefer", "green_avoid", "green_size", "level_", "loop_km",
-              "loop_same", "tour_same", "tour_extra", "n_stops")
+              "loop_same", "tour_same", "tour_extra", "n_stops", "start_sb_useloc", "green_sb_useloc", "loop_a_sb_useloc",
+              "tour_a_sb_useloc")
 
 
 _BUTTON_KEYS = {"san_plan", "san_show", "san_cancel"}
