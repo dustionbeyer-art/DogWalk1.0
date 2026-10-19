@@ -500,7 +500,7 @@ def _nearby_multi(selectors, lat, lon, radius):
         if "lat" not in c:
             continue
         t = e.get("tags", {})
-        kv = next(((k, v) for k, v in kvs if k and t.get(k) == v), None)
+        kv = frozenset((k, v) for k, v in kvs if k and t.get(k) == v)  # ein Laden kann mehreren Kategorien angehören
         if not kv:
             continue
         res.append((float(c["lat"]), float(c["lon"]), t.get("name") or t.get("brand") or t.get("operator") or "",
@@ -517,11 +517,46 @@ def _nominatim_poi(word, lat, lon, half_deg=0.05):
                      params={"q": word, "format": "jsonv2", "limit": 20, "accept-language": "de",
                              "viewbox": box, "bounded": 1})
     r.raise_for_status()
-    return [(float(x["lat"]), float(x["lon"]), x.get("name") or "", "", "") for x in r.json()]
+    return [(float(x["lat"]), float(x["lon"]), x.get("name") or "", "", "", frozenset({("nominatim", word)}))
+            for x in r.json()]
+
+
+_GENERIC_WORDS = {"kiosk", "imbiss", "restaurant", "gaststätte", "gaststaette", "café", "cafe", "bäckerei", "baeckerei",
+                  "bar", "pub", "getränkemarkt", "getraenkemarkt", "späti", "spaeti", "büdchen", "buedchen", "trinkhalle",
+                  "shop", "markt", "und", "der", "die", "das", "zum", "zur", "am"}
+
+
+def _norm_name(n):
+    """Name zum Vergleichen: klein, ohne Zeichen und ohne Allerweltswörter („Hit Kiosk“ = „Hit“)."""
+    words = re.findall(r"[a-z0-9äöüß]+", (n or "").lower().replace("&", " und "))
+    core = [w for w in words if w not in _GENERIC_WORDS]
+    return "".join(core or words)
+
+
+def merge_same_places(items, bias=None, radius_m=120.0):
+    """Ein Geschäft ist oft mehrfach eingetragen (Kiosk + Gaststätte + Getränkemarkt, mehrere OSM-Objekte).
+    Gleicher oder fast gleicher Name und weniger als 120 m Abstand: ein Eintrag, die Kategorien werden vereint."""
+    groups = []
+    for it in items:
+        nn = _norm_name(it[2])
+        if not nn:
+            continue
+        for g in groups:
+            same = g["nn"] == nn or (min(len(nn), len(g["nn"])) >= 4 and (nn in g["nn"] or g["nn"] in nn))
+            if same and dist_m((g["lat"], g["lon"]), (it[0], it[1])) <= radius_m:
+                g["kvs"] |= set(it[5])
+                if not g["street"] and it[3]:
+                    g["street"], g["nr"] = it[3], it[4]
+                break
+        else:
+            groups.append({"lat": it[0], "lon": it[1], "name": it[2], "street": it[3], "nr": it[4],
+                           "kvs": set(it[5]), "nn": nn})
+    return groups
 
 
 def keyword_places(term, bias):
-    """Schlagwort -> nahe Orte als Vorschläge (nach Entfernung). Erst 1 km, dann 2,5 km, dann 6 km Umkreis."""
+    """Schlagwort -> nahe Orte als Vorschläge (nach Entfernung, jedes Geschäft nur einmal).
+    Erst 1 km, dann 2,5 km, dann 6 km Umkreis."""
     if not bias:
         return []
     defs = _cat_defs(term)
@@ -540,20 +575,53 @@ def keyword_places(term, bias):
         # Ersatz: Nominatim (andere Server, anderer Zugang)
         for _, label, _s in defs[:2]:
             try:
-                items += [it + ((None, None),) for it in _nominatim_poi(label, lat, lon) if it[2]]
+                items += [it for it in _nominatim_poi(label, lat, lon) if it[2]]
             except Exception:
                 continue
+    items.sort(key=lambda it: dist_m((bias[0], bias[1]), (it[0], it[1])))
+    groups = merge_same_places(items, bias)
     out = []
-    for icon, label, sels in defs:
-        kvs = {_sel_kv(x) for x in sels}
-        mine = [it for it in items if it[5] in kvs or it[5] == (None, None)] if items else []
-        if items and items[0][5] == (None, None):
-            mine = items  # Nominatim-Ersatz kennt keine Tags
-        mine = sorted(mine, key=lambda it: dist_m((bias[0], bias[1]), (it[0], it[1])))[:4]
-        for la, lo, name, street, nr, _kv in mine:
-            addr = (street + (" " + nr if nr else "")) if street else ""
-            lab = f"{icon} {name} · {label}" + (f" · {addr}" if addr else "")
-            out.append((lab, _pack(la, lo, f"{icon} {name}")))
+    for g in groups[:12]:
+        cats = []  # passende Kategorien, in der Reihenfolge der Suchbegriff-Treffer
+        for icon, label, sels in defs:
+            kvs = {_sel_kv(x) for x in sels}
+            if (g["kvs"] & kvs or ("nominatim", label) in g["kvs"]) and (icon, label) not in cats:
+                cats.append((icon, label))
+        if not cats:
+            continue
+        addr = (g["street"] + (" " + g["nr"] if g["nr"] else "")) if g["street"] else ""
+        lab = f"{cats[0][0]} {g['name']} · " + " / ".join(c[1] for c in cats[:2]) + (f" · {addr}" if addr else "")
+        out.append((lab, _pack(g["lat"], g["lon"], f"{cats[0][0]} {g['name']}")))
+    return out[:6]
+
+
+def _title_of(label):
+    t = re.sub(r"^[^0-9A-Za-zÄÖÜäöüß]+", "", label or "")
+    return t.split(" · ")[0].strip()
+
+
+def dedupe_results(items, radius_m=120.0):
+    """Ergebnisliste (Label, Wert): gleiche Orte (Name + Nähe) nur einmal, Reihenfolge bleibt."""
+    out = []
+    for lab, val in items:
+        try:
+            la, lo, plab = _unpack(val)
+        except Exception:
+            out.append((lab, val))
+            continue
+        nn = _norm_name(_title_of(plab))
+        dup = False
+        for _l2, v2 in out:
+            try:
+                la2, lo2, p2 = _unpack(v2)
+            except Exception:
+                continue
+            n2 = _norm_name(_title_of(p2))
+            if nn and nn == n2 and dist_m((la, lo), (la2, lo2)) <= radius_m:
+                dup = True
+                break
+        if not dup:
+            out.append((lab, val))
     return out
 
 
@@ -719,9 +787,8 @@ def search_places(term):
             return dist_m((bias[0], bias[1]), (la, lo))
         kwhits.sort(key=dist_k)
         kwhits = [(f"{lab}  ·  {_fmt_dist(dist_k((lab, val)))}", val) for lab, val in kwhits][:6]
-        rest = [x for x in out if x[1] not in {v for _, v in kwhits}]
-        return (kwhits + rest)[:10]
-    return out[:8]
+        return dedupe_results(kwhits + out)[:10]
+    return dedupe_results(out)[:8]
 
 
 def _fmt_dist(m):
@@ -1597,7 +1664,7 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
 <div id="map"></div>
 <div id="clouds"></div>
 <div id="banner"><div id="ico">🧭</div><div><div id="dist"></div><div id="ins"></div></div></div>
-<div id="side"><button id="layers" title="Kartenstil wechseln">🗺️</button><button id="sat" title="Satellit / Luftbild">🛰️</button><button id="fit" title="Ganze Route zeigen">⤢</button></div>
+<div id="side"><button id="layers" title="Kartenstil wechseln">🗺️</button><button id="sat" title="Satellit / Luftbild">🛰️</button><button id="fit" title="Ganze Route zeigen">⤢</button><button id="wcbtn" title="Toiletten ein-/ausblenden" style="display:none">🚻</button></div>
 <div id="sheet">
  <div id="ttl"></div>
  <div id="pre"><div id="chips"></div><div id="stats"></div><div id="hint"></div></div>
@@ -1974,6 +2041,19 @@ window.addEventListener('resize', fix);
 if (window.visualViewport) window.visualViewport.addEventListener('resize', fix);
 if (window.ResizeObserver) new ResizeObserver(fix).observe($('map'));
 showOption(D.default || 0, false);
+if (D.san && ((D.san.pub || []).length || (D.san.cust || []).length)) {
+  const wcLayer = L.layerGroup().addTo(map);
+  const wcIcon = c => L.divIcon({className: '', iconSize: [30, 30], iconAnchor: [15, 15],
+    html: '<div style="width:30px;height:30px;border-radius:50%;background:' + c + ';border:2px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;font-size:16px">🚻</div>'});
+  const addWc = (arr, color, label) => (arr || []).forEach(t => {
+    L.marker([t[0], t[1]], {icon: wcIcon(color), zIndexOffset: 300}).addTo(wcLayer)
+      .bindPopup('<b>' + esc(t[2]) + '</b><br><i>' + label + '</i>' + (t[3] ? '<br>' + esc(t[3]) : ''));
+  });
+  addWc(D.san.pub, '#2F6F8F', 'Öffentliche Toilette');
+  addWc(D.san.cust, '#E0A526', 'Kundentoilette / Gaststätte');
+  const wcb = $('wcbtn'); wcb.style.display = ''; let wcOn = true;
+  wcb.addEventListener('click', () => { wcOn = !wcOn; wcOn ? wcLayer.addTo(map) : map.removeLayer(wcLayer); wcb.style.opacity = wcOn ? 1 : .45; });
+}
 if (window.INTRO) {
   // Anflug: erst weit herausgezoomt, dann sanfter Flug auf die Route, während die Wolken aufreißen
   setTimeout(() => {
@@ -3391,6 +3471,171 @@ def make_tour_view_safe(start_v, stops_v, end_v, level, buf=150, log=lambda *_: 
             raise e
 
 
+# ------------------------------------------------------- Sanitäroptionen (Toiletten am Weg)
+# Datenquelle: OpenStreetMap (amenity=toilets, Zugang/Gebühr/Rollstuhl/Öffnungszeiten). Die Daten sind
+# freiwillig gepflegt und können unvollständig sein; Kundentoiletten in Gaststätten sind nicht garantiert.
+SAN_GASTRO = "restaurant|cafe|pub|bar|fast_food|biergarten"
+SAN_REACHES = [100, 150, 250, 400]
+SAN_NOTE = "Benutzung der Sanitäranlagen nicht garantiert. Nutzung nur für Gäste, Kundentoilette."
+
+
+def payload_from_html(html):
+    """Die Kartendaten (JSON) aus dem fertigen Karten-HTML zurückholen."""
+    i = html.index("const D = ") + len("const D = ")
+    j = html.index(";\nconst $ = id =>", i)
+    return json.loads(html[i:j].replace("<\\/", "</"))
+
+
+def _thin(coords, n=70):
+    if len(coords) <= n:
+        return [list(c) for c in coords]
+    step = len(coords) / float(n)
+    out = [list(coords[int(k * step)]) for k in range(n)]
+    out.append(list(coords[-1]))
+    return out
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _san_overpass(q):
+    return _overpass_race(q, timeout=14.0)
+
+
+def fetch_sanitary(option_coords, reach):
+    """Toiletten und Gaststätten in einem Schlauch um die Routen (Overpass „around“ entlang der Linie)."""
+    body = ""
+    for coords in option_coords:
+        line = ",".join(f"{la:.5f},{lo:.5f}" for la, lo in _thin(coords))
+        a = f"(around:{int(reach)},{line})"
+        body += f'nwr["amenity"="toilets"]{a};nwr["amenity"~"^({SAN_GASTRO})$"]["name"]{a};'
+    js = _san_overpass(f"[out:json][timeout:14];({body});out center tags 900;")
+    return js.get("elements", [])
+
+
+def _san_info(t, kind):
+    bits = []
+    if kind == "pub":
+        bits.append("öffentlich")
+    fee = t.get("fee")
+    if fee in ("yes", "no"):
+        bits.append("gebührenpflichtig" if fee == "yes" else "kostenlos")
+        if fee == "yes" and t.get("charge"):
+            bits[-1] += f" ({t['charge']})"
+    if t.get("wheelchair") in ("yes", "designated"):
+        bits.append("rollstuhlgerecht")
+    if t.get("opening_hours"):
+        bits.append("Zeiten: " + t["opening_hours"][:60])
+    if t.get("operator") and kind == "pub":
+        bits.append(t["operator"][:40])
+    return " · ".join(bits)
+
+
+def classify_sanitary(elements):
+    """-> Liste {kind: pub|cust|gastro, lat, lon, name, info}. Privat/gesperrte Toiletten fallen weg."""
+    out = []
+    for e in elements:
+        c = e.get("center") or e
+        if "lat" not in c:
+            continue
+        t = e.get("tags", {})
+        if t.get("amenity") == "toilets":
+            acc = t.get("access", "")
+            if acc in ("private", "no"):
+                continue
+            kind = "cust" if acc in ("customers", "permit") else "pub"
+            name = t.get("name") or ("Öffentliche Toilette" if kind == "pub" else "Kundentoilette")
+        else:
+            kind, name = "gastro", t.get("name", "")
+            if not name:
+                continue
+        out.append({"kind": kind, "lat": float(c["lat"]), "lon": float(c["lon"]), "name": name,
+                    "info": _san_info(t, kind), "kv": t.get("amenity", "")})
+    return out
+
+
+def _route_frame(coords):
+    a = np.asarray(coords, float)
+    lat0 = float(a[:, 0].mean())
+    ky, kx = 110540.0, 111320.0 * math.cos(math.radians(lat0))
+    return lat0, float(a[:, 1].mean()), kx, ky
+
+
+def _near_route(coords, pts, reach):
+    """Je Punkt (lat, lon): (Abstand zur Route in m, Position entlang der Route in m)."""
+    from scipy.spatial import cKDTree
+    a = np.asarray(coords, float)
+    lat0, lon0, kx, ky = _route_frame(coords)
+    X, Y = (a[:, 1] - lon0) * kx, (a[:, 0] - lat0) * ky
+    cum = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(X), np.diff(Y)))])
+    total = float(cum[-1])
+    if total <= 0 or not pts:
+        return [(1e9, 0.0)] * len(pts)
+    s = np.arange(0.0, total + 5.0, 5.0)
+    px, py = np.interp(s, cum, X), np.interp(s, cum, Y)
+    d, idx = cKDTree(np.c_[px, py]).query(
+        np.c_[[(p[1] - lon0) * kx for p in pts], [(p[0] - lat0) * ky for p in pts]])
+    return [(float(d[k]), float(s[idx[k]])) for k in range(len(pts))]
+
+
+def add_sanitary(view, reach=150, log=lambda *_: None):
+    """Sanitäroptionen in eine fertige Kartenansicht einarbeiten: Toiletten am Weg, Hinweis je Route, Marker.
+    Rückgabe: {"n_public": …, "cands": [...]} für die Standardroute (Warnung vor der Anzeige)."""
+    payload = payload_from_html(view["html"])
+    opts = payload["options"]
+    log("🚻 Toiletten entlang der Route suchen")
+    elements = fetch_sanitary([o["coords"] for o in opts], reach + 60)
+    items = classify_sanitary(elements)
+    pts = [(it["lat"], it["lon"]) for it in items]
+    per_opt = []
+    for o in opts:
+        info = _near_route(o["coords"], pts, reach)
+        mine = []
+        for it, (d, s_) in zip(items, info):
+            if d <= reach:
+                mine.append({**it, "d": d, "s": s_})
+        per_opt.append(mine)
+    default = int(payload.get("default") or 0)
+    for o, mine in zip(opts, per_opt):
+        pub = sorted((m for m in mine if m["kind"] in ("pub",)), key=lambda m: m["s"])
+        cust = [m for m in mine if m["kind"] == "cust"]
+        if pub:
+            first = f", erste bei {_fmt_dist(pub[0]['s'])}" if pub[0]["s"] > 20 else ""
+            o["hint"] = (o.get("hint") or "") + f" · 🚻 {len(pub)} öffentliche Toilette{'n' if len(pub) != 1 else ''} am Weg{first}"
+        elif cust:
+            o["hint"] = (o.get("hint") or "") + " · 🚻 keine öffentliche Toilette, aber Kundentoilette am Weg"
+        else:
+            o["hint"] = (o.get("hint") or "") + " · 🚻 keine Toilette am Weg gefunden"
+    mine_def = per_opt[default] if per_opt else []
+    n_public = sum(1 for m in mine_def if m["kind"] == "pub")
+    n_cust = sum(1 for m in mine_def if m["kind"] == "cust")
+    gastro = sorted((m for m in mine_def if m["kind"] == "gastro"), key=lambda m: (m["d"], m["s"]))
+    # Marker für die Karte: alle Toiletten an irgendeiner Route; Gaststätten nur, wenn keine öffentliche da ist
+    seen, pubs, custs = set(), [], []
+    for mine in per_opt:
+        for m in mine:
+            key = (round(m["lat"], 5), round(m["lon"], 5), m["kind"])
+            if key in seen:
+                continue
+            seen.add(key)
+            if m["kind"] == "pub":
+                pubs.append([round(m["lat"], 5), round(m["lon"], 5), m["name"], m["info"]])
+            elif m["kind"] == "cust" or (m["kind"] == "gastro" and n_public == 0):
+                custs.append([round(m["lat"], 5), round(m["lon"], 5), m["name"],
+                              (m["info"] + " · " if m["info"] else "") + SAN_NOTE])
+    payload["san"] = {"pub": pubs[:80], "cust": custs[:40]}
+    view["html"] = map_html(payload)
+    cands = [{"name": m["name"], "lat": m["lat"], "lon": m["lon"], "d": m["d"], "s": m["s"], "kv": m["kv"]}
+             for m in gastro]
+    seen_n, uniq = set(), []
+    for c in cands:  # gleiche Gaststätte nur einmal
+        k = _norm_name(c["name"])
+        if k in seen_n:
+            continue
+        seen_n.add(k)
+        uniq.append(c)
+    view["san"] = {"n_public": n_public, "n_cust": n_cust, "cands": uniq[:8], "reach": reach}
+    return view["san"]
+
+
 # ------------------------------------------------------- Logo / App-Ikon (eingebettet, keine Zusatzdateien nötig)
 # Blatt mit Zielpunkt: Kleinform fürs Ikon (Browser-Tab 64 px, Home-Bildschirm 180 px)
 ICON_FAV_B64 = "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"
@@ -3904,6 +4149,18 @@ def bump_km(delta):
         gw["recalc"] = True
 
 
+def _san_carry(old, new):
+    """Sanitäroptionen bleiben beim Neuberechnen in der Karte aktiv."""
+    reach = old.get("san_reach")
+    if not reach:
+        return
+    new["san_reach"] = reach
+    try:
+        add_sanitary(new, reach)
+    except Exception:
+        pass
+
+
 def render_map_view():
     """Vollbild-Karte mit Suchfeld (Ziel ändern) bzw. Längen-Regler (Ründchen) in der Karte."""
     gw = st.session_state["gw"]
@@ -3973,6 +4230,7 @@ def render_map_view():
             new = make_tour_view_safe(gw["start"], gw["stops_v"] + [add_new], gw["end_v"], gw["level"], gw["buf"],
                                       extra_km=gw.get("extra_km", 0))
             new["sid"] = gw["sid"] + 1  # neues leeres Suchfeld
+            _san_carry(gw, new)
             st.session_state["gw_sid"] = max(st.session_state.get("gw_sid", 0), new["sid"])
             st.session_state["gw"] = new
             st.rerun()
@@ -3996,6 +4254,7 @@ def render_map_view():
             st.toast(f"⚠️ {e}"[:220])
     if new:
         new["sid"] = gw["sid"]
+        _san_carry(gw, new)
         st.session_state["gw"] = new
         st.rerun()
 
@@ -4004,6 +4263,113 @@ def render_map_view():
 
 
 # ---------- Startseite
+def san_settings(prefix):
+    """Feineinstellungen (Startseite): Sanitäroptionen. Rückgabe: Reichweite in m oder None."""
+    with st.expander("⚙️ Feineinstellungen"):
+        on = st.toggle("🚻 Sanitäroptionen", key=f"san_{prefix}", value=False,
+                       help="Zeigt öffentliche Toiletten entlang der Route (Daten: OpenStreetMap) und warnt, "
+                            "wenn keine in der Nähe ist.")
+        reach = st.select_slider("Höchstabstand der Toilette zum Weg", options=SAN_REACHES, value=150,
+                                 key=f"sanr_{prefix}", format_func=lambda m: f"{m} m", disabled=not on)
+    return reach if on else None
+
+
+def san_finish(view, reach, ov):
+    """Toiletten einarbeiten. Gibt (view, wartet) zurück; gibt es keine, wird die Route erst nach Rückfrage gezeigt."""
+    if not reach:
+        return view, False
+    view["san_reach"] = reach
+    try:
+        res = add_sanitary(view, reach, log=ov.log)
+    except Exception:
+        res = None
+        view["san"] = {"n_public": 0, "n_cust": 0, "cands": [], "reach": reach, "failed": True}
+    if res is None or res["n_public"] == 0:
+        return view, True
+    return view, False
+
+
+def san_gate(view, reach, ov):
+    """Karte öffnen – oder bei fehlenden Toiletten zuerst die Warnung zeigen."""
+    view, wait = san_finish(view, reach, ov)
+    if wait:
+        st.session_state["san_pending"] = view
+    else:
+        open_map(view)
+    st.rerun()
+
+
+def render_san_pending():
+    view = st.session_state["san_pending"]
+    san = view.get("san", {})
+    reach = san.get("reach", 150)
+    st.markdown("### 🚻 Sanitäroptionen")
+    if san.get("failed"):
+        st.warning("Die Toilettendaten konnten gerade nicht geladen werden. Ich kann daher nicht sagen, ob auf der "
+                   "Route eine Toilette liegt.")
+    else:
+        st.warning(f"Auf dieser Route habe ich im Umkreis von {reach} m keine öffentliche Toilette gefunden. "
+                   "Die Daten stammen aus OpenStreetMap und können unvollständig sein.")
+        if san.get("n_cust"):
+            st.info(f"Es gibt {san['n_cust']} Kundentoilette(n) am Weg (nur für Gäste).")
+    cands = san.get("cands", [])
+    choice = None
+    if cands:
+        st.markdown("**Alternative:** Eine Gaststätte oder ein Café einplanen, die vermutlich eine Gästetoilette hat.")
+        labels = [f"{c['name']} · {_fmt_dist(c['d'])} vom Weg" for c in cands]
+        pick = st.selectbox("Gaststätte auf dem Weg", range(len(cands)), format_func=lambda i: labels[i],
+                            key="san_pick")
+        choice = cands[pick]
+        st.caption("🚻 Private Sanitäranlagen. " + SAN_NOTE)
+    else:
+        st.caption("Keine Gaststätte in der Nähe des Wegs gefunden. Tipp: Route mit größerem Höchstabstand "
+                   "neu berechnen oder ein Café als Zwischenziel wählen.")
+    c1, c2, c3 = st.columns(3)
+    if choice and c1.button("Gaststätte einplanen", type="primary", use_container_width=True, key="san_plan"):
+        try:
+            with st.spinner("Route mit Zwischenstopp wird berechnet …"):
+                new = replan_with_stop(view, choice)
+            st.session_state.pop("san_pending", None)
+            open_map(new)
+            st.rerun()
+        except Exception as e:
+            st.error(f"Einplanen nicht möglich: {e}")
+    if c2.button("Route trotzdem anzeigen", use_container_width=True, key="san_show"):
+        st.session_state.pop("san_pending", None)
+        open_map(view)
+        st.rerun()
+    if c3.button("Abbrechen", use_container_width=True, key="san_cancel"):
+        st.session_state.pop("san_pending", None)
+        st.rerun()
+
+
+def replan_with_stop(view, cand):
+    """Gaststätte als Zwischenziel einplanen und neu rechnen (Typ je nach Modus)."""
+    stop = _pack(cand["lat"], cand["lon"], "🍽️ " + cand["name"])
+    st.session_state["_water"] = bool(view.get("water"))
+    reach = view.get("san_reach")
+    lvl = view.get("level") if view.get("level") in TOUR_LEVELS else "Sehr grün"
+    if view["mode"] == "ab":
+        new = make_tour_view_safe(view["start"], [stop], view["dest"], "Sehr grün")
+    elif view["mode"] == "loop":
+        d0 = dist_m(view["p1"], (cand["lat"], cand["lon"]))
+        extra = max(0, round(view["km"] - 2.6 * d0 / 1000.0))
+        extra = extra if extra >= 1 else 0
+        new = make_tour_view_safe(view["start"], [stop], view.get("end"), lvl, extra_km=extra)
+    else:
+        if len(view.get("stops_v", [])) >= TOUR_MAX_MAP_STOPS:
+            raise ValueError("Es sind schon die maximal möglichen Zwischenziele geplant.")
+        new = make_tour_view_safe(view["start"], list(view["stops_v"]) + [stop], view.get("end_v"), view["level"],
+                                  extra_km=view.get("extra_km", 0))
+    new["san_reach"] = reach
+    if reach:
+        try:
+            add_sanitary(new, reach)
+        except Exception:
+            pass
+    return new
+
+
 def home_route():
     with st.container(key="card_route"):
         start_v = start_input("Start", "start_sb")
@@ -4011,6 +4377,7 @@ def home_route():
         st.caption(SEARCH_TIP)
         water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_route", value=False,
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
+        san_reach = san_settings("route")
         go = st.button("Route finden", type="primary", use_container_width=True, key="go_ab")
     if not go:
         return
@@ -4028,8 +4395,7 @@ def home_route():
             status.update(label="Fehler", state="error")
             show_error(e)
     if view:
-        open_map(view)
-        st.rerun()
+        san_gate(view, san_reach, ov)
     ov.empty()
 
 
@@ -4048,6 +4414,7 @@ def home_loop():
                                  key="level_loop")
         water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_loop", value=False,
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
+        san_reach = san_settings("loop")
         go = st.button("Ründchen finden", type="primary", use_container_width=True, key="go_loop")
     if not go:
         return
@@ -4074,8 +4441,7 @@ def home_loop():
             status.update(label="Fehler", state="error")
             show_error(e)
     if view:
-        open_map(view)
-        st.rerun()
+        san_gate(view, san_reach, ov)
     ov.empty()
 
 
@@ -4106,6 +4472,7 @@ def home_tour():
         level = st.select_slider("Wie grün soll es sein?", options=TOUR_LEVELS, value="Sehr grün", key="level_tour")
         water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_tour", value=False,
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
+        san_reach = san_settings("tour")
         go = st.button("Ründchen mit Zwischenziel finden", type="primary", use_container_width=True, key="go_tour")
     if not go:
         return
@@ -4123,8 +4490,7 @@ def home_tour():
             status.update(label="Fehler", state="error")
             show_error(e)
     if view:
-        open_map(view)
-        st.rerun()
+        san_gate(view, san_reach, ov)
     ov.empty()
 
 
@@ -4151,5 +4517,7 @@ def render_home():
 
 if st.session_state.get("gw"):
     render_map_view()
+elif st.session_state.get("san_pending"):
+    render_san_pending()
 else:
     render_home()
