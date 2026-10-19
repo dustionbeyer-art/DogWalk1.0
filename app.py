@@ -4508,6 +4508,10 @@ OVERLAY_HTML = """
 #gwload{position:fixed;inset:0;z-index:99999;background:#F4EFE6;display:flex;flex-direction:column;align-items:center;
  justify-content:center;gap:16px;animation:gwfade .35s ease both;overflow:hidden;font-family:system-ui,-apple-system,sans-serif;padding:0 22px}
 @keyframes gwfade{from{opacity:0}to{opacity:1}}
+#gwload .cbg{position:absolute;inset:-24px;background-size:cover;background-position:center;filter:blur(7px) saturate(.85);
+ transform:scale(1.04);animation:gwbgin 1.2s ease both}
+#gwload .cmilk{position:absolute;inset:0;background:linear-gradient(rgba(244,239,230,.66),rgba(244,239,230,.74))}
+@keyframes gwbgin{from{opacity:0}to{opacity:1}}
 #gwload .b{position:absolute;border-radius:50%;filter:blur(34px);background:radial-gradient(closest-side,rgba(255,255,255,.95),rgba(255,255,255,.5) 55%,rgba(255,255,255,0));
  animation:gwdrift 9s ease-in-out infinite alternate}
 #gwload .b:nth-child(1){width:70vmax;height:44vmax;left:-20vmax;top:-8vmax}
@@ -4532,7 +4536,7 @@ OVERLAY_HTML = """
 @media (prefers-reduced-motion:reduce){#gwload *{animation-duration:0s!important}#gwload .fact p:first-of-type{opacity:1}}
 __FACTCSS__
 </style>
-<div id="gwload"><i class="b"></i><i class="b"></i><i class="b"></i><i class="b"></i>
+<div id="gwload">__CITYBG__<i class="b"></i><i class="b"></i><i class="b"></i><i class="b"></i>
 <div class="logo"><img src="data:image/svg+xml;base64,__LOGO__" alt=""></div>
 <div class="st">__STAGE__</div><div class="bar"></div>
 <div class="fact"><small>__LABEL__</small>__FACTS__</div></div>
@@ -4672,6 +4676,54 @@ def pick_facts(lat=None, lon=None, water=False, month=None, seen=None):
     return out
 
 
+_BG_CACHE = {}  # gerundete Koordinaten -> (Stadt, Bild-URL oder "")
+_BG_LOCK = threading.Lock()
+
+
+def _city_name(lat, lon):
+    reg = region_facts(lat, lon)
+    if reg:
+        return reg[0]
+    r = requests.get("https://photon.komoot.io/reverse", headers=UA, timeout=3,
+                     params={"lat": lat, "lon": lon, "lang": "de", "limit": 1})
+    pr = (r.json().get("features") or [{}])[0].get("properties", {})
+    return pr.get("city") or pr.get("town") or pr.get("county") or pr.get("state") or ""
+
+
+def _city_image(city):
+    """Freies Titelbild des Wikipedia-Artikels der Stadt (meist Skyline/Wahrzeichen), ca. 900 px breit."""
+    for lang in ("de", "en"):
+        r = requests.get(f"https://{lang}.wikipedia.org/w/api.php", headers=UA, timeout=3, params={
+            "action": "query", "format": "json", "titles": city, "redirects": 1, "prop": "pageimages",
+            "piprop": "thumbnail", "pithumbsize": 900})
+        for pg in (r.json().get("query", {}).get("pages") or {}).values():
+            u = (pg.get("thumbnail") or {}).get("source", "")
+            if u.startswith("https://upload.wikimedia.org/") and not u.lower().endswith(".svg.png"):
+                return u
+    return ""
+
+
+def city_background(lat, lon):
+    """(Stadt, Bild-URL) zum Ort; im Hintergrund geladen, damit nichts blockiert. Leer, wenn nichts gefunden."""
+    key = (round(lat, 2), round(lon, 2))
+    with _BG_LOCK:
+        if key in _BG_CACHE:
+            return _BG_CACHE[key]
+    try:
+        city = _city_name(lat, lon)
+        with _BG_LOCK:
+            for k, v in _BG_CACHE.items():  # gleiche Stadt schon bekannt
+                if v[0] == city and v[1]:
+                    _BG_CACHE[key] = v
+                    return v
+        res = (city, _city_image(city) if city else "")
+    except Exception:
+        return ("", "")  # nicht merken: nächster Versuch möglich
+    with _BG_LOCK:
+        _BG_CACHE[key] = res
+    return res
+
+
 class Overlay:
     """Vollbild-Ladeansicht mit Arbeitsstand (aktueller Schritt) und wechselnden Natur-/Ortsfakten."""
     PER = 7.0  # Sekunden je Fakt
@@ -4687,6 +4739,17 @@ class Overlay:
         except Exception:
             seen = None
         self.facts = pick_facts(lat, lon, water, seen=seen)
+        self.bg = ""
+        self._bgt = None
+        if lat is not None:
+            def work():
+                try:
+                    self.bg = city_background(lat, lon)[1]
+                except Exception:
+                    pass
+            self._bgt = threading.Thread(target=work, daemon=True)
+            self._bgt.start()
+            self._bgt.join(2.0)  # kurz warten, sonst erscheint das Bild beim nächsten Schritt
         self.stage = "Ich suche den grünsten Weg" + (" am Wasser entlang" if water else "") + " …"
         self.ph = st.empty()
         self.render()
@@ -4704,10 +4767,17 @@ class Overlay:
             logo = base64.b64encode(LOGO_SVG.encode()).decode()
             html = (OVERLAY_HTML.replace("__FACTCSS__", css).replace("__LOGO__", logo)
                     .replace("__STAGE__", escape(self.stage)).replace("__FACTS__", facts)
-                    .replace("__LABEL__", "Wusstest du?"))
+                    .replace("__LABEL__", "Wusstest du?")
+                    .replace("__CITYBG__", self._bg_html()))
             self.ph.markdown(html, unsafe_allow_html=True)
         except Exception:
             pass
+
+    def _bg_html(self):
+        u = self.bg or ""
+        if not u.startswith("https://upload.wikimedia.org/") or any(c in u for c in "\"'<> \\"):
+            return ""
+        return f"<div class='cbg' style='background-image:url(\"{u}\")'></div><div class='cmilk'></div>"
 
     def log(self, msg):
         """Schritt anzeigen (und weiter ins versteckte Statusfeld schreiben)."""
