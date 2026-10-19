@@ -3474,9 +3474,10 @@ def make_tour_view_safe(start_v, stops_v, end_v, level, buf=150, log=lambda *_: 
 # ------------------------------------------------------- „Ins Grün“: passende Grünfläche in der Nähe finden
 GREEN_RADIUS = 10000
 GREEN_PREFS = ["Wassernähe", "Sanitäroption", "Sportangebote", "Spielplätze aller Art", "Sehenswürdigkeiten"]
+GREEN_PREFS_PREFER = GREEN_PREFS + ["Barrierefreiheit"]
 GREEN_CAT = {"Wassernähe": "water", "Sanitäroption": "san", "Sportangebote": "sport",
-             "Spielplätze aller Art": "play", "Sehenswürdigkeiten": "sight"}
-GREEN_ICON = {"water": "💧", "san": "🚻", "sport": "⚽", "play": "🛝", "sight": "🏛️"}
+             "Spielplätze aller Art": "play", "Sehenswürdigkeiten": "sight", "Barrierefreiheit": "access"}
+GREEN_ICON = {"water": "💧", "san": "🚻", "sport": "⚽", "play": "🛝", "sight": "🏛️", "access": "♿"}
 GREEN_SIZES = {"Klein (bis 2 ha)": (0.2, 2.0), "Mittel (2–15 ha)": (2.0, 15.0),
                "Groß (15–100 ha)": (15.0, 100.0), "Sehr groß (ab 100 ha)": (100.0, 1e9)}
 SPORT_SPORTS = ("basketball|table_tennis|skateboard|soccer|volleyball|tennis|climbing|bmx|handball|"
@@ -3499,6 +3500,7 @@ FEAT_QUERIES = {
     "play": 'nwr["leisure"="playground"]',
     "sport": 'nwr["leisure"~"^(pitch|fitness_station|sports_centre|skate_park|dog_park|track)$"];nwr["amenity"="boat_rental"]',
     "water": 'wr["natural"="water"];wr["waterway"~"^(river|canal)$"]',
+    "access": 'nwr["amenity"="toilets"]["wheelchair"~"^(yes|designated)$"];wr["highway"~"^(footway|path|pedestrian|cycleway)$"]["wheelchair"~"^(yes|designated)$"];nwr["leisure"~"^(park|playground|garden)$"]["wheelchair"~"^(yes|designated)$"]',
     "sight": 'nwr["tourism"~"^(attraction|viewpoint|zoo)$"];nwr["historic"~"^(monument|castle|ruins|fort|archaeological_site|tower)$"]',
 }
 
@@ -3554,6 +3556,18 @@ def _bounds(e):
     return None
 
 
+def feature_cats(t):
+    """Wie feature_cat, aber mit Barrierefreiheit zusätzlich: Liste der Kategorien."""
+    out = []
+    c = feature_cat(t)
+    if c:
+        out.append(c)
+    if t.get("wheelchair") in ("yes", "designated") and (t.get("amenity") == "toilets" or t.get("highway")
+                                                          or t.get("leisure") in ("park", "playground", "garden")):
+        out.append("access")
+    return out
+
+
 def feature_cat(t):
     """OSM-Tags → Kategorie (water/san/sport/play/sight) oder None."""
     if t.get("amenity") == "toilets":
@@ -3576,15 +3590,16 @@ def _area_ha(b):
     return (la1 - la0) * ky * (lo1 - lo0) * kx * 0.6 / 10000.0  # Rechteck → grob auf die echte Fläche
 
 
-def rank_greens(greens, feats, prefer, avoid, size_range, pos):
+def rank_greens(greens, feats, prefer, avoid, size_range, pos, min_ha=0.2, min_d=100.0):
     """Grünflächen nach Passung sortieren. greens/feats sind Overpass-Elemente (mit bounds/center)."""
     lat0, lon0 = pos
     ky, kx = 110540.0, 111320.0 * math.cos(math.radians(lat0))
     items = []
     for e in feats:
-        cat, b = feature_cat(e.get("tags", {})), _bounds(e)
-        if cat and b:
-            items.append((cat, b))
+        b = _bounds(e)
+        if b:
+            for cat in feature_cats(e.get("tags", {})):
+                items.append((cat, b))
     lo_ha, hi_ha = size_range
     out = []
     for e in greens:
@@ -3592,7 +3607,7 @@ def rank_greens(greens, feats, prefer, avoid, size_range, pos):
         if not b:
             continue
         ha = _area_ha(b)
-        if ha < 0.2:
+        if ha < min_ha:
             continue
         la0, lo0, la1, lo1 = b
         cla, clo = (la0 + la1) / 2, (lo0 + lo1) / 2
@@ -3602,7 +3617,7 @@ def rank_greens(greens, feats, prefer, avoid, size_range, pos):
         if d < 200:  # Standort liegt im Rechteck der Fläche: Mitte ansteuern
             target = (cla, clo)
             d = math.hypot((cla - lat0) * ky, (clo - lon0) * kx)
-        if d < 100 or d > GREEN_RADIUS:
+        if d < min_d or d > GREEN_RADIUS * 1.15:
             continue
         m = 60.0 / ky
         mx = m * ky / kx
@@ -3660,10 +3675,16 @@ def green_view(start_v, g, prefer, avoid):
     mins = max(1, round(nav["total"] / M_PER_MIN))
     why = green_reasons(g)
     hint = "Schnellster Weg zur am besten passenden Grünfläche" + (" · " + " · ".join(why) if why else "")
-    if g["counts"] and avoid:
-        bad = [GREEN_ICON[c] for c in avoid if g["counts"].get(c)]
-        if bad:
-            hint += " · ⚠️ enthält auch " + " ".join(bad)
+    bad = [GREEN_ICON[c] for c in avoid if g["counts"].get(c)]
+    if bad:
+        hint += " · ⚠️ enthält auch " + " ".join(bad)
+    miss = [GREEN_ICON[c] for c in g.get("missing", []) if c not in g.get("failed", [])]
+    if miss:
+        hint += " · ℹ️ nicht gefunden: " + " ".join(miss)
+    if g.get("failed"):
+        hint += " · ⚠️ nicht abrufbar: " + " ".join(GREEN_ICON[c] for c in g["failed"])
+    if g.get("note"):
+        hint += " · ⚠️ " + g["note"]
     opt = _option(nav, "Schnellste", f"{fmt_km(nav['total'])} · {mins} min", hint,
                   [["Länge", fmt_km(nav["total"])], ["Dauer", f"{mins} min"], ["Fläche", fmt_ha(g["ha"])],
                    ["Passt zu", " ".join(GREEN_ICON[c] for c in g["counts"]) or "–"]])
@@ -3673,17 +3694,61 @@ def green_view(start_v, g, prefer, avoid):
             "start": start_v, "dest": _pack(p2[0], p2[1], t2), "area": None, "bbox": None, "buf": 150}
 
 
+class NoGreen(Exception):
+    """Keine Grünfläche gefunden – kein Programmfehler, sondern ein Hinweis an die Person."""
+
+
+def _nominatim_greens(pos):
+    """Notlösung, wenn der Kartenabruf nichts liefert: Parks und Wälder per Ortssuche (Nominatim)."""
+    out = []
+    for word in ("Park", "Wald", "Grünanlage"):
+        try:
+            for la, lo, name, *_ in _nominatim_poi(word, pos[0], pos[1], half_deg=0.09):
+                d = 100.0 / 110540.0
+                dx = d / max(math.cos(math.radians(la)), 0.3)
+                out.append({"tags": {"name": name, "leisure": "park"},
+                            "bounds": {"minlat": la - d, "minlon": lo - dx, "maxlat": la + d, "maxlon": lo + dx}})
+        except Exception:
+            pass
+    return out
+
+
 def find_green(pos, prefer, avoid, size_range, log=lambda *_: None):
+    """Beste Grünfläche samt Hinweisen. Fehlende Daten führen nie zum Abbruch: es wird gelockert, ausgewichen
+    und der Hinweis später an der Route angezeigt."""
     log("🌳 Grünflächen im Umkreis von 10 km suchen")
     cats = list(dict.fromkeys(list(prefer) + list(avoid)))
-    greens, feats, failed = _green_fetch(round(pos[0], 3), round(pos[1], 3), GREEN_RADIUS, cats)
+    greens, feats, failed = [], [], []
+    try:
+        greens, feats, failed = _green_fetch(round(pos[0], 3), round(pos[1], 3), GREEN_RADIUS, cats)
+    except Exception:
+        log("⚠️ Kartenserver antworten nicht, ich nutze die Ortssuche")
     if failed:
         log("⚠️ Nicht alle Angaben abrufbar: " + ", ".join(GREEN_ICON[c] for c in failed))
     log("🔎 Ausstattung vergleichen")
-    ranked = rank_greens(greens, feats, [c for c in prefer if c not in failed], [c for c in avoid if c not in failed],
-                         size_range, pos)
+    use_p = [c for c in prefer if c not in failed]
+    use_a = [c for c in avoid if c not in failed]
+    note = ""
+    ranked = rank_greens(greens, feats, use_p, use_a, size_range, pos)
+    if not ranked and greens:
+        log("ℹ️ Nichts Passendes in Wunschgröße, ich lockere die Suche")
+        ranked = rank_greens(greens, feats, use_p, use_a, size_range, pos, min_ha=0.05, min_d=30.0)
     if not ranked:
-        raise ValueError("Im Umkreis von 10 km habe ich keine passende Grünfläche gefunden.")
+        log("🌿 Weitere Suche über die Ortssuche")
+        extra = _nominatim_greens(pos)
+        if extra:
+            ranked = rank_greens(extra, [], [], [], size_range, pos, min_ha=0.05, min_d=30.0)
+            note = "Genauere Daten waren nicht abrufbar: Fläche und Ausstattung sind nicht geprüft."
+            use_p, use_a = [], []
+    if not ranked:
+        raise NoGreen("Im Umkreis von 10 km habe ich keine Grünfläche gefunden. Das kann an fehlenden "
+                      "OpenStreetMap-Daten oder überlasteten Servern liegen. Bitte in ein paar Minuten noch einmal "
+                      "versuchen oder den Start an einen anderen Ort legen." + f" (Treffer im Kartenabruf: {len(greens)})")
+    for g in ranked:
+        g["counts"] = {c: n for c, n in g["counts"].items() if c in cats}
+        g["missing"] = [c for c in prefer if c not in g["counts"]]
+        g["failed"] = [c for c in failed if c in cats]
+        g["note"] = note
     return ranked
 
 
@@ -3993,6 +4058,22 @@ try{var T=window.parent.document.querySelector('title');
 })();</script>"""
 
 
+SELECT_JS = """<script>(function(){
+try{var P=window.parent,D=P.document;if(P.__gwSel)return;P.__gwSel=1;var swallow=0;
+D.addEventListener('mousedown',function(e){
+ var sel=e.target.closest&&e.target.closest('[data-baseweb="select"]');if(!sel)return;
+ var svg=e.target.closest('svg');if(!svg||svg.closest('[data-baseweb="tag"]'))return;
+ var all=[].slice.call(sel.querySelectorAll('svg')).filter(function(x){return!x.closest('[data-baseweb="tag"]')});
+ if(svg!==all[all.length-1])return;
+ var inp=sel.querySelector('input');
+ if(inp&&inp.getAttribute('aria-expanded')==='true'){e.preventDefault();e.stopPropagation();swallow=Date.now();inp.blur();
+  inp.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',keyCode:27,bubbles:true}))}
+},true);
+D.addEventListener('click',function(e){if(Date.now()-swallow<400&&e.target.closest&&e.target.closest('[data-baseweb="select"]')){e.preventDefault();e.stopPropagation()}},true);
+}catch(e){}
+})();</script>"""
+
+
 def page_icon():
     try:
         import io
@@ -4005,7 +4086,7 @@ def page_icon():
 def install_icons():
     """Setzt Tab-Ikon und Home-Bildschirm-Ikon (Apple Touch Icon) im Elternfenster."""
     try:
-        st_html(ICON_JS.replace("__FAV__", ICON_FAV_B64).replace("__TOUCH__", ICON_TOUCH_B64), height=0)
+        st_html(ICON_JS.replace("__FAV__", ICON_FAV_B64).replace("__TOUCH__", ICON_TOUCH_B64) + SELECT_JS, height=0)
     except Exception:
         pass
 
@@ -4689,39 +4770,12 @@ def replan_with_stops(view, cands):
     return new
 
 
-def my_location():
-    """Standort per Browser (kein Adressfeld). Gibt (lat, lon, label) oder None."""
-    skey = "loc_shared"
-    loc = st.session_state.get(skey)
-    if loc is None:
-        raw = get_geolocation(component_key="geo_shared")
-        if isinstance(raw, dict) and raw.get("error"):
-            st.warning("Der Standort ist nicht verfügbar. Bitte die Freigabe im Browser erlauben "
-                       "(Schloss-Symbol in der Adressleiste) und die Seite neu laden.")
-            return None
-        c = raw.get("coords") if isinstance(raw, dict) else None
-        if not c or c.get("latitude") is None:
-            st.info("📡 Standort wird ermittelt … bitte im Browser die Freigabe erlauben.")
-            return None
-        loc = (float(c["latitude"]), float(c["longitude"]), c.get("accuracy"))
-        st.session_state[skey] = loc
-    lat, lon, acc = loc
-    name = reverse_name(round(lat, 5), round(lon, 5))
-    lab = "📍 Mein Standort" + (f" · {name}" if name else "")
-    st.markdown(f'<div class="trip"><span class="pill">{escape(lab)}</span></div>', unsafe_allow_html=True)
-    if st.button("🔄 Standort neu bestimmen", key="green_relocate"):
-        st.session_state.pop(skey, None)
-        st.rerun()
-    st.session_state["bias"] = (lat, lon)
-    return _pack(lat, lon, lab)
-
-
 def home_green():
     with st.container(key="card_green"):
         st.markdown("Ich suche vom Standort aus die Grünfläche im Umkreis von 10 km, die am besten passt, "
                     "und zeige den schnellsten Weg dorthin.")
-        start_v = my_location()
-        prefer = st.multiselect("Bevorzugt", GREEN_PREFS, key="green_prefer", placeholder="Auswählen …",
+        start_v = start_input("Startpunkt", "green_sb")
+        prefer = st.multiselect("Bevorzugt", GREEN_PREFS_PREFER, key="green_prefer", placeholder="Auswählen …",
                                 help="Sportangebote: Fußball, Basketball, Tischtennis, Outdoor-Fitness, Skatepark, "
                                      "Hundepark, Tretboot u. a. (als Suchabfrage im Umkreis).")
         avoid = st.multiselect("Vermeiden", GREEN_PREFS, key="green_avoid", placeholder="Auswählen …")
@@ -4755,6 +4809,11 @@ def home_green():
             if not view:
                 raise err or ValueError("Keine erreichbare Grünfläche gefunden.")
             status.update(label="Fertig", state="complete", expanded=False)
+        except NoGreen as e:
+            status.update(label="Nichts gefunden", state="complete", expanded=False)
+            ov.empty()
+            st.warning(str(e))
+            return
         except Exception as e:
             status.update(label="Fehler", state="error")
             show_error(e)
