@@ -3613,11 +3613,28 @@ def _near_route(coords, pts, reach):
 
 
 SAN_WIDE = 500  # so weit abseits der Route werden Ausweichziele (Toilette/Gaststätte) angeboten
+SAN_MAX_STOPS = 7
+
+
+def san_zones(total, stop_s):
+    """Wo sollte eine Toilette liegen? Nach einem und nach zwei Dritteln jedes Abschnitts (Start → Zwischenziel →
+    … → Ende). Sehr kurze Abschnitte brauchen keine."""
+    bounds = [0.0] + sorted(stop_s) + [total]
+    multi = len(bounds) > 2
+    zones = []
+    for i, (lo, hi) in enumerate(zip(bounds, bounds[1:])):
+        seg = hi - lo
+        if seg < 500:
+            continue
+        for k, frac in ((1, "⅓"), (2, "⅔")):
+            label = (f"Abschnitt {i + 1} · {frac}" if multi else f"{frac} der Route")
+            zones.append({"label": label, "center": lo + seg * k / 3.0, "tol": max(150.0, 0.1 * seg)})
+    return zones
 
 
 def add_sanitary(view, reach=150, log=lambda *_: None):
-    """Sanitäroptionen in eine fertige Kartenansicht einarbeiten: Toiletten am Weg, Hinweis je Route, Marker.
-    Rückgabe: Zusammenfassung für die Standardroute (Warnung vor der Anzeige)."""
+    """Sanitäroptionen einarbeiten: Es soll etwa nach einem und nach zwei Dritteln (je Abschnitt) eine Toilette
+    liegen. Fehlt eine, werden Ausweichziele angeboten und die Route lässt sich darüber neu berechnen."""
     payload = payload_from_html(view["html"])
     opts = payload["options"]
     default = int(payload.get("default") or 0)
@@ -3647,48 +3664,77 @@ def add_sanitary(view, reach=150, log=lambda *_: None):
                 per_wide = measure(items)
         except Exception:
             pass
-    per_opt = [[m for m in mine if m["d"] <= reach] for mine in per_wide]
-    for o, mine in zip(opts, per_opt):
-        pub = sorted((m for m in mine if m["kind"] == "pub"), key=lambda m: m["s"])
-        cust = [m for m in mine if m["kind"] == "cust"]
+    all_stops = payload.get("stops", [])
+    stops = [(st_[0], st_[1]) for st_ in all_stops if not str(st_[2]).startswith("🚻")]
+    wc_stops = [(st_[0], st_[1]) for st_ in all_stops if str(st_[2]).startswith("🚻")]  # schon eingeplant
+
+    def zones_for(i):
+        coords = opts[i]["coords"]
+        a_ = np.asarray(coords, float)
+        lat0, _, kx, ky = _route_frame(coords)
+        total = float(np.hypot(np.diff(a_[:, 1]) * kx, np.diff(a_[:, 0]) * ky).sum())
+        stop_s = [s_ for _, s_ in _near_route(coords, stops, 1e9)] if stops else []
+        zs = san_zones(total, stop_s)
+        wc_s = [s_ for _, s_ in _near_route(coords, wc_stops, 1e9)] if wc_stops else []
+        for z in zs:
+            z["ok"] = (any(m["kind"] == "pub" and m["d"] <= reach and abs(m["s"] - z["center"]) <= z["tol"]
+                           for m in per_wide[i])
+                       or any(abs(w - z["center"]) <= z["tol"] for w in wc_s))
+        return zs
+
+    all_zones = [zones_for(i) for i in range(len(opts))]
+    for o, zs in zip(opts, all_zones):
+        ok = sum(1 for z in zs if z["ok"])
         if failed:
-            o["hint"] = (o.get("hint") or "") + " · 🚻 Toilettendaten nicht abrufbar"
-        elif pub:
-            first = f", erste bei {_fmt_dist(pub[0]['s'])}" if pub[0]["s"] > 20 else ""
-            o["hint"] = (o.get("hint") or "") + f" · 🚻 {len(pub)} öffentliche Toilette{'n' if len(pub) != 1 else ''} am Weg{first}"
-        elif cust:
-            o["hint"] = (o.get("hint") or "") + " · 🚻 keine öffentliche Toilette, aber Kundentoilette am Weg"
+            note = " · 🚻 Toilettendaten nicht abrufbar"
+        elif not zs:
+            note = " · 🚻 kurze Strecke, keine Toilette nötig"
+        elif ok == len(zs):
+            note = f" · 🚻 Toilette je Drittel vorhanden ({ok}/{len(zs)})"
         else:
-            o["hint"] = (o.get("hint") or "") + " · 🚻 keine Toilette am Weg gefunden"
-    mine_def = per_opt[default] if per_opt else []
-    n_public = sum(1 for m in mine_def if m["kind"] == "pub")
-    n_cust = sum(1 for m in mine_def if m["kind"] == "cust")
+            note = f" · 🚻 Toiletten an {ok} von {len(zs)} Stellen (je Drittel)"
+        o["hint"] = (o.get("hint") or "") + note
+    zones = all_zones[default]
+    wide_def = per_wide[default]
+    for z in zones:
+        z["cands"] = []
+        if z["ok"]:
+            continue
+        win = max(z["tol"] * 2, 400.0)
+        seen_k = set()
+        for kind in ("pub", "gastro"):
+            pool = [m for m in wide_def if m["kind"] == kind and abs(m["s"] - z["center"]) <= win]
+            pool.sort(key=lambda m: m["d"] + 0.5 * abs(m["s"] - z["center"]))
+            for m in pool[:4]:
+                k = (kind, _norm_name(m["name"]) if kind == "gastro" else (round(m["lat"], 4), round(m["lon"], 4)))
+                if k in seen_k:
+                    continue
+                seen_k.add(k)
+                z["cands"].append({"name": m["name"], "lat": m["lat"], "lon": m["lon"], "d": m["d"],
+                                   "s": m["s"], "kind": kind, "info": m["info"]})
+    n_public = sum(1 for m in wide_def if m["kind"] == "pub" and m["d"] <= reach)
+    n_cust = sum(1 for m in wide_def if m["kind"] == "cust" and m["d"] <= reach)
+    gastro_marks = {(round(c["lat"], 5), round(c["lon"], 5)): c for z in zones for c in z["cands"] if c["kind"] == "gastro"}
     seen, pubs, custs = set(), [], []
-    for mine in per_opt:
+    for mine in per_wide:
         for m in mine:
+            if m["d"] > reach:
+                continue
             key = (round(m["lat"], 5), round(m["lon"], 5), m["kind"])
             if key in seen:
                 continue
             seen.add(key)
             if m["kind"] == "pub":
                 pubs.append([round(m["lat"], 5), round(m["lon"], 5), m["name"], m["info"]])
-            elif m["kind"] == "cust" or (m["kind"] == "gastro" and n_public == 0):
+            elif m["kind"] == "cust":
                 custs.append([round(m["lat"], 5), round(m["lon"], 5), m["name"],
                               (m["info"] + " · " if m["info"] else "") + SAN_NOTE])
+    for (la, lo), c in gastro_marks.items():
+        custs.append([round(la, 5), round(lo, 5), c["name"], SAN_NOTE])
     payload["san"] = {"pub": pubs[:80], "cust": custs[:40]}
     view["html"] = map_html(payload)
-    # Ausweichziele für die Standardroute: öffentliche Toiletten zuerst, dann Gaststätten, je nach Abstand zum Weg
-    wide_def = per_wide[default] if per_wide else []
-    cands, seen_k = [], set()
-    for kind in ("pub", "gastro"):
-        for m in sorted((m for m in wide_def if m["kind"] == kind), key=lambda m: (m["d"], m["s"])):
-            k = (kind, _norm_name(m["name"]) if kind == "gastro" else (round(m["lat"], 4), round(m["lon"], 4)))
-            if k in seen_k:
-                continue
-            seen_k.add(k)
-            cands.append({"name": m["name"], "lat": m["lat"], "lon": m["lon"], "d": m["d"], "s": m["s"],
-                          "kind": kind, "info": m["info"]})
-    view["san"] = {"n_public": n_public, "n_cust": n_cust, "cands": cands[:10], "reach": reach, "failed": failed}
+    view["san"] = {"n_public": n_public, "n_cust": n_cust, "zones": zones, "reach": reach, "failed": failed,
+                   "missing": sum(1 for z in zones if not z["ok"])}
     return view["san"]
 
 
@@ -4328,18 +4374,16 @@ def san_settings(prefix):
 
 
 def san_finish(view, reach, ov):
-    """Toiletten einarbeiten. Gibt (view, wartet) zurück; gibt es keine, wird die Route erst nach Rückfrage gezeigt."""
+    """Toiletten einarbeiten. Gibt (view, wartet) zurück; fehlen Toiletten, wird die Route erst nach Rückfrage gezeigt."""
     if not reach:
         return view, False
     view["san_reach"] = reach
     try:
         res = add_sanitary(view, reach, log=ov.log)
     except Exception:
-        res = None
-        view["san"] = {"n_public": 0, "n_cust": 0, "cands": [], "reach": reach, "failed": True}
-    if res is None or res["n_public"] == 0:
+        view["san"] = {"n_public": 0, "n_cust": 0, "zones": [], "reach": reach, "failed": True, "missing": 0}
         return view, True
-    return view, False
+    return view, bool(res.get("failed") or res.get("missing"))
 
 
 def san_gate(view, reach, ov):
@@ -4357,33 +4401,37 @@ def render_san_pending():
     san = view.get("san", {})
     reach = san.get("reach", 150)
     st.markdown("### 🚻 Sanitäroptionen")
+    zones = san.get("zones", [])
+    missing = [z for z in zones if not z["ok"]]
+    chosen = []
     if san.get("failed"):
         st.warning("Die Toilettendaten konnten gerade nicht geladen werden. Ich kann daher nicht sagen, ob auf der "
-                   "Route eine Toilette liegt.")
+                   "Route Toiletten liegen.")
     else:
-        st.warning(f"Auf dieser Route habe ich im Umkreis von {reach} m keine öffentliche Toilette gefunden. "
-                   "Die Daten stammen aus OpenStreetMap und können unvollständig sein.")
-        if san.get("n_cust"):
-            st.info(f"Es gibt {san['n_cust']} Kundentoilette(n) am Weg (nur für Gäste).")
-    cands = san.get("cands", [])
-    choice = None
-    if cands:
-        st.markdown("**Alternative:** Die Route so anpassen, dass sie an einer Toilette oder einer Gaststätte "
+        names = ", ".join(z["label"] for z in missing)
+        st.warning(f"An folgenden Stellen der Route habe ich im Umkreis von {reach} m keine öffentliche Toilette "
+                   f"gefunden: {names}. Die Daten stammen aus OpenStreetMap und können unvollständig sein.")
+        st.markdown("**Alternative:** Die Route so anpassen, dass sie dort an einer Toilette oder einer Gaststätte "
                     "mit Gästetoilette vorbeiführt (kleiner Umweg).")
-        labels = [("🚻 " if c["kind"] == "pub" else "🍽️ ") + f"{c['name']} · {_fmt_dist(c['d'])} vom Weg"
-                  + (" · öffentlich" if c["kind"] == "pub" else " · private Sanitäranlagen") for c in cands]
-        pick = st.selectbox("Ausweichziel", range(len(cands)), format_func=lambda i: labels[i], key="san_pick")
-        choice = cands[pick]
-        if choice["kind"] != "pub":
+        for i, z in enumerate(missing):
+            cands = z.get("cands", [])
+            if not cands:
+                st.caption(f"{z['label']}: nichts in der Nähe gefunden.")
+                continue
+            labels = [("🚻 " if c["kind"] == "pub" else "🍽️ ") + f"{c['name']} · {_fmt_dist(c['d'])} vom Weg"
+                      + (" · öffentlich" if c["kind"] == "pub" else " · private Sanitäranlagen") for c in cands]
+            opts = [None] + list(range(len(cands)))
+            pick = st.selectbox(z["label"], opts, index=1, key=f"san_pick_{i}",
+                                format_func=lambda j, L=labels: "– nicht einplanen –" if j is None else L[j])
+            if pick is not None:
+                chosen.append(cands[pick])
+        if any(c["kind"] != "pub" for c in chosen) or any(c.get("cands") and c["cands"][0]["kind"] != "pub" for c in missing):
             st.caption("🚻 Private Sanitäranlagen. " + SAN_NOTE)
-    else:
-        st.caption("Auch im weiteren Umkreis habe ich weder Toilette noch Gaststätte gefunden. Tipp: ein Café "
-                   "als Zwischenziel wählen.")
     c1, c2, c3 = st.columns(3)
-    if choice and c1.button("Route anpassen", type="primary", use_container_width=True, key="san_plan"):
+    if chosen and c1.button("Route anpassen", type="primary", use_container_width=True, key="san_plan"):
         try:
-            with st.spinner("Route mit Zwischenstopp wird berechnet …"):
-                new = replan_with_stop(view, choice)
+            with st.spinner("Route mit Toiletten-Stopps wird berechnet …"):
+                new = replan_with_stops(view, chosen)
             st.session_state.pop("san_pending", None)
             open_map(new)
             st.rerun()
@@ -4398,24 +4446,24 @@ def render_san_pending():
         st.rerun()
 
 
-def replan_with_stop(view, cand):
-    """Gaststätte als Zwischenziel einplanen und neu rechnen (Typ je nach Modus)."""
-    stop = _pack(cand["lat"], cand["lon"], ("🚻 " if cand.get("kind") == "pub" else "🍽️ ") + cand["name"])
+def replan_with_stops(view, cands):
+    """Toiletten bzw. Gaststätten als Zwischenziele einplanen und neu rechnen (Typ je nach Modus)."""
+    stops_new = [_pack(c["lat"], c["lon"], "🚻 " + c["name"] + ("" if c.get("kind") == "pub" else " (Gäste-WC)")) for c in cands]
     st.session_state["_water"] = bool(view.get("water"))
     reach = view.get("san_reach")
     lvl = view.get("level") if view.get("level") in TOUR_LEVELS else "Sehr grün"
     if view["mode"] == "ab":
-        new = make_tour_view_safe(view["start"], [stop], view["dest"], "Sehr grün")
+        new = make_tour_view_safe(view["start"], stops_new[:SAN_MAX_STOPS], view["dest"], "Sehr grün")
     elif view["mode"] == "loop":
-        d0 = dist_m(view["p1"], (cand["lat"], cand["lon"]))
-        extra = max(0, round(view["km"] - 2.6 * d0 / 1000.0))
-        extra = extra if extra >= 1 else 0
-        new = make_tour_view_safe(view["start"], [stop], view.get("end"), lvl, extra_km=extra)
+        chain = [view["p1"]] + [(c["lat"], c["lon"]) for c in cands[:SAN_MAX_STOPS]] + [view["p1"]]
+        length = sum(dist_m(chain[i], chain[i + 1]) for i in range(len(chain) - 1))
+        extra = round(view["km"] - 1.4 * length / 1000.0)
+        new = make_tour_view_safe(view["start"], stops_new[:SAN_MAX_STOPS], view.get("end"), lvl,
+                                  extra_km=extra if extra >= 1 else 0)
     else:
-        if len(view.get("stops_v", [])) >= TOUR_MAX_MAP_STOPS:
-            raise ValueError("Es sind schon die maximal möglichen Zwischenziele geplant.")
-        new = make_tour_view_safe(view["start"], list(view["stops_v"]) + [stop], view.get("end_v"), view["level"],
-                                  extra_km=view.get("extra_km", 0))
+        room = max(0, SAN_MAX_STOPS - len(view.get("stops_v", [])))
+        new = make_tour_view_safe(view["start"], list(view["stops_v"]) + stops_new[:room], view.get("end_v"),
+                                  view["level"], extra_km=view.get("extra_km", 0))
     new["san_reach"] = reach
     if reach:
         try:
