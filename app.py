@@ -4107,21 +4107,73 @@ def _thin(coords, n=70):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def _san_overpass(q):
-    return _overpass_race(q, 26.0, _ranked_mirrors()[:3])
+    return _overpass_race(q, 22.0, _ranked_mirrors()[:4])
 
 
-def fetch_sanitary(option_coords, reach):
-    """Toiletten und Gaststätten im Rechteck um alle Routen (ein schneller Bereichsabruf; die genaue Entfernung
-    zum Weg wird danach hier berechnet – lange „around“-Linien sind für Overpass in Großstädten oft zu langsam)."""
+def _san_bbox(option_coords, reach):
     allp = [c for coords in option_coords for c in coords]
     la0, la1 = min(c[0] for c in allp), max(c[0] for c in allp)
     lo0, lo1 = min(c[1] for c in allp), max(c[1] for c in allp)
     pad = reach / 110540.0
     padx = pad / max(math.cos(math.radians((la0 + la1) / 2)), 0.3)
-    bb = f"({la0 - pad:.5f},{lo0 - padx:.5f},{la1 + pad:.5f},{lo1 + padx:.5f})"
-    q = (f'[out:json][timeout:25];(nwr["amenity"="toilets"]{bb};'
-         f'nwr["amenity"~"^({SAN_GASTRO})$"]["name"]{bb};);out center tags 8000;')
-    return _san_overpass(q).get("elements", [])
+    return la0 - pad, lo0 - padx, la1 + pad, lo1 + padx  # s, w, n, e
+
+
+def fetch_sanitary(option_coords, reach):
+    """Toiletten und Gaststätten im Rechteck um alle Routen. Zwei kleine Abfragen parallel (Toiletten /
+    Gaststätten); die genaue Entfernung zum Weg wird danach hier berechnet. Klappt nur eine, wird sie genutzt."""
+    s_, w_, n_, e_ = _san_bbox(option_coords, reach)
+    bb = f"({s_:.5f},{w_:.5f},{n_:.5f},{e_:.5f})"
+    qs = (f'[out:json][timeout:20];nwr["amenity"="toilets"]{bb};out center tags 4000;',
+          f'[out:json][timeout:20];nwr["amenity"~"^({SAN_GASTRO})$"]["name"]{bb};out center tags 6000;')
+    res, errs = [], []
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futs = [ex.submit(_san_overpass, q) for q in qs]
+        for f in futs:
+            try:
+                res.append(f.result().get("elements", []))
+            except Exception as e:
+                errs.append(e)
+    if not res:
+        raise errs[0]
+    return [el for part in res for el in part]
+
+
+_TILE_GASTRO = {"restaurant", "cafe", "bar", "pub", "biergarten", "bakery", "ice_cream", "food_court"}
+
+
+def tile_pois(option_coords, reach):
+    """Ersatz ohne Overpass: Cafés, Restaurants, Kneipen (und Toiletten, falls enthalten) aus den freien
+    Vektorkacheln von OpenFreeMap (POI-Ebene). Liefert Einträge im Format von classify_sanitary."""
+    s_, w_, n_, e_ = _san_bbox(option_coords, reach)
+    tpl = _ofm_template()
+    x0, y0 = _tile_of(n_, w_, VT_ZOOM)
+    x1, y1 = _tile_of(s_, e_, VT_ZOOM)
+    tiles = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+    if len(tiles) > 40:
+        raise ValueError("Gebiet zu groß")
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        datas = list(ex.map(lambda t: _fetch_tile(tpl, VT_ZOOM, t[0], t[1]), tiles))
+    out = []
+    for (tx, ty), data in zip(tiles, datas):
+        if not data:
+            continue
+        for extent, gtype, parts, props in mvt_decode(data, {"poi"}).get("poi", []):
+            if gtype != 1 or not parts:
+                continue
+            cls, sub = str(props.get("class") or ""), str(props.get("subclass") or "")
+            name = props.get("name") or props.get("name:latin") or ""
+            toilet = bool({cls, sub} & {"toilet", "toilets"})
+            if not toilet and (not name or not ({cls, sub} & _TILE_GASTRO)):
+                continue
+            for part in parts:
+                lon, lat = _tile_lonlat(tx, ty, VT_ZOOM, extent, part[:1])
+                la, lo = float(lat[0]), float(lon[0])
+                if s_ <= la <= n_ and w_ <= lo <= e_:
+                    out.append({"kind": "pub" if toilet else "gastro", "lat": la, "lon": lo,
+                                "name": str(name) or "Öffentliche Toilette", "info": "öffentlich" if toilet else "",
+                                "kv": sub or cls})
+    return out
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -4264,6 +4316,16 @@ def add_sanitary(view, reach=150, log=lambda *_: None):
         return res
 
     per_wide = measure(items)
+    if not any(m["kind"] in ("pub", "gastro") for m in per_wide[default]):
+        log("🍽️ Zweite Kartenquelle wird befragt")
+        try:
+            extra = tile_pois([o["coords"] for o in opts], SAN_WIDE + 60)
+            if extra:
+                failed = False
+                items = items + extra
+                per_wide = measure(items)
+        except Exception:
+            pass
     if not any(m["kind"] in ("pub", "gastro") for m in per_wide[default]):
         log("🍽️ Keine Treffer im Kartenabruf, ich laufe die Route nach Cafés und Restaurants ab")
         try:
@@ -4690,16 +4752,65 @@ def _city_name(lat, lon):
     return pr.get("city") or pr.get("town") or pr.get("county") or pr.get("state") or ""
 
 
-def _city_image(city):
-    """Freies Titelbild des Wikipedia-Artikels der Stadt (meist Skyline/Wahrzeichen), ca. 900 px breit."""
+CITY_MOTIF = {  # Suchbegriffe für typische Motive (Wikimedia Commons)
+    "Köln": "Köln Dom Skyline Rhein", "Düsseldorf": "Düsseldorf Rheinturm Skyline", "Aachen": "Aachener Dom",
+    "Dresden": "Dresden Frauenkirche Altstadt", "Bonn": "Bonn Rhein Panorama", "Essen": "Essen Zollverein",
+    "Berlin": "Berlin Skyline Fernsehturm", "Hamburg": "Hamburg Elbphilharmonie Skyline", "München": "München Frauenkirche Skyline",
+    "Frankfurt": "Frankfurt Skyline Main", "Stuttgart": "Stuttgart Skyline", "Leipzig": "Leipzig Skyline Panorama",
+    "Hannover": "Hannover Neues Rathaus", "Bremen": "Bremen Marktplatz Rathaus", "Münster": "Münster Prinzipalmarkt",
+    "Nürnberg": "Nürnberg Kaiserburg Altstadt",
+}
+
+
+def _wiki_get(host, params):
+    r = requests.get(f"https://{host}/w/api.php", headers=UA, timeout=3.5, params={"format": "json", **params})
+    r.raise_for_status()
+    return r.json().get("query", {}).get("pages") or {}
+
+
+def _ok_img(u):
+    return isinstance(u, str) and u.startswith("https://upload.wikimedia.org/") and not u.lower().endswith(".svg.png")
+
+
+def _img_pageimage(city):
     for lang in ("de", "en"):
-        r = requests.get(f"https://{lang}.wikipedia.org/w/api.php", headers=UA, timeout=3, params={
-            "action": "query", "format": "json", "titles": city, "redirects": 1, "prop": "pageimages",
-            "piprop": "thumbnail", "pithumbsize": 900})
-        for pg in (r.json().get("query", {}).get("pages") or {}).values():
+        for pg in _wiki_get(f"{lang}.wikipedia.org", {"action": "query", "titles": city, "redirects": 1,
+                                                        "prop": "pageimages", "piprop": "thumbnail",
+                                                        "pithumbsize": 900}).values():
             u = (pg.get("thumbnail") or {}).get("source", "")
-            if u.startswith("https://upload.wikimedia.org/") and not u.lower().endswith(".svg.png"):
+            if _ok_img(u):
                 return u
+    return ""
+
+
+def _img_commons(term):
+    """Bildsuche in Wikimedia Commons (nur Fotos, Querformat), erstes passendes Ergebnis."""
+    pages = _wiki_get("commons.wikimedia.org", {
+        "action": "query", "generator": "search", "gsrsearch": f"{term} filetype:bitmap", "gsrnamespace": 6,
+        "gsrlimit": 8, "prop": "imageinfo", "iiprop": "url|size", "iiurlwidth": 900})
+    best = []
+    for pg in pages.values():
+        ii = (pg.get("imageinfo") or [{}])[0]
+        u, w, h = ii.get("thumburl", ""), ii.get("width", 0), ii.get("height", 0)
+        if _ok_img(u) and w >= 1200 and w > h * 1.15 and not str(pg.get("title", "")).lower().endswith((".gif", ".png")):
+            best.append((pg.get("index", 99), u))
+    return min(best)[1] if best else ""
+
+
+def _city_image(city):
+    """Freies Foto der Stadt: bei bekannten Städten zuerst ein Motiv-Treffer (Skyline/Wahrzeichen) aus Commons,
+    sonst das Titelbild des Wikipedia-Artikels."""
+    steps = []
+    if city in CITY_MOTIF:
+        steps.append(lambda: _img_commons(CITY_MOTIF[city]))
+    steps += [lambda: _img_pageimage(city), lambda: _img_commons(f"{city} Skyline")]
+    for fn in steps:
+        try:
+            u = fn()
+            if u:
+                return u
+        except Exception:
+            continue
     return ""
 
 
@@ -4749,7 +4860,7 @@ class Overlay:
                     pass
             self._bgt = threading.Thread(target=work, daemon=True)
             self._bgt.start()
-            self._bgt.join(2.0)  # kurz warten, sonst erscheint das Bild beim nächsten Schritt
+            self._bgt.join(4.0)  # kurz warten, sonst erscheint das Bild beim nächsten Schritt
         self.stage = "Ich suche den grünsten Weg" + (" am Wasser entlang" if water else "") + " …"
         self.ph = st.empty()
         self.render()
@@ -4765,7 +4876,7 @@ class Overlay:
                    + "".join(f"#gwload .fact p:nth-of-type({k + 1}){{animation:gwfact {total:.1f}s {k * self.PER:.1f}s infinite}}" for k in range(n)))
             facts = "".join(f"<p>{escape(f)}</p>" for f in self.facts)
             logo = base64.b64encode(LOGO_SVG.encode()).decode()
-            html = (OVERLAY_HTML.replace("__FACTCSS__", css).replace("__LOGO__", logo)
+            html = (OVERLAY_HTML.replace("__FACTCSS__", css + self._bg_css()).replace("__LOGO__", logo)
                     .replace("__STAGE__", escape(self.stage)).replace("__FACTS__", facts)
                     .replace("__LABEL__", "Wusstest du?")
                     .replace("__CITYBG__", self._bg_html()))
@@ -4773,11 +4884,14 @@ class Overlay:
         except Exception:
             pass
 
-    def _bg_html(self):
+    def _bg_css(self):
         u = self.bg or ""
-        if not u.startswith("https://upload.wikimedia.org/") or any(c in u for c in "\"'<> \\"):
+        if not u.startswith("https://upload.wikimedia.org/") or any(c in u for c in "\"'<> \\{};"):
             return ""
-        return f"<div class='cbg' style='background-image:url(\"{u}\")'></div><div class='cmilk'></div>"
+        return f'#gwload .cbg{{background-image:url("{u}")}}'
+
+    def _bg_html(self):
+        return "<div class='cbg'></div><div class='cmilk'></div>" if self._bg_css() else ""
 
     def log(self, msg):
         """Schritt anzeigen (und weiter ins versteckte Statusfeld schreiben)."""
@@ -4986,11 +5100,15 @@ _KEEP_KEYS = ("page_sel", "water_", "acc_", "san_", "green_prefer", "green_avoid
               "loop_same", "tour_same", "tour_extra", "n_stops")
 
 
+_BUTTON_KEYS = {"san_plan", "san_show", "san_cancel"}
+
+
 def snap_widgets():
     try:
         st.session_state["_saved_widgets"] = {k: v for k, v in st.session_state.items()
                                               if isinstance(k, str) and k.startswith(_KEEP_KEYS)
-                                              and not k.endswith("_sb") and k != "green_pending"}
+                                              and not k.endswith("_sb") and k != "green_pending"
+                                              and k not in _BUTTON_KEYS}
     except Exception:
         pass
 
@@ -4998,8 +5116,11 @@ def snap_widgets():
 def restore_widgets():
     try:
         for k, v in st.session_state.get("_saved_widgets", {}).items():
-            if k not in st.session_state:
-                st.session_state[k] = v
+            if k not in st.session_state and k not in _BUTTON_KEYS:
+                try:
+                    st.session_state[k] = v
+                except Exception:  # z. B. Button-Schlüssel: nicht setzbar, einfach überspringen
+                    pass
     except Exception:
         pass
 
