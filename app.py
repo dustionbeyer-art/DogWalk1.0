@@ -3499,10 +3499,19 @@ FEAT_QUERIES = {
     "san": 'nwr["amenity"="toilets"]',
     "play": 'nwr["leisure"="playground"]',
     "sport": 'nwr["leisure"~"^(pitch|fitness_station|sports_centre|skate_park|dog_park|track)$"];nwr["amenity"="boat_rental"]',
-    "water": 'wr["natural"="water"];wr["waterway"~"^(river|canal)$"]',
+    "water": 'wr["natural"="water"];wr["landuse"~"^(reservoir|basin)$"];wr["waterway"~"^(river|canal|riverbank)$"]',
     "access": 'nwr["amenity"="toilets"]["wheelchair"~"^(yes|designated)$"];wr["highway"~"^(footway|path|pedestrian|cycleway)$"]["wheelchair"~"^(yes|designated)$"];nwr["leisure"~"^(park|playground|garden)$"]["wheelchair"~"^(yes|designated)$"]',
     "sight": 'nwr["tourism"~"^(attraction|viewpoint|zoo)$"];nwr["historic"~"^(monument|castle|ruins|fort|archaeological_site|tower)$"]',
 }
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def _ranked_mirrors():
+    """Server mit freien Plätzen zuerst (wie beim Routen-Abruf), nicht erreichbare weglassen."""
+    try:
+        return rank_mirrors()
+    except Exception:
+        return list(OVERPASS_MIRRORS)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -3510,9 +3519,10 @@ def _green_part(lat, lon, r, sel):
     """Eine kleine Abfrage (Bereichsfilter statt Umkreis = schneller). Alle Server werden der Reihe nach probiert."""
     box = _box(lat, lon, r)
     body = ";".join(f"{x}{box}" for x in sel.split(";"))
-    q = f"[out:json][timeout:40];({body};);out tags bb center 6000;"
+    q = f"[out:json][timeout:40];({body};);out tags bb 6000;"  # bb: Rechteck je Objekt (nicht mit „center“ mischen!)
     last = None
-    for chunk in (OVERPASS_MIRRORS[:3], OVERPASS_MIRRORS[3:6], OVERPASS_MIRRORS[:2]):
+    ms = _ranked_mirrors()
+    for chunk in (ms[:3], ms[3:6], ms[:2]):
         if not chunk:
             continue
         try:
@@ -3614,6 +3624,13 @@ def rank_greens(greens, feats, prefer, avoid, size_range, pos, min_ha=0.2, min_d
         tla, tlo = min(max(lat0, la0), la1), min(max(lon0, lo0), lo1)
         d = math.hypot((tla - lat0) * ky, (tlo - lon0) * kx)
         target = (tla, tlo)
+        if ha <= 6:  # kleine Fläche: Mitte (Rechteck); genauer Umriss wird danach für die besten Flächen geholt
+            target = (cla, clo)
+        else:  # große Fläche: vom Rand ein Stück zur Mitte hin
+            vx, vy = (cla - tla) * ky, (clo - tlo) * kx
+            nv = math.hypot(vx, vy)
+            if nv > 150:
+                target = (tla + vx / nv * 70 / ky, tlo + vy / nv * 70 / kx)
         if d < 200:  # Standort liegt im Rechteck der Fläche: Mitte ansteuern
             target = (cla, clo)
             d = math.hypot((cla - lat0) * ky, (clo - lon0) * kx)
@@ -3621,12 +3638,22 @@ def rank_greens(greens, feats, prefer, avoid, size_range, pos, min_ha=0.2, min_d
             continue
         m = 60.0 / ky
         mx = m * ky / kx
-        counts = {}
+        counts, pts = {}, {}
         for cat, (fa0, fo0, fa1, fo1) in items:
             pad = 100.0 / ky if cat == "water" else m
             padx = pad * ky / kx
             if fa1 >= la0 - pad and fa0 <= la1 + pad and fo1 >= lo0 - padx and fo0 <= lo1 + padx:
                 counts[cat] = counts.get(cat, 0) + 1
+                pts.setdefault(cat, []).append(((fa0 + fa1) / 2, (fo0 + fo1) / 2))
+        # Ziel: bevorzugte Ausstattung (z. B. Teich, Spielplatz), die dem Standort am nächsten liegt – dort soll es hingehen
+        goal = None
+        for c in prefer:
+            for (fla, flo) in pts.get(c, []):
+                dd = math.hypot((fla - lat0) * ky, (flo - lon0) * kx)
+                if goal is None or dd < goal[0]:
+                    goal = (dd, (fla, flo), c)
+        if goal:
+            target = goal[1]
         # Größe: 1 im Wunschbereich, nach außen fallend (je Zehnerpotenz Abweichung -1)
         if lo_ha <= ha <= hi_ha:
             fit = 1.0
@@ -3646,7 +3673,8 @@ def rank_greens(greens, feats, prefer, avoid, size_range, pos, min_ha=0.2, min_d
                                   "common": "Grünfläche", "recreation_ground": "Erholungsfläche", "heath": "Heide",
                                   "village_green": "Grünanlage", "dog_park": "Hundepark"}.get(kind, "Grünfläche")
         out.append({"name": name, "kind": kind, "ha": ha, "d": d, "target": target, "counts": counts,
-                    "score": score, "fit": fit})
+                    "score": score, "fit": fit, "goal": goal[2] if goal else None,
+                    "id": (e.get("type"), e.get("id")), "inside": goal is not None})
     out.sort(key=lambda g: -g["score"])
     return out
 
@@ -3692,6 +3720,80 @@ def green_view(start_v, g, prefer, avoid):
                    options=[opt], default=0, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
             "start": start_v, "dest": _pack(p2[0], p2[1], t2), "area": None, "bbox": None, "buf": 150}
+
+
+def _poly_centroid(pts):
+    """Schwerpunkt eines Polygons (Liste (lon, lat)); None bei entartetem Umriss."""
+    a2 = cx = cy = 0.0
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1]):
+        cr = x0 * y1 - x1 * y0
+        a2 += cr
+        cx += (x0 + x1) * cr
+        cy += (y0 + y1) * cr
+    if abs(a2) < 1e-18:
+        return None
+    return cx / (3 * a2), cy / (3 * a2)
+
+
+def _in_poly(x, y, pts):
+    inside = False
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1]):
+        if (y0 > y) != (y1 > y) and x < (x1 - x0) * (y - y0) / (y1 - y0) + x0:
+            inside = not inside
+    return inside
+
+
+def inside_point_of(pts, pos, ha):
+    """pts: Umriss als [(lon, lat)]. Kleine Fläche: ein Punkt in der Mitte (liegt er nicht darin, der dichteste
+    Randpunkt zur Mitte hin verschoben). Große Fläche: ca. 70 m hinter dem Rand, an der Stelle nächst dem Standort."""
+    if len(pts) > 2 and pts[0] == pts[-1]:
+        pts = pts[:-1]
+    cen = _poly_centroid(pts) or (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+    ky = 110540.0
+    kx = 111320.0 * math.cos(math.radians(pos[0]))
+    if not _in_poly(cen[0], cen[1], pts):  # unregelmäßige Form: einen Punkt innen suchen
+        best = None
+        for p in pts:
+            q = ((p[0] + cen[0]) / 2, (p[1] + cen[1]) / 2)
+            if _in_poly(q[0], q[1], pts):
+                best = q
+                break
+        cen = best or pts[0]
+    if ha <= 6:
+        return cen[1], cen[0]
+    near = min(pts, key=lambda p: math.hypot((p[1] - pos[0]) * ky, (p[0] - pos[1]) * kx))
+    dx, dy = (cen[0] - near[0]) * kx, (cen[1] - near[1]) * ky
+    n = math.hypot(dx, dy)
+    if n < 90:
+        return cen[1], cen[0]
+    cand = (near[0] + dx / n * 70 / kx, near[1] + dy / n * 70 / ky)
+    return (cand[1], cand[0]) if _in_poly(cand[0], cand[1], pts) else (cen[1], cen[0])
+
+
+def green_inside_point(g, pos):
+    """Punkt IM Grün statt am Rand/an der Straße: nutzt den echten Umriss der Fläche (ein kleiner Abruf je Fläche)."""
+    typ, oid = g.get("id", (None, None))
+    if not typ or not oid:
+        return None
+    js = _overpass_race(f"[out:json][timeout:20];{typ}({oid});out geom;", 20.0, _ranked_mirrors()[:3])
+    el = (js.get("elements") or [None])[0]
+    if not el:
+        return None
+    if typ == "way":
+        pts = [(p["lon"], p["lat"]) for p in el.get("geometry") or []]
+    else:  # Relation: größter geschlossener Außenring; sonst alle Randpunkte
+        rings = []
+        for m in el.get("members", []):
+            if m.get("role") in ("outer", "") and len(m.get("geometry") or []) > 3:
+                r = [(p["lon"], p["lat"]) for p in m["geometry"]]
+                if r[0] == r[-1]:
+                    rings.append(r)
+        if not rings:
+            return None
+        pts = max(rings, key=lambda r: (max(x for x, _ in r) - min(x for x, _ in r)) * (max(y for _, y in r) - min(y for _, y in r)))
+    if len(pts) < 4:
+        return None
+    return inside_point_of(pts, pos, g["ha"])
 
 
 class NoGreen(Exception):
@@ -3744,6 +3846,12 @@ def find_green(pos, prefer, avoid, size_range, log=lambda *_: None):
         raise NoGreen("Im Umkreis von 10 km habe ich keine Grünfläche gefunden. Das kann an fehlenden "
                       "OpenStreetMap-Daten oder überlasteten Servern liegen. Bitte in ein paar Minuten noch einmal "
                       "versuchen oder den Start an einen anderen Ort legen." + f" (Treffer im Kartenabruf: {len(greens)})")
+    for g in ranked[:3]:  # Ziel mitten in die Fläche legen (nicht an den Rand/die Straße)
+        if not g.get("inside"):
+            try:
+                g["target"] = green_inside_point(g, pos) or g["target"]
+            except Exception:
+                pass
     for g in ranked:
         g["counts"] = {c: n for c, n in g["counts"].items() if c in cats}
         g["missing"] = [c for c in prefer if c not in g["counts"]]
@@ -3778,7 +3886,7 @@ def _thin(coords, n=70):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def _san_overpass(q):
-    return _overpass_race(q, timeout=26.0)
+    return _overpass_race(q, 26.0, _ranked_mirrors()[:3])
 
 
 def fetch_sanitary(option_coords, reach):
