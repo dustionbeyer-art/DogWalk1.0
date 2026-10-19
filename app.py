@@ -2058,7 +2058,15 @@ function showThanks() {
   $('thx').textContent = list[i];
   $('thanks').classList.add('on');
 }
-$('thxb').addEventListener('click', () => { $('thanks').classList.remove('on'); document.body.classList.remove('thx'); });
+$('thxb').addEventListener('click', () => {
+  $('thanks').classList.remove('on');
+  // Zurück zur Startseite: den „←“-Knopf der App auslösen (gwdone ist gesetzt, es geht ohne Vorauswahl zurück)
+  try {
+    const b = parent.document.querySelector('.st-key-gw_back button') || parent.document.querySelector('[class*="st-key-gw_back"] button');
+    if (b) { b.click(); return; }
+  } catch (e) {}
+  document.body.classList.remove('thx');
+});
 function finish() {
   finished = true; stopWatch();
   setTimeout(showThanks, 1800);
