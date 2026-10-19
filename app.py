@@ -4491,7 +4491,7 @@ def san_zones(total, stop_s):
             continue
         for k, frac in ((1, "⅓"), (2, "⅔")):
             label = (f"Abschnitt {i + 1} · {frac}" if multi else f"{frac} der Route")
-            zones.append({"label": label, "center": lo + seg * k / 3.0, "tol": max(150.0, 0.1 * seg)})
+            zones.append({"label": label, "center": lo + seg * k / 3.0, "tol": min(700.0, max(250.0, 0.17 * seg))})
     return zones
 
 
