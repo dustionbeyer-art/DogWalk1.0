@@ -3680,10 +3680,9 @@ def rank_greens(greens, feats, prefer, avoid, size_range, pos, min_ha=0.2, min_d
 
 
 def green_reasons(g):
-    names = {"water": "Wasser", "san": "Toilette", "sport": "Sportangebot", "play": "Spielplatz", "sight": "Sehenswürdigkeit"}
     bits = []
     for c, n in g["counts"].items():
-        bits.append(f"{GREEN_ICON[c]} {names[c]}" + (f" ×{n}" if n > 1 and c != "water" else ""))
+        bits.append(f"{GREEN_ICON.get(c, '')} {CAT_NAME.get(c, c)}" + (f" ×{n}" if n > 1 and c != "water" else ""))
     return bits
 
 
@@ -3705,9 +3704,9 @@ def green_view(start_v, g, prefer, avoid):
     if g.get("ok") is not None:
         hint = "Schnellster Weg zu deinem Grün"
         if g["ok"]:
-            hint += " · ✅ " + " · ".join(g["ok"])
+            hint += " · ✓ " + " · ".join(g["ok"])
         if g["dev"]:
-            hint += " · 🔸 Anders als gewünscht: " + " · ".join(g["dev"])
+            hint += " · Abweichung: " + " · ".join(g["dev"])
     else:
         hint = "Schnellster Weg zur am besten passenden Grünfläche" + (" · " + " · ".join(why) if why else "")
     if g.get("failed"):
@@ -4703,8 +4702,46 @@ def open_map(view):
     st.session_state["bias"] = view["p1"]
 
 
+def soft_back():
+    """Nächster Aufbau der Startseite blendet weich ein (statt hart umzuschalten)."""
+    st.session_state["_back"] = True
+
+
 def close_map():
     st.session_state.pop("gw", None)
+    soft_back()
+
+
+# Eingaben der Startseite bleiben beim Wechsel in die Karte und zurück erhalten (Streamlit verwirft sonst
+# den Zustand von Widgets, die in einem Durchlauf nicht gezeichnet werden).
+_KEEP_KEYS = ("page_sel", "water_", "san_", "green_prefer", "green_avoid", "green_size", "level_", "loop_km",
+              "loop_same", "tour_same", "tour_extra", "n_stops")
+
+
+def snap_widgets():
+    try:
+        st.session_state["_saved_widgets"] = {k: v for k, v in st.session_state.items()
+                                              if isinstance(k, str) and k.startswith(_KEEP_KEYS)
+                                              and not k.endswith("_sb") and k != "green_pending"}
+    except Exception:
+        pass
+
+
+def restore_widgets():
+    try:
+        for k, v in st.session_state.get("_saved_widgets", {}).items():
+            if k not in st.session_state:
+                st.session_state[k] = v
+    except Exception:
+        pass
+
+
+BACK_CSS = """<style>
+@keyframes gwback{0%{opacity:1}100%{opacity:0;visibility:hidden}}
+.stApp::after{content:"";position:fixed;inset:0;background:#F3EEE5;z-index:99999;pointer-events:none;
+ animation:gwback .65s cubic-bezier(.3,.1,.2,1) forwards}
+@media (prefers-reduced-motion:reduce){.stApp::after{display:none}}
+</style>"""
 
 
 def set_retry():
@@ -4912,6 +4949,7 @@ def render_san_pending():
         st.rerun()
     if c3.button("Abbrechen", use_container_width=True, key="san_cancel"):
         st.session_state.pop("san_pending", None)
+        soft_back()
         st.rerun()
 
 
@@ -5007,7 +5045,7 @@ def render_green_pending():
     """Wünsche passen nicht alle zusammen: freundlich erklären und 2–3 Vorschläge zur Auswahl stellen."""
     gp = st.session_state["green_pending"]
     prefer_n, avoid_n = gp["wishes"]
-    st.markdown("### 🌳 Das passt für dich")
+    st.markdown("### Das passt für dich")
     wishes = [f"Größe: {gp['size'].split(' (')[0].lower()}"] + [f"{GREEN_ICON[GREEN_CAT[x]]} {x}" for x in prefer_n] \
         + [f"kein {GREEN_ICON[GREEN_CAT[x]]} {x}" for x in avoid_n]
     st.markdown("**Deine Wünsche:** " + " · ".join(wishes))
@@ -5022,12 +5060,12 @@ def render_green_pending():
                     "sicher bestätigen. Die Vorschläge zeigen, was sonst am besten passt.")
     for i, g in enumerate(opts):
         with st.container(border=True):
-            tag = "⭐ Beste Gesamtpassung" if i == 0 else f"Alternative {i}"
+            tag = "Beste Gesamtpassung" if i == 0 else f"Alternative {i}"
             st.markdown(f"**{tag}: {g['name']}** · {fmt_ha(g['ha'])} · ca. {_fmt_dist(g['d'])} entfernt")
             for t in g["ok"]:
-                st.markdown(f"✅ {t}")
+                st.markdown(f"✓ {t}")
             for t in g["dev"]:
-                st.markdown(f"🔸 {t}")
+                st.markdown(f"○ {t}")
             if st.button("Hierhin gehen", key=f"gp_pick_{i}", type="primary" if i == 0 else "secondary",
                          use_container_width=True):
                 try:
@@ -5040,6 +5078,7 @@ def render_green_pending():
                     show_error(e)
     if st.button("← Wünsche ändern", key="gp_back", use_container_width=True):
         st.session_state.pop("green_pending", None)
+        soft_back()
         st.rerun()
 
 
@@ -5168,6 +5207,10 @@ def home_tour():
 
 
 def render_home():
+    restore_widgets()
+    snap_widgets()
+    if st.session_state.pop("_back", False):
+        st.markdown(BACK_CSS, unsafe_allow_html=True)
     logo = base64.b64encode(LOGO_SVG.encode()).decode()
     st.markdown('<div class="hero"><div class="ico"><img src="data:image/svg+xml;base64,' + logo +
                 '" width="46" height="46" alt=""></div><div><h1>GreenWalker</h1>'
@@ -5176,7 +5219,8 @@ def render_home():
     # Nur der gewählte Reiter wird aufgebaut (st.tabs würde alle drei samt Suchfeldern laden = langsam)
     pages = {"route": "🧭 Route", "green": "🌳 Ins Grün", "loop": "🔄 Ründchen", "tour": "🛍️ Ründchen mit Zwischenziel"}
     try:
-        page = st.segmented_control("Ansicht", list(pages), format_func=pages.get, default="route",
+        page = st.segmented_control("Ansicht", list(pages), format_func=pages.get,
+                                    **({} if "page_sel" in st.session_state else {"default": "route"}),
                                     key="page_sel", label_visibility="collapsed")
     except Exception:
         page = st.radio("Ansicht", list(pages), format_func=pages.get, horizontal=True, key="page_sel_r",
