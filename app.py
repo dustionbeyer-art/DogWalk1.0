@@ -4474,6 +4474,7 @@ def _near_route(coords, pts, reach):
     return [(float(d[k]), float(s[idx[k]])) for k in range(len(pts))]
 
 
+SAN_GASTRO_REACH = 250  # so weit abseits der Route zählt ein Café/Restaurant als Toilettenmöglichkeit (m)
 SAN_WIDE = 500  # so weit abseits der Route werden Ausweichziele (Toilette/Gaststätte) angeboten
 SAN_MAX_STOPS = 7
 
@@ -4548,21 +4549,30 @@ def add_sanitary(view, reach=150, log=lambda *_: None):
         stop_s = [s_ for _, s_ in _near_route(coords, stops, 1e9)] if stops else []
         zs = san_zones(total, stop_s)
         wc_s = [s_ for _, s_ in _near_route(coords, wc_stops, 1e9)] if wc_stops else []
+        greach = max(reach, SAN_GASTRO_REACH)
         for z in zs:
-            z["ok"] = (any(m["kind"] == "pub" and m["d"] <= reach and abs(m["s"] - z["center"]) <= z["tol"]
+            z["pub"] = (any(m["kind"] == "pub" and m["d"] <= reach and abs(m["s"] - z["center"]) <= z["tol"]
+                            for m in per_wide[i])
+                        or any(abs(w - z["center"]) <= z["tol"] for w in wc_s))
+            # Cafés, Restaurants und Kundentoiletten gelten ebenfalls als Möglichkeit (nur für Gäste)
+            z["gas"] = any(m["kind"] in ("cust", "gastro") and m["d"] <= greach and abs(m["s"] - z["center"]) <= z["tol"]
                            for m in per_wide[i])
-                       or any(abs(w - z["center"]) <= z["tol"] for w in wc_s))
+            z["ok"] = z["pub"] or z["gas"]
         return zs
 
     all_zones = [zones_for(i) for i in range(len(opts))]
     for o, zs in zip(opts, all_zones):
         ok = sum(1 for z in zs if z["ok"])
+        n_pz = sum(1 for z in zs if z["pub"])
         if failed:
             note = " · 🚻 Toilettendaten nicht abrufbar"
         elif not zs:
             note = " · 🚻 kurze Strecke, keine Toilette nötig"
-        elif ok == len(zs):
+        elif ok == len(zs) and n_pz == len(zs):
             note = f" · 🚻 Toilette je Drittel vorhanden ({ok}/{len(zs)})"
+        elif ok == len(zs):
+            note = (f" · 🚻 Toilette je Drittel: {n_pz} öffentlich, {ok - n_pz} über Cafés/Restaurants "
+                    f"(nur für Gäste)")
         else:
             note = f" · 🚻 Toiletten an {ok} von {len(zs)} Stellen (je Drittel)"
         o["hint"] = (o.get("hint") or "") + note
@@ -4603,6 +4613,21 @@ def add_sanitary(view, reach=150, log=lambda *_: None):
                               (m["info"] + " · " if m["info"] else "") + SAN_NOTE])
     for (la, lo), c in gastro_marks.items():
         custs.append([round(la, 5), round(lo, 5), c["name"], SAN_NOTE])
+    # Für Abschnitte ohne öffentliche Toilette die nächsten Cafés/Restaurants auf der Karte zeigen
+    greach = max(reach, SAN_GASTRO_REACH)
+    have = {(c[0], c[1]) for c in custs}
+    for z in zones:
+        if z.get("pub"):
+            continue
+        near = sorted((m for m in wide_def if m["kind"] in ("cust", "gastro") and m["d"] <= greach
+                       and abs(m["s"] - z["center"]) <= max(z["tol"] * 2, 300.0)),
+                      key=lambda m: m["d"] + 0.5 * abs(m["s"] - z["center"]))
+        for m in near[:4]:
+            k = (round(m["lat"], 5), round(m["lon"], 5))
+            if k in have:
+                continue
+            have.add(k)
+            custs.append([k[0], k[1], m["name"], (m["info"] + " · " if m["info"] else "") + SAN_NOTE])
     payload["san"] = {"pub": pubs[:80], "cust": custs[:40]}
     view["html"] = map_html(payload)
     view["san"] = {"n_public": n_public, "n_cust": n_cust, "zones": zones, "reach": reach, "failed": failed,
