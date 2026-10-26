@@ -403,8 +403,13 @@ KEYWORDS = {
     "currywurst": ["imbiss"], "snack": ["imbiss", "kiosk", "baecker"], "fastfood": ["imbiss"],
     "trinken": ["kiosk", "getraenke", "cafe"], "durst": ["kiosk", "getraenke", "trinkwasser"],
     "getränk": ["kiosk", "getraenke"], "getränke": ["getraenke", "kiosk"], "getränkemarkt": ["getraenke"],
-    "bier": ["kneipe", "biergarten", "getraenke"], "kneipe": ["kneipe"], "pub": ["kneipe"], "bar": ["kneipe"],
-    "biergarten": ["biergarten"], "feierabendbier": ["kneipe", "biergarten", "kiosk"], "cocktail": ["kneipe"],
+    "bier": ["kneipe", "biergarten", "restaurant", "getraenke"], "kneipe": ["kneipe"], "pub": ["kneipe"], "bar": ["kneipe"],
+    "bierchen": ["kneipe", "biergarten", "restaurant"], "kölsch": ["kneipe", "restaurant", "biergarten"],
+    "koelsch": ["kneipe", "restaurant", "biergarten"], "pils": ["kneipe", "restaurant", "biergarten"],
+    "altbier": ["kneipe", "restaurant"], "brauerei": ["kneipe", "restaurant", "biergarten"],
+    "brauhaus": ["restaurant", "kneipe"], "gaststätte": ["restaurant", "kneipe"], "gasthaus": ["restaurant", "kneipe"],
+    "drink": ["kneipe", "restaurant"], "drinks": ["kneipe", "restaurant"], "ausgehen": ["kneipe", "restaurant", "cafe"],
+    "biergarten": ["biergarten"], "feierabendbier": ["kneipe", "biergarten", "restaurant", "kiosk"], "cocktail": ["kneipe"],
     "wein": ["wein", "kneipe"], "kaffee": ["cafe", "baecker"], "café": ["cafe"], "cafe": ["cafe"],
     "kuchen": ["cafe", "baecker"], "tee": ["cafe"], "kiosk": ["kiosk"], "büdchen": ["kiosk"],
     "buedchen": ["kiosk"], "späti": ["kiosk"], "spaeti": ["kiosk"], "trinkhalle": ["kiosk"],
@@ -431,7 +436,7 @@ KEYWORDS = {
     "zigaretten": ["tabak", "kiosk"], "tabak": ["tabak"],
 }
 _SEL_OK = re.compile(r'^\["(amenity|shop|leisure|tourism|historic|natural|railway)"="[a-z_]{2,30}"\]$')
-KW_MAX_CATS = 2
+KW_MAX_CATS = 3
 KW_RADIUS_M = 2500
 
 
@@ -538,7 +543,7 @@ def _nearby_multi(selectors, lat, lon, radius):
     """Alle Orte, die einer der Auswahlen (Tags) entsprechen, rund um (lat, lon): eine einzige Abfrage.
     Ergebnis: Liste (lat, lon, name, straße, nr, (schlüssel, wert))."""
     body = "".join(f"nwr{s}(around:{radius},{lat},{lon});" for s in selectors)
-    js = _overpass_race(f"[out:json][timeout:8];({body});out center 400;")
+    js = _overpass_race(f"[out:json][timeout:8];({body});out center 800;")
     kvs = [_sel_kv(x) for x in selectors]
     res = []
     for e in js.get("elements", []):
@@ -600,6 +605,13 @@ def merge_same_places(items, bias=None, radius_m=120.0):
     return groups
 
 
+def _safe_poi(label, lat, lon):
+    try:
+        return [it for it in _nominatim_poi(label, lat, lon) if it[2]]
+    except Exception:
+        return []
+
+
 def keyword_places(term, bias):
     """Schlagwort -> nahe Orte als Vorschläge (nach Entfernung, jedes Geschäft nur einmal).
     Erst 1 km, dann 2,5 km, dann 6 km Umkreis."""
@@ -611,23 +623,31 @@ def keyword_places(term, bias):
     lat, lon = round(bias[0], 3), round(bias[1], 3)
     allsel = tuple(sorted({sel for _, _, sels in defs for sel in sels}))
     items = []
-    try:
-        for radius in (1000, 2500, 6000):
-            items = [it for it in _nearby_multi(allsel, lat, lon, radius) if it[2]]
-            if len(items) >= 6:
-                break
-    except Exception:
-        items = []
-        # Ersatz: Nominatim (andere Server, anderer Zugang)
-        for _, label, _s in defs[:2]:
-            try:
-                items += [it for it in _nominatim_poi(label, lat, lon) if it[2]]
-            except Exception:
-                continue
+
+    def near(radius):
+        try:
+            return [it for it in _nearby_multi(allsel, lat, lon, radius) if it[2]]
+        except Exception:
+            return None
+
+    # Kleiner und mittlerer Umkreis gleichzeitig; der große nur, wenn beide zu wenig liefern
+    with ThreadPoolExecutor(max_workers=2) as ex_:
+        r_small, r_mid = ex_.map(near, (1000, 2500))
+    ok_any = r_small is not None or r_mid is not None
+    items = r_small if (r_small is not None and len(r_small) >= 6) else (r_mid or r_small or [])
+    if ok_any and len(items) < 6:
+        big = near(6000)
+        if big:
+            items = big
+    if not items:
+        # Ersatz: Nominatim (andere Server, anderer Zugang), auch wenn Overpass nur leer antwortet
+        with ThreadPoolExecutor(max_workers=3) as ex_:
+            for part in ex_.map(lambda lb: _safe_poi(lb, lat, lon), [lb for _, lb, _s in defs[:3]]):
+                items += part
     items.sort(key=lambda it: dist_m((bias[0], bias[1]), (it[0], it[1])))
     groups = merge_same_places(items, bias)
     out = []
-    for g in groups[:12]:
+    for g in groups[:40]:
         cats = []  # passende Kategorien, in der Reihenfolge der Suchbegriff-Treffer
         for icon, label, sels in defs:
             kvs = {_sel_kv(x) for x in sels}
@@ -637,8 +657,18 @@ def keyword_places(term, bias):
             continue
         addr = (g["street"] + (" " + g["nr"] if g["nr"] else "")) if g["street"] else ""
         lab = f"{cats[0][0]} {g['name']} · " + " / ".join(c[1] for c in cats[:2]) + (f" · {addr}" if addr else "")
-        out.append((lab, _pack(g["lat"], g["lon"], f"{cats[0][0]} {g['name']}")))
-    return out[:6]
+        out.append((cats[0], (lab, _pack(g["lat"], g["lon"], f"{cats[0][0]} {g['name']}"))))
+    # Reihum je Kategorie das Nächste (sonst verdrängen z. B. viele Restaurants alle Kneipen): Bar, Biergarten, ...
+    buckets = {}
+    for c, item in out:
+        buckets.setdefault(c, []).append(item)
+    mixed = []
+    while any(buckets.values()) and len(mixed) < 8:
+        for c in list(buckets):
+            if buckets[c] and len(mixed) < 8:
+                mixed.append(buckets[c].pop(0))
+    mixed.sort(key=lambda it: dist_m((bias[0], bias[1]), (_unpack(it[1])[0], _unpack(it[1])[1])))
+    return mixed
 
 
 def _title_of(label):
@@ -807,7 +837,7 @@ def _search_places(term, free):
     except Exception:
         pass
     try:
-        kwhits = kw_f.result(timeout=12)
+        kwhits = kw_f.result(timeout=15)
     except Exception:
         kwhits = []
     kw_ex.shutdown(wait=False)
@@ -863,8 +893,8 @@ def _search_places(term, free):
             la, lo, _ = _unpack(item[1])
             return dist_m((bias[0], bias[1]), (la, lo))
         kwhits.sort(key=dist_k)
-        kwhits = [(f"{lab}  ·  {_fmt_dist(dist_k((lab, val)))}", val) for lab, val in kwhits][:6]
-        return dedupe_results(kwhits + out)[:10]
+        kwhits = [(f"{lab}  ·  {_fmt_dist(dist_k((lab, val)))}", val) for lab, val in kwhits][:8]
+        return dedupe_results(kwhits + out)[:12]
     return dedupe_results(out)[:8]
 
 
@@ -1604,16 +1634,32 @@ def dog_prefetch(start_v):
 
 
 def dog_weather(start_v):
-    """Temperatur (Pfotenwarnung, nur Hundemodus) und Windhinweis am Startpunkt bestimmen. Wartet kurz auf den
-    Wetterdienst; im normalen Modus nur kurz, damit die Berechnung nicht aufgehalten wird."""
+    """Wetterabruf für den Startpunkt anstoßen (läuft im Hintergrund, während Wegenetz und Route berechnet werden).
+    Abgewartet wird erst, wenn die Ergebnisse gebraucht werden (_resolve_weather), dann ist er meist längst fertig."""
     try:
         lat, lon, _ = _unpack(start_v)
-        w = get_weather(lat, lon, wait=3.5 if _dog() else 2.0)
+        get_weather(lat, lon, wait=0.0)
+        st.session_state["_wx_pending"] = (lat, lon)
+        st.session_state["_temp"] = None
+        st.session_state["_windnote"] = ""
+    except Exception:
+        st.session_state["_wx_pending"] = None
+        st.session_state["_temp"] = None
+        st.session_state["_windnote"] = ""
+
+
+def _resolve_weather():
+    """Temperatur (Pfotenwarnung, nur Hundemodus) und Windhinweis übernehmen; wartet nur noch kurz, falls nötig."""
+    try:
+        pend = st.session_state.get("_wx_pending")
+        if not pend:
+            return
+        st.session_state["_wx_pending"] = None
+        w = get_weather(pend[0], pend[1], wait=3.5 if _dog() else 1.5)
         st.session_state["_temp"] = None if not w else w["temp"]
         st.session_state["_windnote"] = wind_note(w)
     except Exception:
-        st.session_state["_temp"] = None
-        st.session_state["_windnote"] = ""
+        pass
 
 
 def _seg_runs(area, path, mask, limit=80):
@@ -3220,6 +3266,7 @@ def dog_osrm_check(coords):
 
 
 def _option(nav, label, sub, hint, stats, area=None, path=None):
+    _resolve_weather()
     extra = {}
     if _dog() and area is not None and path:
         try:
