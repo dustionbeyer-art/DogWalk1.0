@@ -1174,7 +1174,7 @@ def road_noise(lines, roads, dist):
     return noise / SAMPLES
 
 
-@st.cache_resource(show_spinner=False, max_entries=2, ttl=3600)
+@st.cache_resource(show_spinner=False, max_entries=3, ttl=3600)
 def load_area(bbox):
     try:  # osmnx behält sonst nur wenige Wegtags: für Barrierefreiheit zusätzlich Belag, Steigung usw.
         ox.settings.useful_tags_way = sorted(set(ox.settings.useful_tags_way) | {"surface", "smoothness", "wheelchair", "incline", "dog"})
@@ -1845,6 +1845,95 @@ def ensure_water(area, log=None):
         area["_wgeo"] = base
     except Exception:
         pass
+
+
+_AREA_REG = []   # geladene Gebiete: (bbox, area), die letzten drei
+_AREA_PEND = []  # Gebiete, die gerade im Hintergrund geladen werden: (bbox, Event)
+_AREA_LOCK = threading.Lock()
+
+
+def _bbox_covers(old, new, shrink=0.15):
+    """Deckt das alte Gebiet das neue ab (Rand um 15 % verkleinert, damit kleine Verschiebungen des Startpunkts
+    nicht zählen)? Und ist es nicht viel größer (sonst wird das Rechnen unnötig langsam)?"""
+    w, s_, e, n = new
+    dx, dy = (e - w) * shrink / 2, (n - s_) * shrink / 2
+    ok = old[0] <= w + dx and old[1] <= s_ + dy and old[2] >= e - dx and old[3] >= n - dy
+    big = (old[2] - old[0]) * (old[3] - old[1]) <= 6.0 * max((e - w) * (n - s_), 1e-9)
+    return ok and big
+
+
+def _area_lookup(bbox):
+    with _AREA_LOCK:
+        for bb, ar in reversed(_AREA_REG):
+            if _bbox_covers(bb, bbox):
+                return ar
+    return None
+
+
+def load_area_any(bbox, own=None):
+    """Wie load_area, nutzt aber ein schon geladenes (oder gerade ladendes) Gebiet, das den Bedarf abdeckt. Wer in
+    der Nähe schon einmal gerechnet hat, wartet so nicht erneut auf die Kartenserver."""
+    ar = _area_lookup(bbox)
+    if ar is not None:
+        return ar
+    with _AREA_LOCK:
+        pend = [ev for bb, ev in _AREA_PEND if ev is not own and _bbox_covers(bb, bbox)]
+    for ev in pend[:1]:
+        ev.wait(40)  # läuft schon im Hintergrund: abwarten statt doppelt zu laden
+        ar = _area_lookup(bbox)
+        if ar is not None:
+            return ar
+    ar = load_area(bbox)
+    with _AREA_LOCK:
+        _AREA_REG.append((tuple(ar.get("bbox") or bbox), ar))
+        del _AREA_REG[:-3]
+    return ar
+
+
+_PREWARMED = set()
+
+
+def prewarm(lat, lon):
+    """Sobald der Standort bekannt ist, im Hintergrund Wegenetz (für ein Ründchen von ca. 3 km und Routen in der Nähe)
+    und Grünflächen holen. Die erste Berechnung findet die Daten dann schon vor."""
+    key = (round(lat, 2), round(lon, 2))
+    if key in _PREWARMED:
+        return
+    _PREWARMED.add(key)
+    if len(_PREWARMED) > 100:
+        _PREWARMED.clear()
+    bb = loop_bbox((lat, lon), (lat, lon), LOAD_TIERS[0] * 1000)
+    ev = threading.Event()
+    with _AREA_LOCK:
+        _AREA_PEND.append((bb, ev))
+
+    def work():
+        try:
+            load_area_any(bb, own=ev)
+        except Exception:
+            _PREWARMED.discard(key)
+        finally:
+            with _AREA_LOCK:
+                try:
+                    _AREA_PEND.remove((bb, ev))
+                except ValueError:
+                    pass
+            ev.set()
+
+    def work_green():
+        try:
+            glat, glon = green_center(lat, lon)
+            for v in GREEN_QUERIES.values():
+                _green_part(glat, glon, GREEN_RADIUS + 900, v)
+        except Exception:
+            pass
+    threading.Thread(target=work, daemon=True).start()
+    threading.Thread(target=work_green, daemon=True).start()
+
+
+def green_center(lat, lon):
+    """Suchmitte für Grünflächen auf ein 1-km-Raster gelegt: Wer in der Nähe schon gesucht hat, findet die Daten im Speicher."""
+    return round(round(lat * 100) / 100, 2), round(round(lon * 100) / 100, 2)
 
 
 def water_geo(area):
@@ -3403,7 +3492,8 @@ def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: 
         log("🗺️ Wegenetz und Grünflächen laden (nur der Korridor zwischen Start und Ziel)")
         t0 = time.time()
         prefetch_water(bbox)
-        area = load_area(bbox)
+        area = load_area_any(bbox)
+        bbox = tuple(area.get("bbox") or bbox)
         log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
     ensure_water(area, log)
     o, t = nearest_node(area, *p1), nearest_node(area, *p2)
@@ -3458,7 +3548,7 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
         t0 = time.time()
         _lb = loop_bbox(p1, p2, load_km * 1000)
         prefetch_water(_lb)
-        area = load_area(_lb)
+        area = load_area_any(_lb)
         bbox_km = load_km
         log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
     if bbox_km < LOOP_MAX_KM:  # nächstgrößeres Gebiet schon im Hintergrund holen
@@ -4506,7 +4596,7 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
     log("🗺️ Wegenetz und Grünflächen laden")
     t0 = time.time()
     prefetch_water(bbox)
-    area = load_area(bbox)
+    area = load_area_any(bbox)
     log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
     ensure_water(area, log)
     nodes = [nearest_node(area, *p) for p in pts]
@@ -4785,7 +4875,7 @@ def _ranked_mirrors():
         return list(OVERPASS_MIRRORS)
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=21600, show_spinner=False)
 def _green_part(lat, lon, r, sel):
     """Eine kleine Abfrage (Bereichsfilter statt Umkreis = schneller). Alle Server werden der Reihe nach probiert."""
     box = _box(lat, lon, r)
@@ -5168,7 +5258,7 @@ def find_green(pos, prefer, avoid, size_range, log=lambda *_: None):
     cats = list(dict.fromkeys(list(prefer) + list(avoid)))
     greens, feats, failed = [], [], []
     try:
-        greens, feats, failed = _green_fetch(round(pos[0], 3), round(pos[1], 3), GREEN_RADIUS, cats)
+        greens, feats, failed = _green_fetch(*green_center(pos[0], pos[1]), GREEN_RADIUS + 900, cats)
     except Exception:
         log("⚠️ Kartenserver antworten nicht, ich nutze die Ortssuche")
     if failed:
@@ -6500,6 +6590,11 @@ class Overlay:
             self._bgt = threading.Thread(target=work, daemon=True)
             self._bgt.start()
             self._bgt.join(0.3)  # kurz warten, sonst erscheint das Bild beim nächsten Schritt
+        self.laps = [(time.time(), "Start")]
+        try:
+            st.session_state.pop("_laps_end", None)
+        except Exception:
+            pass
         self.stage = "Ich suche den grünsten Weg" + (" am Wasser entlang" if water else "") + " …"
         self.ph = st.empty()
         self.render()
@@ -6559,6 +6654,7 @@ class Overlay:
 
     def log(self, msg):
         """Schritt anzeigen (und weiter ins versteckte Statusfeld schreiben)."""
+        self._lap(msg)
         try:
             st.write(msg)
         except Exception:
@@ -6570,10 +6666,19 @@ class Overlay:
 
     def step(self, msg):
         """Wie log, aber ohne Textzeile auf der Seite (für die Kartenansicht)."""
+        self._lap(msg)
         txt = re.sub(r"\s*\([^)]*\)\s*$", "", str(msg)).strip()
         if txt and txt != self.stage and len(txt) < 140:
             self.stage = txt
             self.render()
+
+    def _lap(self, msg):
+        """Merkt, wie lange jeder Schritt gedauert hat (Anzeige unten auf der Startseite: „Zeiten der letzten Berechnung“)."""
+        try:
+            self.laps.append((time.time(), str(msg)))
+            st.session_state["_laps"] = list(self.laps)
+        except Exception:
+            pass
 
     def empty(self):
         try:
@@ -6674,7 +6779,7 @@ def place_input(label, key):
 def reverse_name(lat, lon):
     """Adresse zu Koordinaten (Photon), nur zur Anzeige."""
     try:
-        r = requests.get("https://photon.komoot.io/reverse", headers=UA, timeout=3.5,
+        r = requests.get("https://photon.komoot.io/reverse", headers=UA, timeout=2.0,
                          params={"lat": lat, "lon": lon, "lang": "de"})
         p = r.json()["features"][0]["properties"]
         street = " ".join(x for x in [p.get("street") or p.get("name"), p.get("housenumber")] if x)
@@ -6691,6 +6796,10 @@ def start_input(label, key):
         v = place_input(label, key)
         if v:
             st.session_state["bias"] = _unpack(v)[:2]
+            try:
+                prewarm(*_unpack(v)[:2])
+            except Exception:
+                pass
         return v
 
     skey = "loc_shared"  # ein Standort für alle Reiter: wird nur einmal abgefragt
@@ -6712,6 +6821,10 @@ def start_input(label, key):
         loc = (float(c["latitude"]), float(c["longitude"]), c.get("accuracy"))
         st.session_state[skey] = loc
     lat, lon, acc = loc
+    try:
+        prewarm(lat, lon)
+    except Exception:
+        pass
     name = reverse_name(round(lat, 5), round(lon, 5))
     lab = "📍 Mein Standort" + (f" · {name}" if name else "")
     st.markdown(f'<div class="trip"><span class="pill">{escape(lab)}</span></div>', unsafe_allow_html=True)
@@ -6773,6 +6886,7 @@ def open_map(view):
     except Exception:
         pass
     st.session_state["gw_sid"] = st.session_state.get("gw_sid", 0) + 1
+    st.session_state["_laps_end"] = time.time()
     view["sid"] = st.session_state["gw_sid"]
     st.session_state["gw"] = view
     st.session_state["bias"] = view["p1"]
@@ -7542,6 +7656,18 @@ def render_home():
     {"route": home_route, "green": home_green, "loop": home_loop, "tour": home_tour}[page]()
     with st.expander("Datenquellen und Gewichtung"):
         st.markdown(sources_text(150, LEVELS["Ausgewogen"]))
+    laps_ = st.session_state.get("_laps")
+    if laps_ and len(laps_) > 1:
+        with st.expander("⏱️ Zeiten der letzten Berechnung"):
+            rows = []
+            for (t0_, m0), (t1_, _m1) in zip(laps_[:-1], laps_[1:]):
+                if m0 != "Start":
+                    rows.append(f"- {re.sub(chr(10), ' ', m0)[:90]}: **{t1_ - t0_:.1f} s**")
+            last_t, last_m = laps_[-1]
+            end_t = st.session_state.get("_laps_end") or last_t
+            rows.append(f"- {last_m[:90]}: **{max(end_t - last_t, 0):.1f} s**")
+            rows.append(f"\n**Gesamt: {end_t - laps_[0][0]:.1f} s**")
+            st.markdown("\n".join(rows))
 
 
 if st.session_state.get("gw"):
