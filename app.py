@@ -2931,6 +2931,7 @@ body.dog #gpxb{border-color:#E3A96B}
 #ins{font-size:1rem;margin-top:2px}
 #side{position:fixed;z-index:1000;right:10px;top:calc(var(--top) + 8px);display:flex;flex-direction:column;gap:8px}
 body.nav #side{top:calc(var(--top) + 92px)}
+#side button.on{background:#DCEBF6;border-color:#8DBBD6}
 #side button{width:44px;height:44px;border-radius:12px;border:1px solid var(--line);background:var(--paper);font-size:20px;box-shadow:0 3px 10px rgba(60,50,30,.25)}
 #sheet{position:fixed;z-index:1000;left:10px;right:10px;bottom:10px;max-width:620px;margin:0 auto;background:rgba(251,248,241,.98);border:1px solid var(--line);border-radius:20px;padding:12px;box-shadow:0 8px 28px rgba(60,50,30,.3)}
 #ttl{font-size:.85rem;opacity:.75;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -2988,7 +2989,7 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
 #sbclose{border:0;border-radius:12px;background:var(--moss);color:#FBF7EE;padding:8px 18px;font-size:.95rem}
 #vbtn,#fbtn{display:none}body.nav #vbtn,body.nav #fbtn{display:block}
 #map .cone{background:none;border:none;pointer-events:none}.coneIn{width:120px;height:120px;transition:transform .35s ease-out;transform-origin:60px 60px;filter:drop-shadow(0 0 3px rgba(255,255,255,.7))}.cone svg{overflow:visible}
-#styletip{position:fixed;z-index:1200;left:50%;top:calc(var(--top) + 14px);transform:translateX(-50%);background:rgba(59,58,51,.88);color:#FBF7EE;padding:6px 12px;border-radius:10px;font-size:.85rem;opacity:0;transition:opacity .3s;pointer-events:none}
+#styletip{position:fixed;z-index:1200;left:50%;top:calc(var(--top) + 14px);transform:translateX(-50%);max-width:min(92vw,420px);text-align:center;background:rgba(59,58,51,.88);color:#FBF7EE;padding:6px 12px;border-radius:10px;font-size:.85rem;opacity:0;transition:opacity .3s;pointer-events:none}
 #clouds{position:fixed;inset:0;z-index:3000;pointer-events:none;background:#F4EFE6;animation:cbase 1.2s .25s cubic-bezier(.4,0,.6,1) forwards;overflow:hidden}
 .cl{position:absolute;border-radius:50%;filter:blur(30px);background:radial-gradient(closest-side,rgba(255,255,255,.96),rgba(255,255,255,.55) 55%,rgba(255,255,255,0));will-change:transform,opacity;animation:cpart 1.9s .15s cubic-bezier(.45,0,.2,1) forwards}
 @keyframes cbase{to{opacity:0}}
@@ -3004,7 +3005,7 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
 <div id="clouds"></div>
 <div id="thanks"><div id="thx"></div><div id="sum"></div><button id="gpxb">💾 Strecke als GPX sichern</button><button id="thxb">Bis bald im Grünen 🌿</button></div>
 <div id="banner"><div id="ico">🧭</div><div><div id="dist"></div><div id="ins"></div></div></div>
-<div id="side"><button id="layers" title="Kartenstil wechseln">🗺️</button><button id="sat" title="Satellit / Luftbild">🛰️</button><button id="fit" title="Ganze Route zeigen">⤢</button><button id="wcbtn" title="Toiletten ein-/ausblenden" style="display:none">🚻</button><button id="home" title="Zurück zum Start">🏠</button></div>
+<div id="side"><button id="layers" title="Kartenstil wechseln">🗺️</button><button id="sat" title="Satellit / Luftbild">🛰️</button><button id="fit" title="Ganze Route zeigen">⤢</button><button id="wcbtn" title="Toiletten ein-/ausblenden" style="display:none">🚻</button><button id="dwbtn" title="Trinkwasserstellen zeigen">🚰</button><button id="home" title="Zurück zum Start">🏠</button></div>
 <div id="sheet">
  <div id="smenu"><button id="m_gpx">💾 Als GPX speichern<small>für Uhr, Komoot, Organic Maps und andere Apps</small></button><button id="m_off">📴 Offline-Blatt speichern<small>Skizze und Anweisungen als Datei, ohne Netz nutzbar</small></button><button id="m_loc">📍 Standort teilen<small>Link mit deiner Position und der Restzeit</small></button></div>
  <div id="ttl"></div>
@@ -3061,9 +3062,9 @@ const TILES = [
 ];
 const BASE = TILES.map((t, i) => i).filter(i => !TILES[i].sat), SAT = TILES.map((t, i) => i).filter(i => TILES[i].sat);
 let tIdx = 0, tLayer = null, tOk = 0, tErr = 0, tTimer = null, tTried = new Set(), tipTimer = null;
-function tip(t) {
+function tip(t, ms) {
   const el = $('styletip'); el.textContent = t; el.style.opacity = 1;
-  clearTimeout(tipTimer); tipTimer = setTimeout(() => { el.style.opacity = 0; }, 1600);
+  clearTimeout(tipTimer); tipTimer = setTimeout(() => { el.style.opacity = 0; }, ms || 1600);
 }
 function nextWorking() {
   // automatischer Wechsel: nächste noch nicht probierte Quelle (Satellit nur als letzte)
@@ -3164,7 +3165,7 @@ const userAcc = L.circle([0, 0], {radius: 10, color: '#2F6F8F', weight: 1, fillC
 
 let cur = -1, layers = [], coords = [], cum = [], steps = [], total = 1, P = [], lat0 = 0, lon0 = 0, kx = 1, done = null;
 let navOn = false, along = 0, lastIdx = 0, offCount = 0, finished = false, follow = true, lastPos = null,
-    said = {}, voice = true, watchId = null, sim = null, hadFix = false, wake = null, navT0 = 0, demoRun = false;
+    said = {}, voice = true, watchId = null, sim = null, hadFix = false, wake = null, navT0 = 0, demoRun = false, dwPts = [], dwLayer = null, dwOn = false, dwBusy = false;
 
 const toXY = (la, lo) => [(lo - lon0) * kx, (la - lat0) * ky];
 function fmt(m) {
@@ -3382,6 +3383,7 @@ function gpxText(o) {
   let w = wpt(D.p1, (loop ? 'Start/Ziel: ' : 'Start: ') + D.t1);
   (D.stops || []).forEach(s => { w += wpt([s[0], s[1]], 'Zwischenziel: ' + s[2]); });
   if (!loop) w += wpt(D.p2, 'Ziel: ' + D.t2);
+  (dwOn ? dwNear() : []).forEach(p => { w += wpt([p.la, p.lo], 'Trinkwasser' + (p.name ? ': ' + p.name : '')); });
   const pts = (o.coords || []).map(c => '<trkpt lat="' + c[0].toFixed(6) + '" lon="' + c[1].toFixed(6) + '"></trkpt>').join('');
   return '<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="GreenWalker" xmlns="http://www.topografix.com/GPX/1/1">'
     + '<metadata><name>' + x(name) + '</name><desc>' + x(desc) + '</desc></metadata>' + w
@@ -3465,6 +3467,8 @@ function offlineHtml(o) {
     rows += '<li id="s' + i + '" data-d="' + (s.d || 0) + '"><span class="n">' + (first ? 'S' : (last ? 'Z' : i)) + '</span><span class="ic">' + x(s.i || '') + '</span><span class="t">' + x(s.t) + '</span><span class="d">' + (s.d ? fmt(s.d) : '') + '</span></li>';
   });
   const a = pts[0], b = pts[pts.length - 1];
+  const dws = dwOn ? dwNear() : [];
+  const dwSvg = dws.map(p => { const q = P(p.la, p.lo); return '<g><circle cx="' + f1(q[0]) + '" cy="' + f1(q[1]) + '" r="8" fill="#2F8FCB" stroke="#fff" stroke-width="2.5"/><circle cx="' + f1(q[0]) + '" cy="' + f1(q[1]) + '" r="2.6" fill="#fff"/></g>'; }).join('');
   const stops = (D.stops || []).map(s => { const p = P(s[0], s[1]); return '<g><circle cx="' + f1(p[0]) + '" cy="' + f1(p[1]) + '" r="9" fill="#B07A35" stroke="#fff" stroke-width="2.5"/><text x="' + f1(p[0] + 13) + '" y="' + f1(p[1] + 6) + '" font-size="18" fill="#3B3A33" stroke="#fff" stroke-width="4" paint-order="stroke">' + x(s[2]) + '</text></g>'; }).join('');
   const loop = Math.hypot(a[0] - b[0], a[1] - b[1]) < 6;
   const pxm = sc / 111320;
@@ -3477,7 +3481,10 @@ function offlineHtml(o) {
     + 'svg{width:100%;height:auto;background:#EFE9DB;border:1px solid #D9CFBC;border-radius:14px}ol{list-style:none;padding:0;margin:12px 0}li{display:flex;gap:10px;align-items:center;padding:9px 6px;border-bottom:1px solid #E4DBC8}'
     + 'li.cur{background:#E7EDDB;border-radius:10px;font-weight:700}.n{width:24px;height:24px;border-radius:50%;background:#fff;border:1.6px solid #3B3A33;text-align:center;font-size:.72rem;line-height:21px;flex:none}.ic{width:26px;text-align:center;font-size:1.2rem;flex:none}.t{flex:1}.d{opacity:.65;font-size:.85rem;white-space:nowrap}'
     + '.leg{display:flex;gap:12px;flex-wrap:wrap;font-size:.8rem;margin:6px 0}.leg i{display:inline-block;width:18px;height:5px;border-radius:3px;margin-right:5px;vertical-align:middle}.foot{font-size:.72rem;opacity:.65;margin-top:14px}#gps{font-size:.85rem;margin:6px 0;opacity:.85}@media print{#gps{display:none}}';
-  const leg = o.gr && o.gr.length ? '<div class="leg">' + [0, 1, 2].map(i => '<span><i style="background:' + GCOL[i] + '"></i>' + GNAME[i] + '</span>').join('') + '</div>' : '';
+  const leg = (o.gr && o.gr.length ? '<div class="leg">' + [0, 1, 2].map(i => '<span><i style="background:' + GCOL[i] + '"></i>' + GNAME[i] + '</span>').join('')
+    + (dws.length ? '<span><i style="background:#2F8FCB;height:10px;width:10px;border-radius:50%"></i>Trinkwasser</span>' : '') + '</div>'
+    : (dws.length ? '<div class="leg"><span><i style="background:#2F8FCB;height:10px;width:10px;border-radius:50%"></i>Trinkwasser</span></div>' : ''))
+    + (dws.length ? '<div class="sub">🚰 ' + dws.length + ' Trinkwasserstelle' + (dws.length > 1 ? 'n' : '') + ' bis ' + DW_NEAR + ' m neben der Route, nächste ca. ' + Math.round(dws[0].d / 10) * 10 + ' m (Stand ' + new Date().toLocaleDateString('de-DE') + ', oft nur im Sommer in Betrieb)</div>' : '');
   const js = '(function(){var D=' + data + ',dot=document.getElementById("dot"),g=document.getElementById("gps"),li=document.querySelectorAll("li");'
     + 'function hav(a,b,c,d){var R=6371000,p=Math.PI/180,u=(c-a)*p,v=(d-b)*p,h=Math.sin(u/2)*Math.sin(u/2)+Math.cos(a*p)*Math.cos(c*p)*Math.sin(v/2)*Math.sin(v/2);return 2*R*Math.asin(Math.sqrt(h))}'
     + 'function upd(p){var la=p.coords.latitude,lo=p.coords.longitude,px=D.ox+(lo*D.k-D.x0)*D.sc,py=D.oy+(-la-D.y0)*D.sc,bi=0,bd=1e12;'
@@ -3493,7 +3500,7 @@ function offlineHtml(o) {
     + '<path d="' + fillOf(D.parks) + '" fill="#CFE0B8" fill-rule="evenodd" stroke="#A9C58C" stroke-width="1"/>'
     + '<path d="' + fillOf(D.water) + '" fill="#BCD9EA" fill-rule="evenodd" stroke="#8DBBD6" stroke-width="1"/>'
     + '<path d="' + linesOf(D.water) + '" fill="none" stroke="#8DBBD6" stroke-width="2.5"/>'
-    + casing + line + marks + stops
+    + casing + line + marks + stops + dwSvg
     + '<circle cx="' + f1(a[0]) + '" cy="' + f1(a[1]) + '" r="9" fill="#4E6E45" stroke="#fff" stroke-width="3"/>'
     + (loop ? '' : '<circle cx="' + f1(b[0]) + '" cy="' + f1(b[1]) + '" r="9" fill="#B8571A" stroke="#fff" stroke-width="3"/>')
     + '<circle id="dot" cx="0" cy="0" r="8" fill="#1E6FE0" stroke="#fff" stroke-width="3" style="display:none"/>'
@@ -3713,6 +3720,93 @@ if (D.san && ((D.san.pub || []).length || (D.san.cust || []).length)) {
   const wcb = $('wcbtn'); wcb.style.display = ''; let wcOn = true;
   wcb.addEventListener('click', () => { wcOn = !wcOn; wcOn ? wcLayer.addTo(map) : map.removeLayer(wcLayer); wcb.style.opacity = wcOn ? 1 : .45; });
 }
+// Trinkwasser-Ebene: Trinkbrunnen aus OpenStreetMap, beim Antippen direkt vom Gerät bei Overpass geholt (24 h gemerkt)
+const OVP = ['https://overpass-api.de/api/interpreter', 'https://z.overpass-api.de/api/interpreter',
+             'https://overpass.kumi.systems/api/interpreter', 'https://overpass.private.coffee/api/interpreter'];
+const DW_NEAR = 300;
+function dwBox() {
+  let s = 90, w = 180, n = -90, e = -180;
+  D.options.forEach(o => (o.coords || []).forEach(c => { s = Math.min(s, c[0]); n = Math.max(n, c[0]); w = Math.min(w, c[1]); e = Math.max(e, c[1]); }));
+  const pad = 0.004;  // ca. 400 m
+  return [s - pad, w - pad, n + pad, e + pad];
+}
+function segDistM(la, lo, a, b, kxl) {
+  const ky = 110540, px = lo * kxl, py = la * ky, ax = a[1] * kxl, ay = a[0] * ky, bx = b[1] * kxl, by = b[0] * ky;
+  const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+  const t = l2 ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / l2)) : 0;
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+function distToRoute(la, lo, cs) {
+  const kxl = 111320 * Math.cos(la * Math.PI / 180);
+  let best = 1e9;
+  for (let i = 0; i < cs.length - 1; i++) {
+    if (Math.abs(cs[i][0] - la) > 0.01 && Math.abs(cs[i + 1][0] - la) > 0.01) continue;  // weit weg: überspringen
+    best = Math.min(best, segDistM(la, lo, cs[i], cs[i + 1], kxl));
+  }
+  return best;
+}
+async function fetchDw(bb) {
+  const key = 'gw_dw_' + bb.map(v => v.toFixed(3)).join('_');
+  try {
+    const c = JSON.parse(localStorage.getItem(key) || 'null');
+    if (c && Date.now() - c.t < 86400000) return c.p;
+  } catch (e) {}
+  const b = '(' + bb.map(v => v.toFixed(5)).join(',') + ')';
+  const q = '[out:json][timeout:20];(nwr["amenity"="drinking_water"]' + b + ';nwr["man_made"="water_tap"]["drinking_water"="yes"]' + b + ';);out center 300;';
+  let lastErr = null;
+  for (const u of OVP) {
+    try {
+      const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), 12000);
+      const r = await fetch(u, {method: 'POST', body: 'data=' + encodeURIComponent(q), headers: {'Content-Type': 'application/x-www-form-urlencoded'}, signal: ctl.signal});
+      clearTimeout(tm);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const js = await r.json();
+      const pts = (js.elements || []).map(el => {
+        const t = el.tags || {}, la = el.lat !== undefined ? el.lat : (el.center && el.center.lat), lo = el.lon !== undefined ? el.lon : (el.center && el.center.lon);
+        if (la === undefined || lo === undefined || t.drinking_water === 'no' || t.access === 'private') return null;
+        return {la: la, lo: lo, name: t.name || '', seasonal: !!t.seasonal && t.seasonal !== 'no', dog: t.dog === 'yes' || t['drinking_water:dog'] === 'yes'};
+      }).filter(Boolean);
+      try { localStorage.setItem(key, JSON.stringify({t: Date.now(), p: pts})); } catch (e) {}
+      return pts;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('Overpass nicht erreichbar');
+}
+function dwNear() {
+  const o = D.options[Math.max(cur, 0)] || {};
+  return dwPts.map(p => ({...p, d: distToRoute(p.la, p.lo, o.coords || [])})).filter(p => p.d <= DW_NEAR).sort((a, b) => a.d - b.d);
+}
+function dwRender() {
+  if (!dwLayer) dwLayer = L.layerGroup();
+  dwLayer.clearLayers();
+  const near = dwNear();
+  near.forEach(p => {
+    L.marker([p.la, p.lo], {zIndexOffset: 250, icon: L.divIcon({className: '', iconSize: [30, 30], iconAnchor: [15, 15],
+      html: '<div style="width:30px;height:30px;border-radius:50%;background:#2F8FCB;border:2px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;font-size:16px">🚰</div>'})})
+      .addTo(dwLayer).bindPopup('<b>' + esc(p.name || 'Trinkwasser') + '</b><br>ca. ' + Math.round(p.d / 10) * 10 + ' m von der Route'
+        + (p.dog ? '<br>🐕 für Hunde ausgewiesen' : '') + (p.seasonal ? '<br><i>saisonal: im Winter oft abgestellt</i>' : ''));
+  });
+  if (!map.hasLayer(dwLayer)) dwLayer.addTo(map);
+  return near;
+}
+async function toggleDw() {
+  const b = $('dwbtn');
+  if (dwOn) { dwOn = false; if (dwLayer) map.removeLayer(dwLayer); b.style.opacity = 1; b.classList.remove('on'); return; }
+  if (dwBusy) return;
+  dwBusy = true; tip('🚰 Trinkwasserstellen werden gesucht …');
+  try {
+    if (!dwPts.length) dwPts = await fetchDw(dwBox());
+    dwOn = true; b.classList.add('on');
+    const near = dwRender();
+    const mo = new Date().getMonth(), winter = mo >= 10 || mo <= 2;
+    tip(near.length ? '🚰 ' + near.length + ' Trinkwasserstelle' + (near.length > 1 ? 'n' : '') + ' bis ' + DW_NEAR + ' m neben der Route, nächste ca. ' + Math.round(near[0].d / 10) * 10 + ' m'
+      + (winter ? '. Im Winter sind viele abgestellt.' : '')
+      : '🚰 Keine Trinkwasserstelle bis ' + DW_NEAR + ' m neben der Route in OpenStreetMap gefunden', 4200);
+  } catch (e) { tip('🚰 Trinkwasser konnte nicht geladen werden. Bitte später nochmal.', 3000); }
+  dwBusy = false;
+}
+$('dwbtn').addEventListener('click', toggleDw);
+const _so0 = showOption; showOption = function(i, f) { _so0(i, f); if (dwOn) dwRender(); };
 if (window.INTRO) {
   // Anflug: erst weit herausgezoomt, dann sanfter Flug auf die Route, während die Wolken aufreißen
   setTimeout(() => {
@@ -4182,9 +4276,11 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
         prefetch_osm(loop_bbox(p1, p2, next(t for t in LOAD_TIERS if t > bbox_km) * 1000))
     ensure_water(area, log)
     o, t = nearest_node(area, *p1), nearest_node(area, *p2)
+    log("🔄 Runden in verschiedene Richtungen probieren")
     variants = find_loops(area, o, t, target, LEVELS[level], buf, progress=progress, quiet=level_quiet(level))
     t1, t2 = lab1.split(" · ")[0], lab2.split(" · ")[0]
     options = []
+    log("🧭 Wegehinweise und Varianten aufbauen")
     for i, v in enumerate(variants):
         nav = build_nav(area, v["path"], f"Ründchen {i + 1}", loop=True)
         if not nav:
@@ -4204,6 +4300,7 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
     try:  # Zusatz: „Extrem grün“ (bis 35 % länger als gewünscht, über 70 % Grün)
         log("🌿 Extrem grüne Variante suchen")
         ext = extreme_loop(area, o, t, target, buf, variants)
+        log("🧭 Extrem grüne Variante aufbauen")
         if ext:
             nav = build_nav(area, ext["path"], "Ründchen extrem grün", loop=True)
             if nav:
@@ -7859,6 +7956,8 @@ def sources_text(buf, lam):
         + ", ".join(f"{k} {v:g}" for k, v in LEVELS.items())
         + f"\n- Hauptstraßen (Bundes-, Haupt-, Neben-, Kreisstraßen) zählen bis {NOISE_DIST:g} m Abstand als laut "
         "(bei „Schnellste“ ignoriert)\n"
+        "- Trinkwasser (🚰): OSM-Tags `amenity=drinking_water` und `man_made=water_tap` mit `drinking_water=yes`, Overpass direkt vom Gerät, "
+        "bis 300 m neben der Route; viele Brunnen sind im Winter abgestellt\n"
         "- Beleuchtete Wege (💡): OSM-Tag `lit`. Wege mit `lit=no` kosten +60 %, nicht erfasste Fuß- und Waldwege +30 %, "
         "nicht erfasste Straßen +8 % (nur wenn der Schalter aktiv ist)\n"
         f"- Extrem grün: grünste Strecke mit höchstens {EXTREME_DETOUR:.0%} Umweg (Ründchen: {EXTREME_DETOUR:.0%} länger als "
@@ -8818,6 +8917,8 @@ Hobbyprojekt und keine Rechtsberatung. Der Betrieb läuft auf Streamlit Communit
   Open-Meteo (Wetter am Startpunkt) und Wikipedia/Wikimedia (Stadtbild und Namen im Ladebildschirm).
 - Direkt von deinem Gerät aus: Kartenkacheln (Esri, OpenTopoMap, OpenStreetMap, EOX, Geobasis NRW) und die Kartenbibliothek
   Leaflet (cdnjs). Diese Dienste sehen deine IP-Adresse und den angezeigten Kartenausschnitt.
+- 🚰 *Trinkwasser* in der Karte: Beim Antippen fragt dein Gerät direkt bei einem Overpass-Server nach Trinkbrunnen im Bereich
+  der Route (Rechteck um die Route). Das Ergebnis wird 24 Stunden im Browser gemerkt.
 - Nur wenn der Betreiber einen KI-Schlüssel hinterlegt hat: ein unbekannter Suchbegriff (ohne Standort) kann an einen
   KI-Dienst gehen, damit passende Orte gefunden werden.
 
