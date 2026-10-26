@@ -2275,8 +2275,9 @@ def prewarm(lat, lon):
     def work_green():
         try:
             glat, glon = green_center(lat, lon)
-            for v in GREEN_QUERIES.values():
-                _green_part(glat, glon, GREEN_RADIUS + 900, v)
+            for r_ in (GREEN_NEAR_RADIUS, GREEN_RADIUS + 900):  # erst der nahe Umkreis (den nutzt „Ins Grün“ zuerst), dann der große
+                for v in GREEN_QUERIES.values():
+                    _green_part(glat, glon, r_, v)
         except Exception:
             pass
     threading.Thread(target=work_green, daemon=True).start()
@@ -5889,17 +5890,46 @@ def _green_part(lat, lon, r, sel):
 _GP_OK = set()  # (lat, lon, r, Auswahl) der Abfragen, die schon im Zwischenspeicher liegen
 
 
+def feats_sel(cats):
+    """Alle gewählten Ausstattungs-Kategorien in EINER Abfrage (statt einer pro Wunsch): weniger gleichzeitige Anfragen,
+    die die Kartenserver sonst gern mit 429/504 ablehnen."""
+    return ";".join(FEAT_QUERIES[c] for c in cats)
+
+
 def _green_ready(lat, lon, r, cats):
     """Liegen alle Abfragen für diesen Umkreis schon im Zwischenspeicher (z. B. durch das Vorwärmen)?"""
-    sels = list(GREEN_QUERIES.values()) + [FEAT_QUERIES[c] for c in cats]
+    sels = list(GREEN_QUERIES.values()) + ([feats_sel(cats)] if cats else [])
     return all((lat, lon, r, v) in _GP_OK for v in sels)
 
 
+def _water_elements(lat, lon, r):
+    """Notlösung für den Wunsch „Wassernähe“, wenn die Kartenserver ausfallen: Seen und Flüsse aus den freien Vektorkacheln,
+    als Elemente im Format der Overpass-Antwort (nur Rechteck + Tag)."""
+    d = min(r, 5200) / 110540.0
+    dx = d / max(math.cos(math.radians(lat)), 0.3)
+    gj = scan_water_geo((lon - dx, lat - d, lon + dx, lat + d))
+    els = []
+    for f in gj.get("features", []):
+        geom = f.get("geometry") or {}
+        pts = geom.get("coordinates") or []
+        if geom.get("type") == "Polygon" and pts:
+            pts = pts[0]
+        if not pts:
+            continue
+        els.append({"type": "way", "tags": {"natural": "water"},
+                    "bounds": {"minlat": min(p[1] for p in pts), "minlon": min(p[0] for p in pts),
+                               "maxlat": max(p[1] for p in pts), "maxlon": max(p[0] for p in pts)}})
+    return els
+
+
 def _green_fetch(lat, lon, r, cats):
-    """Grünflächen (Pflicht) und die gewählten Ausstattungs-Kategorien (nur diese, spart Last), alles gleichzeitig.
-    Fällt eine Ausstattungs-Abfrage aus, wird sie übersprungen; Rückgabe (greens, feats, ausgefallene Kategorien)."""
+    """Grünflächen (Pflicht) und die gewählten Ausstattungs-Kategorien (nur diese, spart Last), alles gleichzeitig:
+    zwei Grünflächen-Abfragen und eine gemeinsame für alle Wünsche. Fällt diese aus, werden die Wünsche einzeln noch
+    einmal versucht; für Wasser gibt es als letzte Rückfallebene die Vektorkacheln. Rückgabe (greens, feats,
+    ausgefallene Kategorien)."""
     jobs = {("g", k): v for k, v in GREEN_QUERIES.items()}
-    jobs.update({("f", c): FEAT_QUERIES[c] for c in cats})
+    if cats:
+        jobs[("f", "*")] = feats_sel(cats)
     greens, feats, failed = [], [], []
     ex = ThreadPoolExecutor(max_workers=len(jobs))
     futs = {k: ex.submit(_green_part, lat, lon, r, v) for k, v in jobs.items()}
@@ -5913,27 +5943,33 @@ def _green_fetch(lat, lon, r, cats):
             if kind == "g":
                 failed.append(("g", e))
             else:
-                failed.append((name, e))
+                failed.extend((c, e) for c in cats)
             continue
         (greens if kind == "g" else feats).extend(els)
     if not greens:
         errs = [e for k, e in failed if k == "g"]
         raise errs[0] if errs else ValueError("Im Umkreis von 10 km habe ich keine Grünfläche gefunden.")
-    # Ausgefallene Ausstattungs-Abfragen (oft nur kurz überlastete Server) noch einmal versuchen, mit weniger
-    # gleichzeitigen Anfragen: Ohne sie wüsste die Suche nicht, welche Fläche Wasser, Toiletten usw. hat.
+    # Ausgefallene Wünsche (oft nur kurz überlastete Server) noch einmal einzeln versuchen, mit wenigen gleichzeitigen
+    # Anfragen: Ohne sie wüsste die Suche nicht, welche Fläche Wasser, Toiletten usw. hat.
     redo = [k for k, _ in failed if k != "g"]
     if redo:
-        time.sleep(1.5)
+        time.sleep(1.0)
         ex2 = ThreadPoolExecutor(max_workers=2)
         futs2 = {c: ex2.submit(_green_part, lat, lon, r, FEAT_QUERIES[c]) for c in redo}
         ex2.shutdown(wait=False)
-        t_end2 = time.time() + 22.0
+        t_end2 = time.time() + 18.0
         for c, f in futs2.items():
             try:
                 feats.extend(f.result(timeout=max(0.5, t_end2 - time.time())).get("elements", []))
                 failed = [(k, e) for k, e in failed if k != c]
             except Exception:
                 pass
+    if any(k == "water" for k, _ in failed):  # Wassernähe ist der häufigste Wunsch: nicht einfach weglassen
+        try:
+            feats.extend(_water_elements(lat, lon, r))
+            failed = [(k, e) for k, e in failed if k != "water"]
+        except Exception:
+            pass
     return greens, feats, [k for k, _ in failed if k != "g"]
 
 
@@ -6350,6 +6386,24 @@ def _green_progressive(clat, clon, cats, prefer, avoid, size_range, pos, log):
         raise
 
 
+def place_targets(gs, pos, budget=8.0):
+    """Ziel mitten in die Fläche legen (nicht an den Rand/die Straße). Nur für die Flächen, die wirklich vorgeschlagen werden,
+    gleichzeitig und mit Zeitgrenze (große Flächen haben viel Geometrie)."""
+    todo = [g for g in gs if not g.get("inside") and not g.get("placed")]
+    if not todo:
+        return
+    ex_ = ThreadPoolExecutor(max_workers=len(todo))
+    futs_ = [(g, ex_.submit(green_inside_point, g, pos)) for g in todo]
+    ex_.shutdown(wait=False)
+    t_end = time.time() + budget
+    for g, f in futs_:
+        g["placed"] = True
+        try:
+            g["target"] = f.result(timeout=max(0.3, t_end - time.time())) or g["target"]
+        except Exception:
+            pass
+
+
 def find_green(pos, prefer, avoid, size_range, log=lambda *_: None):
     """Beste Grünfläche samt Hinweisen. Fehlende Daten führen nie zum Abbruch: es wird gelockert, ausgewichen
     und der Hinweis später an der Route angezeigt."""
@@ -6384,17 +6438,6 @@ def find_green(pos, prefer, avoid, size_range, log=lambda *_: None):
         raise NoGreen("Im Umkreis von 10 km habe ich keine Grünfläche gefunden. Das kann an fehlenden "
                       "OpenStreetMap-Daten oder überlasteten Servern liegen. Bitte in ein paar Minuten noch einmal "
                       "versuchen oder den Start an einen anderen Ort legen." + f" (Treffer im Kartenabruf: {len(greens)})")
-    todo = [g for g in ranked[:3] if not g.get("inside")]  # Ziel mitten in die Fläche legen (nicht an den Rand/die Straße)
-    if todo:
-        ex_ = ThreadPoolExecutor(max_workers=len(todo))
-        futs_ = [(g, ex_.submit(green_inside_point, g, pos)) for g in todo]
-        ex_.shutdown(wait=False)
-        t_end = time.time() + 12.0  # gleichzeitig und mit Zeitgrenze statt nacheinander (große Flächen haben viel Geometrie)
-        for g, f in futs_:
-            try:
-                g["target"] = f.result(timeout=max(0.3, t_end - time.time())) or g["target"]
-            except Exception:
-                pass
     for g in ranked:
         g["counts"] = {c: n for c, n in g["counts"].items() if c in cats}
         g["missing"] = [c for c in prefer if c not in g["counts"]]
@@ -8627,6 +8670,9 @@ def home_green():
             ranked = find_green(pos, pc, ac, GREEN_SIZES[size], log=ov.log)
             ov.log("⚖️ Wünsche abwägen")
             options = propose_options(ranked, pc, ac, GREEN_SIZES[size], size)
+            if options:
+                ov.log("📍 Ziel in der Fläche festlegen")
+                place_targets(options if options[0]["cost"] > 0 else options[:1], pos)
             if options and options[0]["cost"] > 0:
                 # Wünsche passen nicht alle zusammen: erst zur Auswahl stellen
                 st.session_state["green_pending"] = {"start_v": start_v, "options": options, "prefer": pc,
