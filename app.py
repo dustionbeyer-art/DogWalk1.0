@@ -232,6 +232,50 @@ LEVELS = {"Schnellste": 0.0, "Leicht grün": 1.5, "Ausgewogen": 4.0,
 LEVEL_QUIET = {"Maximal grün": (4.0, 6.0), "Grünster Umweg": (6.0, 10.0)}
 
 
+# Zusatzoption „Extrem grün“ bei Route, Ründchen und Ründchen mit Zwischenziel: bis zu 35 % Umweg (bzw. Mehrlänge) sind
+# erlaubt, solange die Strecke zu mehr als 70 % grün ist. Schafft eine Strecke das nicht, wird sie nicht angeboten.
+EXTREME_NAME = "Extrem grün"
+EXTREME_DETOUR = 0.35
+EXTREME_GREEN_MIN = 0.70
+EXTREME_QUIET = ((4.0, 6.0), (6.0, 10.0))  # (Hauptstraßen-, Breiten-Gewicht): zwei Stile, der grünere gewinnt
+
+
+def extreme_hint(detour_txt=""):
+    return f"Bis {EXTREME_DETOUR:.0%} Umweg erlaubt, dafür über {EXTREME_GREEN_MIN:.0%} Grün{detour_txt}"
+
+
+def extreme_note(n_ok):
+    """Hinweis an der Standardvariante, wenn keine Extrem-grün-Strecke über 70 % Grün möglich war."""
+    return (f" · 🌿 Extrem grün: innerhalb von {EXTREME_DETOUR:.0%} Umweg sind hier keine "
+            f"{EXTREME_GREEN_MIN:.0%} Grün erreichbar") if not n_ok else ""
+
+
+def greenest_within(run, budget):
+    """Grünste Route mit höchstens `budget` Meter Länge. run(lam, mu, wq) liefert {"dist", "green", ...}.
+    Das Grün-Gewicht lam wird je Stil per Halbierung gesucht (grösstes lam, das noch ins Längenbudget passt)."""
+    best = None
+    for mu, wq in EXTREME_QUIET:
+        cands = []
+        r = run(300.0, mu, wq)
+        if r["dist"] <= budget:
+            cands.append(r)
+        else:
+            lo, hi = 2.0, 300.0
+            for _ in range(8):
+                mid = math.sqrt(lo * hi)
+                r = run(mid, mu, wq)
+                if r["dist"] <= budget:
+                    cands.append(r)
+                    lo = mid
+                else:
+                    hi = mid
+        for r in cands:
+            if best is None or r["green"] > best["green"] + 1e-6 or (
+                    abs(r["green"] - best["green"]) <= 1e-6 and r["dist"] < best["dist"]):
+                best = r
+    return best
+
+
 def level_quiet(name):
     lam = LEVELS[name]
     return LEVEL_QUIET.get(name, (1.0 if lam > 0 else 0.0, 0.0))
@@ -1258,7 +1302,7 @@ def road_noise(lines, roads, dist):
 @st.cache_resource(show_spinner=False, max_entries=3, ttl=3600)
 def load_area(bbox):
     try:  # osmnx behält sonst nur wenige Wegtags: für Barrierefreiheit zusätzlich Belag, Steigung usw.
-        ox.settings.useful_tags_way = sorted(set(ox.settings.useful_tags_way) | {"surface", "smoothness", "wheelchair", "incline", "dog"})
+        ox.settings.useful_tags_way = sorted(set(ox.settings.useful_tags_way) | {"surface", "smoothness", "wheelchair", "incline", "dog", "lit"})
     except Exception:
         pass
     _tm0 = time.time()
@@ -1353,7 +1397,7 @@ def load_area(bbox):
             hw = d.get("highway")
             hw = (hw[0] if hw else "") if isinstance(hw, (list, tuple)) else (hw or "")
             best[(u, v)] = (d["length"], d.get("geometry") or LineString([pos[u], pos[v]]), *edge_label(d), hw,
-                            edge_wide(d, hw), edge_access_pen(d, hw), *edge_surface(d, hw), edge_dogtag(d))
+                            edge_wide(d, hw), edge_access_pen(d, hw), *edge_surface(d, hw), edge_dogtag(d), *edge_lit(d, hw))
     keys = list(best)
     lengths = np.array([best[k][0] for k in keys], dtype=float)
     names = [best[k][2] for k in keys]
@@ -1472,6 +1516,8 @@ def load_area(bbox):
     surf = np.array([best[k][7] for k in keys], dtype=np.int8)
     surf_known = np.array([best[k][8] for k in keys], dtype=bool)
     dogtag = np.array([best[k][9] for k in keys], dtype=np.int8)
+    lit = np.array([best[k][10] for k in keys], dtype=np.int8)
+    litpen = np.array([best[k][11] for k in keys], dtype=np.float32)
 
 
     # Gewässer-Nähe je Kante (Abstand zum nächsten See, Teich oder Fluss)
@@ -1484,6 +1530,7 @@ def load_area(bbox):
             "eu": np.array([nidx[u] for u, v in keys]), "ev": np.array([nidx[v] for u, v in keys]),
             "names": names, "kinds": kinds, "noise": noise, "wide": wide, "accp": accp,
             "surf": surf_est, "surf_known": surf_known, "hard": hard, "dogno": dogno, "dogtag": dogtag,
+            "lit": lit, "litpen": litpen,
             "dogz_json": dogz_json, "n_dogz": n_dogz,
             "parks_json": parks_json, "n_parks": n_parks, "n_edges": len(keys),
             "tm": (round(_tm_dl - _tm0, 1), round(time.time() - _tm_dl, 1))}
@@ -1597,6 +1644,30 @@ def edge_dogtag(d):
     return 0
 
 
+LIT_YES = {"yes", "24/7", "automatic", "sunset-sunrise", "dusk-dawn", "interval", "limited", "operating_hours"}
+LIT_PEN_NO, LIT_PEN_UNK_PATH, LIT_PEN_UNK_ROAD = 0.6, 0.3, 0.08
+
+
+def edge_lit(d, hw):
+    """(Code, Zuschlag) für „Beleuchtete Wege“: Code 1 = beleuchtet (lit=yes u. ä.), 2 = unbeleuchtet (lit=no),
+    0 = nicht erfasst. Nicht erfasste Wege zählen vorsichtig als eher dunkel: Fuß- und Waldwege stärker als Straßen."""
+    v = _tag1(d, "lit")
+    if v in LIT_YES:
+        return 1, 0.0
+    if v in ("no", "disused"):
+        return 2, LIT_PEN_NO
+    return 0, (LIT_PEN_UNK_PATH if hw in ("footway", "path", "track", "bridleway", "steps", "pedestrian", "cycleway")
+               else LIT_PEN_UNK_ROAD)
+
+
+def _lit():
+    """Ist „Beleuchtete Wege“ aktiv? (bevorzugt Wege, für die lit=yes in OpenStreetMap steht)"""
+    try:
+        return bool(st.session_state.get("_lit", False))
+    except Exception:
+        return False
+
+
 def _dog():
     try:
         return bool(st.session_state.get("_dog", False))
@@ -1617,9 +1688,9 @@ def area_accp(area):
     """Kostenzuschlag je Kante: Barrierefreiheit (wenn aktiv) und Hundemodus (Verbotszonen praktisch gesperrt,
     harter Belag etwas teurer, bei Hitze deutlich)."""
     n = len(area["lengths"])
-    acc, dog, hot = _access(), _dog(), _hot()
+    acc, dog, hot, lit = _access(), _dog(), _hot(), _lit()
     cache = area.setdefault("_accp_c", {})
-    key = (acc, dog, hot)
+    key = (acc, dog, hot, lit)
     if key in cache:
         return cache[key]
     a = area.get("accp")
@@ -1631,6 +1702,10 @@ def area_accp(area):
         hard = area.get("hard")
         if hard is not None:
             pen = pen + (0.45 if hot else 0.06) * np.asarray(hard, dtype=np.float32)
+    if lit:
+        lp = area.get("litpen")
+        if lp is not None:
+            pen = pen + np.asarray(lp, dtype=np.float32)
     cache[key] = pen
     return pen
 
@@ -2611,14 +2686,15 @@ def loop_stats(area, g, path):
     return dist, float((l * g[idx]).sum() / dist), float(rep), noise
 
 
-def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None):
+def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None, bearings=None):
     """Probiert mehrere Richtungen, passt den Kreisradius an die Wunschlänge an und
     liefert bis zu 3 deutlich verschiedene Varianten (beste zuerst)."""
     g = edge_green(area, buf)
     ng = node_green(area, g)
     cands = []
-    for k in range(LOOP_BEARINGS):
-        theta = 2 * math.pi * k / LOOP_BEARINGS
+    nb = bearings or LOOP_BEARINGS
+    for k in range(nb):
+        theta = 2 * math.pi * k / nb
         rho = target / (2 * math.pi * 1.35)
         for _ in range(3):
             try:
@@ -2636,7 +2712,7 @@ def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None):
                 break
             rho /= ratio
         if progress:
-            progress((k + 1) / LOOP_BEARINGS)
+            progress((k + 1) / nb)
     # Zusätzlich: Runden, die gezielt in einen nahen Park hinein und quer hindurch führen (statt nur am Rand entlang)
     if lam > 0:
         mu_, wq_ = quiet or (None, 0.0)
@@ -2692,6 +2768,17 @@ def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None):
         cands[0]["es"] = edge_set(cands[0]["path"])
         picked = [cands[0]]
     return picked
+
+
+def extreme_loop(area, o, t, target, buf, existing=()):
+    """Ründchen „Extrem grün“: bis zu 35 % länger als gewünscht, aber über 70 % Grün. Gesucht wird mit dem stärksten
+    Grün-Gewicht eine Runde um etwa 1,22 × Wunschlänge; nur was ≤ 1,35 × Wunschlänge bleibt und über 70 % Grün hat, zählt."""
+    lam = LEVELS["Grünster Umweg"]
+    vs = find_loops(area, o, t, target * 1.22, lam, buf, quiet=LEVEL_QUIET["Grünster Umweg"], bearings=6)
+    have = {tuple(v["path"]) for v in existing}
+    ok = [v for v in vs if v["dist"] <= (1 + EXTREME_DETOUR) * target and v["green"] > EXTREME_GREEN_MIN
+          and tuple(v["path"]) not in have]
+    return max(ok, key=lambda v: (v["green"] - REP_W * v["rep"])) if ok else None
 
 
 # ------------------------------------------------------- Navigation
@@ -3486,6 +3573,29 @@ def solve_levels(area, o, t, buf):
     return short, out
 
 
+def solve_extreme(area, o, t, buf, short):
+    """Route A -> B „Extrem grün“: grünste Strecke mit höchstens 35 % Umweg. Nur mit mehr als 70 % Grün, sonst None."""
+    g = edge_green(area, buf)
+    L, H = area["lengths"], area["H"]
+    nz = area.get("noise")
+    nz = np.zeros(len(L)) if nz is None else nz
+    wd = area.get("wide")
+    wd = np.zeros(len(L)) if wd is None else wd
+    ap = area_accp(area)
+
+    def run(lam, mu, wq):
+        path = fast_path(area, L * (1 + lam * (1 - g) + mu * nz + wq * wd + ap), o, t)
+        idx = [H[a][b]["i"] for a, b in zip(path[:-1], path[1:])]
+        dist = float(L[idx].sum()) if idx else 0.0
+        share = float((L[idx] * g[idx]).sum() / dist) if dist > 0 else 0.0
+        noise = float((L[idx] * nz[idx]).sum() / dist) if dist > 0 else 0.0
+        narrow = float((L[idx] * (wd[idx] <= NARROW)).sum() / dist) if dist > 0 else 0.0
+        return {"path": path, "dist": dist, "green": share, "noise": noise, "narrow": narrow}
+
+    best = greenest_within(run, (1 + EXTREME_DETOUR) * short["dist"])
+    return best if best and best["green"] > EXTREME_GREEN_MIN else None
+
+
 def parks_geo(area):
     """Grünflächen als kompaktes GeoJSON-Objekt (Koordinaten gerundet)."""
     if "_geo" in area:
@@ -3693,8 +3803,31 @@ def green_runs(area, path, nidx, buf=150):
     return [[c, i0, i1] for c, i0, i1, _ in merged], share
 
 
+def lit_share(area, path):
+    """Anteil der Strecke (nach Länge) mit lit=yes bzw. lit=no; der Rest ist in OpenStreetMap nicht erfasst."""
+    lit = area.get("lit")
+    if lit is None or not path or len(path) < 2:
+        return None
+    idx = [area["H"][a][b]["i"] for a, b in zip(path[:-1], path[1:])]
+    L = area["lengths"][idx]
+    tot = float(L.sum())
+    if tot <= 0:
+        return None
+    c = np.asarray(lit)[idx]
+    return float(L[c == 1].sum() / tot), float(L[c == 2].sum() / tot)
+
+
 def _option(nav, label, sub, hint, stats, area=None, path=None, endctx=None):
     _resolve_weather()
+    if _lit() and area is not None and path:
+        try:
+            ls = lit_share(area, path)
+            if ls:
+                yes, no = ls
+                hint += f" · 💡 {yes:.0%} beleuchtet erfasst" + (f", {no:.0%} unbeleuchtet" if no >= 0.05 else "")
+                stats = list(stats) + [["Beleuchtet", f"{yes:.0%}"]]
+        except Exception:
+            pass
     nidx = nav.get("nidx")
     nav = {k: v for k, v in nav.items() if k != "nidx"}
     gr, gb = [], []
@@ -3784,6 +3917,24 @@ def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: 
     if not options:
         raise ValueError("Start und Ziel liegen zu nah beieinander.")
     default = next((i for i, o_ in enumerate(options) if o_["label"] == "Ausgewogen"), 0)
+    try:  # Zusatz: „Extrem grün“ (bis 35 % Umweg, über 70 % Grün)
+        ext = solve_extreme(area, o, t, buf, short)
+        if ext and ext["path"] not in [r_["path"] for _, r_ in levels]:
+            nav = build_nav(area, ext["path"], f"{t1} → {t2}")
+            if nav:
+                detour = ext["dist"] / short["dist"] - 1 if short["dist"] else 0.0
+                mins = max(1, round(ext["dist"] / M_PER_MIN))
+                options.append(_option(
+                    nav, EXTREME_NAME, f"{fmt_km(ext['dist'])} · {ext['green']:.0%} grün",
+                    extreme_hint(f" · Umweg {detour:+.0%}") + (f" · {ext['narrow']:.0%} kleine Wege")
+                    + (water_note(area, ext['path']) if _water() else ""),
+                    [["Länge", fmt_km(ext["dist"])], ["Dauer", f"{mins} min"],
+                     ["Grünanteil", f"{ext['green']:.0%}"], ["Hauptstraße", f"{ext['noise']:.0%}"]],
+                    area=area, path=ext["path"]))
+        elif not ext and short["dist"] > 300:
+            options[default]["hint"] += extreme_note(False)
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        pass
     payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=parks_geo(area), water=water_geo(area), dogz=dogz_geo(area),
                    options=options, default=default, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
@@ -3837,6 +3988,25 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
     if not options:
         raise ValueError("Hier konnte ich keine passende Runde finden. Versuche eine andere Länge "
                          "oder einen anderen Startpunkt.")
+    try:  # Zusatz: „Extrem grün“ (bis 35 % länger als gewünscht, über 70 % Grün)
+        log("🌿 Extrem grüne Variante suchen")
+        ext = extreme_loop(area, o, t, target, buf, variants)
+        if ext:
+            nav = build_nav(area, ext["path"], "Ründchen extrem grün", loop=True)
+            if nav:
+                mins = max(1, round(ext["dist"] / M_PER_MIN))
+                options.append(_option(
+                    nav, EXTREME_NAME, f"{fmt_km(ext['dist'])} · {ext['green']:.0%} grün",
+                    f"Wunschlänge {fmt_km(target)} ({ext['dist'] / target - 1:+.0%}) · "
+                    + extreme_hint(f" · {1 - ext['rep']:.0%} ohne Doppelweg")
+                    + (water_note(area, ext['path']) if _water() else ""),
+                    [["Länge", fmt_km(ext["dist"])], ["Dauer", f"{mins} min"],
+                     ["Grünanteil", f"{ext['green']:.0%}"], ["Hauptstraße", f"{ext.get('noise', 0):.0%}"]],
+                    area=area, path=ext["path"]))
+        else:
+            options[0]["hint"] += extreme_note(False)
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        pass
     payload = dict(mode="loop", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=parks_geo(area), water=water_geo(area), dogz=dogz_geo(area),
                    options=options, default=0, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "loop", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
@@ -4897,6 +5067,34 @@ def tour_extra_variants(area, g, lam, mu, wq, nodes, extra_m):
     return picked
 
 
+def tour_extreme(area, g, nodes, extra_m, existing=()):
+    """Ründchen mit Zwischenziel „Extrem grün“: bis 35 % länger als der direkte Weg über die Zwischenziele (mit
+    Extra-Strecke: als Wunschweg + Extra), aber über 70 % Grün. Ergebnis {"path", "marks", "dist", "green", ...} oder None."""
+    p0, _ = tour_path(area, g, 0.0, 0.0, 0.0, nodes)
+    st0 = loop_stats(area, g, p0)
+    if not st0:
+        return None
+    budget = (1 + EXTREME_DETOUR) * (st0[0] + extra_m)
+    have = {tuple(x) for x in existing}
+    if extra_m > 0:
+        q = LEVEL_QUIET["Grünster Umweg"]
+        vs = tour_extra_variants(area, g, LEVELS["Grünster Umweg"], q[0], q[1], nodes, extra_m * 1.1)
+        ok = [v for v in vs if v["dist"] <= budget and v["green"] > EXTREME_GREEN_MIN and tuple(v["path"]) not in have]
+        return max(ok, key=lambda v: v["green"] - REP_W * v["rep"]) if ok else None
+
+    def run(lam, mu, wq):
+        path, marks = tour_path(area, g, lam, mu, wq, nodes)
+        st_ = loop_stats(area, g, path)
+        if not st_:
+            return {"path": path, "marks": marks, "dist": 1e12, "green": 0.0, "rep": 1.0, "noise": 0.0}
+        return {"path": path, "marks": marks, "dist": st_[0], "green": st_[1], "rep": st_[2], "noise": st_[3]}
+
+    best = greenest_within(run, budget)
+    if best and best["green"] > EXTREME_GREEN_MIN and tuple(best["path"]) not in have:
+        return best
+    return None
+
+
 def _tour_payload(mode_extra, p1, pe, t1, t2, stops, options, parks, default, attrib=None, water=None, dogz=None):
     payload = dict(mode="tour", dogz=dogz, p1=list(p1), p2=list(pe), t1=t1, t2=t2, parks=parks, options=options,
                    default=default, speed=M_PER_MIN, topPad=TOP_PAD,
@@ -4949,6 +5147,15 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
             except (nx.NetworkXNoPath, nx.NodeNotFound):
                 raise ValueError("Zwischen den Punkten gibt es keinen Fußweg im geladenen Gebiet.")
             runs.append((name, path, marks, f"{LEVEL_HINT[name]} · "))
+    ext_ok = None
+    try:  # Zusatz: „Extrem grün“ (bis 35 % Umweg, über 70 % Grün)
+        log("🌿 Extrem grüne Variante suchen")
+        ext = tour_extreme(area, g, nodes, extra_m, [r_[1] for r_ in runs])
+        ext_ok = bool(ext)
+        if ext:
+            runs.append((EXTREME_NAME, ext["path"], ext["marks"], extreme_hint(" · ")))
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        pass
     for name, path, marks, pre in runs:
         key = tuple(path)
         if key in seen:
@@ -4965,13 +5172,16 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
         mins = max(1, round(dist / M_PER_MIN))
         options.append(_option(
             nav, name, f"{fmt_km(dist)} · {green:.0%} grün",
-            f"{pre}{1 - rep:.0%} ohne Doppelweg" + (f" · {narrow:.0%} kleine Wege" if LEVELS[level if extra_m > 0 else name] >= 12 else "")
+            f"{pre}{1 - rep:.0%} ohne Doppelweg" + (f" · {narrow:.0%} kleine Wege" if LEVELS.get(level if (extra_m > 0 and name != EXTREME_NAME) else name,
+                                                                                                LEVELS["Grünster Umweg"]) >= 12 else "")
             + (water_note(area, path) if _water() else ""),
             [["Länge", fmt_km(dist)], ["Dauer", f"{mins} min"], ["Grünanteil", f"{green:.0%}"],
              ["Hauptstraße", f"{noise:.0%}"]], area=area, path=path))
     if not options:
         raise ValueError("Ich konnte keine Runde mit diesen Zwischenzielen finden.")
     default = next((i for i, o_ in enumerate(options) if o_["label"] == level), 0)
+    if ext_ok is False and options:
+        options[default]["hint"] += extreme_note(False)
     payload = _tour_payload(None, pts[0], pts[-1], names[0], names[-1], stops, options, parks_geo(area), default,
                             water=water_geo(area), dogz=dogz_geo(area))
     return {"mode": "tour", "html": map_html(payload), "p1": pts[0], "p2": pts[-1], "t1": names[0],
@@ -7436,6 +7646,10 @@ def sources_text(buf, lam):
         + ", ".join(f"{k} {v:g}" for k, v in LEVELS.items())
         + f"\n- Hauptstraßen (Bundes-, Haupt-, Neben-, Kreisstraßen) zählen bis {NOISE_DIST:g} m Abstand als laut "
         "(bei „Schnellste“ ignoriert)\n"
+        "- Beleuchtete Wege (💡): OSM-Tag `lit`. Wege mit `lit=no` kosten +60 %, nicht erfasste Fuß- und Waldwege +30 %, "
+        "nicht erfasste Straßen +8 % (nur wenn der Schalter aktiv ist)\n"
+        f"- Extrem grün: grünste Strecke mit höchstens {EXTREME_DETOUR:.0%} Umweg (Ründchen: {EXTREME_DETOUR:.0%} länger als "
+        f"gewünscht), nur angeboten bei über {EXTREME_GREEN_MIN:.0%} Grün\n"
         "- Hundemodus: Verbotszonen (Friedhof, Spielplatz, Zoo, dog=no) und Belag (surface) aus OpenStreetMap; "
         "Wetter für Pfotenwarnung (ab 30 °C) und Ladehund von Open-Meteo (open-meteo.com, nicht kommerziell)"
     )
@@ -7479,7 +7693,7 @@ def close_map():
 
 # Eingaben der Startseite bleiben beim Wechsel in die Karte und zurück erhalten (Streamlit verwirft sonst
 # den Zustand von Widgets, die in einem Durchlauf nicht gezeichnet werden).
-_KEEP_KEYS = ("page_sel", "water_", "acc_", "san_", "green_prefer", "green_avoid", "green_size", "level_", "loop_km",
+_KEEP_KEYS = ("page_sel", "water_", "acc_", "lit_", "san_", "green_prefer", "green_avoid", "green_size", "level_", "loop_km",
               "loop_same", "tour_same", "tour_extra", "n_stops", "start_sb_useloc", "green_sb_useloc", "loop_a_sb_useloc",
               "tour_a_sb_useloc", "dog_mode")
 
@@ -7541,6 +7755,7 @@ def bump_km(delta):
 def _san_carry(old, new):
     """Sanitäroptionen bleiben beim Neuberechnen in der Karte aktiv."""
     new["access"] = old.get("access", False)
+    new["lit"] = old.get("lit", False)
     if new["access"]:
         try:
             access_hint(new)
@@ -7587,6 +7802,7 @@ def render_map_view():
     st.session_state["bias"] = gw["p1"]
     st.session_state["_water"] = bool(gw.get("water", False))
     st.session_state["_access"] = bool(gw.get("access", False))
+    st.session_state["_lit"] = bool(gw.get("lit", False))
     st.session_state["_dog"] = bool(gw.get("dog", False))
     st.session_state["_temp"] = gw.get("temp")
     st.session_state["_windnote"] = gw.get("wnote", "")
@@ -7733,6 +7949,25 @@ def access_hint(view):
     return view
 
 
+def lit_toggle(prefix):
+    """Schalter „Beleuchtete Wege“ (für den Abend): bevorzugt Wege mit lit=yes, meidet unbeleuchtete."""
+    return st.toggle("💡 Beleuchtete Wege", key=f"lit_{prefix}", value=False,
+                     help="Für den Abend und die dunkle Jahreszeit: bevorzugt Wege, die in OpenStreetMap als beleuchtet "
+                          "erfasst sind, und meidet Wege mit lit=no. Wege ohne Eintrag gelten als eher dunkel "
+                          "(Fußwege stärker als Straßen). Es zählt, was erfasst ist.")
+
+
+def lit_hint(view):
+    """Im Ersatzmodus (ohne eigenes Wegenetz) ehrlich sagen, dass die Beleuchtung nicht geprüft werden kann."""
+    if not view.get("lit") or not (view.get("fallback") or view.get("area") is None):
+        return view
+    payload = payload_from_html(view["html"])
+    for o in payload["options"]:
+        o["hint"] = (o.get("hint") or "") + " · 💡 im Ersatzmodus nicht prüfbar, bitte selbst auf Beleuchtung achten"
+    view["html"] = map_html(payload)
+    return view
+
+
 def san_settings(prefix):
     """Schalter wie bei der Wassernähe. Rückgabe: Reichweite in m (fest 150) oder None."""
     on = st.toggle("🚻 Sanitäroptionen", key=f"san_{prefix}", value=False,
@@ -7757,8 +7992,10 @@ def san_finish(view, reach, ov):
 def san_gate(view, reach, ov):
     """Karte öffnen – oder bei fehlenden Toiletten zuerst die Warnung zeigen."""
     view["access"] = _access()
+    view["lit"] = _lit()
     try:
         access_hint(view)
+        lit_hint(view)
     except Exception:
         pass
     view, wait = san_finish(view, reach, ov)
@@ -7824,6 +8061,7 @@ def replan_with_stops(view, cands):
     stops_new = [_pack(c["lat"], c["lon"], "🚻 " + c["name"] + ("" if c.get("kind") == "pub" else " (Gäste-WC)")) for c in cands]
     st.session_state["_water"] = bool(view.get("water"))
     st.session_state["_access"] = bool(view.get("access"))
+    st.session_state["_lit"] = bool(view.get("lit"))
     st.session_state["_dog"] = bool(view.get("dog"))
     st.session_state["_temp"] = view.get("temp")
     st.session_state["_windnote"] = view.get("wnote", "")
@@ -7843,6 +8081,7 @@ def replan_with_stops(view, cands):
                                   view["level"], extra_km=view.get("extra_km", 0))
     new["san_reach"] = reach
     new["access"] = bool(view.get("access"))
+    new["lit"] = bool(view.get("lit"))
     try:
         access_hint(new)
     except Exception:
@@ -7918,6 +8157,7 @@ def home_green():
     pos = _unpack(start_v)[:2]
     pc, ac = [GREEN_CAT[x] for x in prefer], [GREEN_CAT[x] for x in avoid]
     view = None
+    st.session_state["_lit"] = False
     st.session_state["_dog"] = bool(st.session_state.get("dog_mode", False))
     st.session_state["_temp"] = None
     dog_prefetch(start_v)
@@ -8140,6 +8380,7 @@ def home_route():
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         san_reach = san_settings("route")
         acc_on = access_toggle("route")
+        lit_on = lit_toggle("route")
         go = st.button("Route finden", type="primary", use_container_width=True, key="go_ab")
     quick = st.session_state.get("_quick_dest")
     if quick:
@@ -8160,6 +8401,7 @@ def home_route():
     view = None
     st.session_state["_water"] = bool(water_on)
     st.session_state["_access"] = bool(acc_on)
+    st.session_state["_lit"] = bool(lit_on)
     st.session_state["_dog"] = bool(st.session_state.get("dog_mode", False))
     st.session_state["_temp"] = None
     dog_prefetch(start_v)
@@ -8198,6 +8440,7 @@ def home_loop():
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         san_reach = san_settings("loop")
         acc_on = access_toggle("loop")
+        lit_on = lit_toggle("loop")
         go = st.button("Ründchen finden", type="primary", use_container_width=True, key="go_loop")
     if not go:
         return
@@ -8207,6 +8450,7 @@ def home_loop():
     view, holder = None, {}
     st.session_state["_water"] = bool(water_on)
     st.session_state["_access"] = bool(acc_on)
+    st.session_state["_lit"] = bool(lit_on)
     st.session_state["_dog"] = bool(st.session_state.get("dog_mode", False))
     st.session_state["_temp"] = None
     dog_prefetch(a_v)
@@ -8260,6 +8504,7 @@ def home_tour():
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         san_reach = san_settings("tour")
         acc_on = access_toggle("tour")
+        lit_on = lit_toggle("tour")
         go = st.button("Ründchen mit Zwischenziel finden", type="primary", use_container_width=True, key="go_tour")
     if a_v and all(stops) and (same or b_v):
         prewarm_tour(a_v, stops, None if same else b_v, extra_km)  # Gebiet schon laden, während noch eingestellt wird
@@ -8271,6 +8516,7 @@ def home_tour():
     view = None
     st.session_state["_water"] = bool(water_on)
     st.session_state["_access"] = bool(acc_on)
+    st.session_state["_lit"] = bool(lit_on)
     st.session_state["_dog"] = bool(st.session_state.get("dog_mode", False))
     st.session_state["_temp"] = None
     dog_prefetch(a_v)
