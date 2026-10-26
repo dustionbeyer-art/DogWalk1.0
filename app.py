@@ -5101,6 +5101,21 @@ def _green_fetch(lat, lon, r, cats):
     if not greens:
         errs = [e for k, e in failed if k == "g"]
         raise errs[0] if errs else ValueError("Im Umkreis von 10 km habe ich keine Grünfläche gefunden.")
+    # Ausgefallene Ausstattungs-Abfragen (oft nur kurz überlastete Server) noch einmal versuchen, mit weniger
+    # gleichzeitigen Anfragen: Ohne sie wüsste die Suche nicht, welche Fläche Wasser, Toiletten usw. hat.
+    redo = [k for k, _ in failed if k != "g"]
+    if redo:
+        time.sleep(1.5)
+        ex2 = ThreadPoolExecutor(max_workers=2)
+        futs2 = {c: ex2.submit(_green_part, lat, lon, r, FEAT_QUERIES[c]) for c in redo}
+        ex2.shutdown(wait=False)
+        t_end2 = time.time() + 22.0
+        for c, f in futs2.items():
+            try:
+                feats.extend(f.result(timeout=max(0.5, t_end2 - time.time())).get("elements", []))
+                failed = [(k, e) for k, e in failed if k != c]
+            except Exception:
+                pass
     return greens, feats, [k for k, _ in failed if k != "g"]
 
 
@@ -5327,24 +5342,52 @@ def inside_point_of(pts, pos, ha):
     return (cand[1], cand[0]) if _in_poly(cand[0], cand[1], pts) else (cen[1], cen[0])
 
 
+def _assemble_rings(segs):
+    """Außenränder einer Relation bestehen oft aus mehreren Wegstücken: zu geschlossenen Ringen zusammensetzen."""
+    segs = [list(sg) for sg in segs if len(sg) > 1]
+    rings = [sg for sg in segs if len(sg) > 3 and sg[0] == sg[-1]]
+    open_ = [sg for sg in segs if sg[0] != sg[-1]]
+    while open_:
+        cur = open_.pop(0)
+        grew = True
+        while grew and cur[0] != cur[-1]:
+            grew = False
+            for i, o in enumerate(open_):
+                if o[0] == cur[-1]:
+                    cur += o[1:]
+                elif o[-1] == cur[-1]:
+                    cur += o[::-1][1:]
+                elif o[-1] == cur[0]:
+                    cur = o[:-1] + cur
+                elif o[0] == cur[0]:
+                    cur = o[::-1][:-1] + cur
+                else:
+                    continue
+                open_.pop(i)
+                grew = True
+                break
+        if cur[0] == cur[-1] and len(cur) > 3:
+            rings.append(cur)
+    return rings
+
+
 def green_inside_point(g, pos):
     """Punkt IM Grün statt am Rand/an der Straße: nutzt den echten Umriss der Fläche (ein kleiner Abruf je Fläche)."""
     typ, oid = g.get("id", (None, None))
     if not typ or not oid:
         return None
-    js = _overpass_race(f"[out:json][timeout:10];{typ}({oid});out geom;", 8.0, _ranked_mirrors()[:3])
+    js = _overpass_race(f"[out:json][timeout:25];{typ}({oid});out geom;", 22.0, _ranked_mirrors()[:3])
     el = (js.get("elements") or [None])[0]
     if not el:
         return None
     if typ == "way":
         pts = [(p["lon"], p["lat"]) for p in el.get("geometry") or []]
     else:  # Relation: größter geschlossener Außenring; sonst alle Randpunkte
-        rings = []
+        segs = []
         for m in el.get("members", []):
-            if m.get("role") in ("outer", "") and len(m.get("geometry") or []) > 3:
-                r = [(p["lon"], p["lat"]) for p in m["geometry"]]
-                if r[0] == r[-1]:
-                    rings.append(r)
+            if m.get("role") in ("outer", "") and len(m.get("geometry") or []) > 1:
+                segs.append([(p["lon"], p["lat"]) for p in m["geometry"]])
+        rings = _assemble_rings(segs)
         if not rings:
             return None
         pts = max(rings, key=lambda r: (max(x for x, _ in r) - min(x for x, _ in r)) * (max(y for _, y in r) - min(y for _, y in r)))
@@ -5472,7 +5515,7 @@ def _green_progressive(clat, clon, cats, prefer, avoid, size_range, pos, log):
         up = [c for c in prefer if c not in fl_]
         ua = [c for c in avoid if c not in fl_]
         ranked = rank_greens(g_, f_, up, ua, size_range, pos)
-        if _green_good(ranked, up):
+        if _green_good(ranked, up) and not any(c in fl_ for c in prefer):  # fehlende Angaben: nicht raten, weiter suchen
             ex.shutdown(wait=False)
             if f_big is None:
                 log("🌳 Grünflächen in der Nähe gefunden")
@@ -5528,7 +5571,7 @@ def find_green(pos, prefer, avoid, size_range, log=lambda *_: None):
         ex_ = ThreadPoolExecutor(max_workers=len(todo))
         futs_ = [(g, ex_.submit(green_inside_point, g, pos)) for g in todo]
         ex_.shutdown(wait=False)
-        t_end = time.time() + 6.0  # gleichzeitig und mit Zeitgrenze statt nacheinander
+        t_end = time.time() + 12.0  # gleichzeitig und mit Zeitgrenze statt nacheinander (große Flächen haben viel Geometrie)
         for g, f in futs_:
             try:
                 g["target"] = f.result(timeout=max(0.3, t_end - time.time())) or g["target"]
