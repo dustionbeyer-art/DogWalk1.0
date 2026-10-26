@@ -93,6 +93,14 @@ OVERPASS_MIRRORS = [
     "https://maps.mail.ru/osm/tools/overpass/api",
 ]
 LOAD_DEADLINE_S = 16  # harte Zeitgrenze für Overpass; danach übernimmt der Grün-Scan
+LOAD_DEADLINE_FAST_S = 6  # nach einem gerade gescheiterten Abruf nur noch kurz versuchen, dann gleich der Grün-Scan
+_OSM_FAIL = [0.0]  # Zeitpunkt des letzten gescheiterten Overpass-Abrufs
+
+
+def osm_load_deadline():
+    """Zeitgrenze für den nächsten Overpass-Abruf: war der letzte gerade erst gescheitert (Server überlastet), nicht
+    wieder 16 s warten."""
+    return LOAD_DEADLINE_FAST_S if time.time() - _OSM_FAIL[0] < 90 else LOAD_DEADLINE_S
 OSM_CACHE_DIR = os.path.join(tempfile.gettempdir(), "green_walker_osm")
 OSM_CACHE_DAYS = 7
 _MIRROR_CACHE = {"t": 0.0, "v": None}
@@ -1273,6 +1281,7 @@ def fetch_osm(bbox, deadline):
             ex.shutdown(wait=False)
         if winner:
             os.replace(tmps[winner], path)
+            _OSM_FAIL[0] = 0.0
             for b, t in tmps.items():
                 if b != winner:
                     threading.Timer(5.0, lambda t=t: os.path.exists(t) and os.remove(t)).start()
@@ -1282,6 +1291,7 @@ def fetch_osm(bbox, deadline):
         if deadline - time.time() < 6:
             break
         time.sleep(1)
+    _OSM_FAIL[0] = time.time()
     raise RuntimeError(f"Alle Kartenserver sind gerade überlastet ({last}).")
 
 
@@ -1399,7 +1409,7 @@ def load_area(bbox):
     except Exception:
         pass
     _tm0 = time.time()
-    path = fetch_osm(bbox, time.time() + LOAD_DEADLINE_S)
+    path = fetch_osm(bbox, time.time() + osm_load_deadline())
     _tm_dl = time.time()
     def _features():
         parks, waters, dogz = None, None, None
@@ -2053,6 +2063,9 @@ def prefetch_osm(bbox):
     def work():
         try:
             time.sleep(12)  # erst die Route des Nutzers fertig werden lassen (Toilettenabfrage u. a. nutzt dieselben Server)
+            if time.time() - _OSM_FAIL[0] < 90:  # Server gerade überlastet: nicht noch zusätzlich belasten
+                _PF_SEEN.discard(bbox)
+                return
             fetch_osm(bbox, time.time() + 40)
         except Exception:
             _PF_SEEN.discard(bbox)
@@ -2196,7 +2209,7 @@ def load_area_any(bbox, own=None, load_bbox=None):
     with _AREA_LOCK:
         pend = [ev for bb, ev in _AREA_PEND if ev is not own and _bbox_covers(bb, bbox)]
     for ev in pend[:1]:
-        ev.wait(40)  # läuft schon im Hintergrund: abwarten statt doppelt zu laden
+        ev.wait(LOAD_DEADLINE_S + 3)  # läuft schon im Hintergrund: kurz abwarten statt doppelt zu laden
         ar = _area_lookup(bbox)
         if ar is not None:
             return ar
@@ -5036,6 +5049,26 @@ def osrm_request(points, alternatives=False):
     return js["routes"]
 
 
+def osrm_many(jobs, budget=28.0, workers=4):
+    """Mehrere Routenanfragen gleichzeitig. jobs: [(Punkte, alternatives), ...]. Der Takt von höchstens einer Anfrage
+    pro Sekunde bleibt (osrm_request), aber die Wartezeit der Antworten läuft parallel. Gibt je Auftrag die Routenliste
+    zurück (leer, wenn er scheiterte oder nicht mehr fertig wurde)."""
+    from concurrent.futures import ThreadPoolExecutor, wait
+    out = [[] for _ in jobs]
+    if not jobs:
+        return out
+    ex = ThreadPoolExecutor(max_workers=workers)
+    futs = {ex.submit(osrm_request, pts, alt): i for i, (pts, alt) in enumerate(jobs)}
+    done, _ = wait(list(futs), timeout=budget)
+    for f in done:
+        try:
+            out[futs[f]] = list(f.result())
+        except Exception:
+            pass
+    ex.shutdown(wait=False, cancel_futures=True)
+    return out
+
+
 def quick_route(pts, timeout=6):
     """Nur für die Sofort-Vorschau: schnellste Fußroute (vereinfachte Linie, ohne Wegehinweise), ein Versuch.
     Rückgabe {"ll": [[lat, lon], ...], "m": Meter} oder None. Nie ein Fehler: die Vorschau ist nur ein Bonus."""
@@ -5107,7 +5140,6 @@ def scan_ab_candidates(sa, p1, p2, log=lambda *_: None, wide=True):
     A, B = _to_xy(sa, p1[0], p1[1]), _to_xy(sa, p2[0], p2[1])
     A, B = (float(A[0]), float(A[1])), (float(B[0]), float(B[1]))
     D = math.hypot(B[0] - A[0], B[1] - A[1])
-    routes = list(osrm_request([p1, p2], alternatives=True))
     vias = [[_to_ll(sa, x, y) for x, y in via] for via in _green_targets(sa, A, B, k=4)]
     if D > 150:
         mx, my = (A[0] + B[0]) / 2, (A[1] + B[1]) / 2
@@ -5123,12 +5155,11 @@ def scan_ab_candidates(sa, p1, p2, log=lambda *_: None, wide=True):
             x, y = _snap_green(sa, mx + sgn * 0.7 * D * nx_, my + sgn * 0.7 * D * ny_, 0.35 * D + 120)
             vias.append([_to_ll(sa, x, y)])
     log(f"🌳 {len(vias)} grüne Umwege werden geprüft")
-    for via in vias:
-        try:
-            routes += osrm_request([p1] + [(float(v[0]), float(v[1])) for v in via] + [p2])
-        except Exception:
-            continue
-    return _dedupe(routes)
+    jobs = [([p1, p2], True)] + [([p1] + [(float(v[0]), float(v[1])) for v in via] + [p2], False) for via in vias]
+    res = osrm_many(jobs)
+    if not res[0]:  # die direkte Anfrage muss klappen (sonst Fehlerhinweis wie bisher)
+        res[0] = list(osrm_request([p1, p2], alternatives=True))
+    return _dedupe([rt for r_ in res for rt in r_])
 
 
 def scan_loop_candidates(sa, p1, p2, target, buf, progress=None):
@@ -5150,36 +5181,52 @@ def scan_loop_candidates(sa, p1, p2, target, buf, progress=None):
         sc = scan_score(sa, _route_ll(rt), buf)
         return {"route": rt, **sc}
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     cands, first, errs = [], [], []
     bearings = [2 * math.pi * k / 6 for k in range(6)]
     rho0 = target / (2 * math.pi * 1.3)
     total_steps = len(bearings) + 3
-    for k, th in enumerate(bearings):
+    done_n = [0]
+
+    def guarded(theta, rho):
+        if len(errs) >= 3 and not cands:  # Routenserver offenbar down: nicht weiter warten
+            raise RuntimeError("Routenserver down")
+        return build(theta, rho)
+
+    def run_many(jobs, keep):
+        """Mehrere Runden gleichzeitig bauen (der Routenserver nimmt höchstens eine Anfrage pro Sekunde an, die Antworten
+        dürfen aber parallel eintreffen)."""
+        ex = ThreadPoolExecutor(max_workers=4)
+        futs = {ex.submit(guarded, th, rho): (th, rho) for th, rho in jobs}
         try:
-            c = build(th, rho0)
-            c["theta"], c["rho"] = th, rho0
-            cands.append(c)
-            first.append(c)
-        except Exception as e:
-            errs.append(e)
-            if len(errs) >= 3 and not cands:  # Routenserver offenbar down: nicht weiter warten
-                break
-        if progress:
-            progress((k + 1) / total_steps)
+            for f in as_completed(futs, timeout=45):
+                th, rho = futs[f]
+                try:
+                    c = f.result()
+                    c["theta"], c["rho"] = th, rho
+                    cands.append(c)
+                    keep(c)
+                except Exception as e:
+                    errs.append(e)
+                done_n[0] += 1
+                if progress:
+                    progress(min(done_n[0] / total_steps, 1.0))
+        except Exception:
+            pass  # Zeitgrenze: mit dem arbeiten, was da ist
+        ex.shutdown(wait=False, cancel_futures=True)
+
+    run_many([(th, rho0) for th in bearings], first.append)
     if not cands and errs:
         raise ValueError(f"{errs[-1]} Bitte in ein bis zwei Minuten noch einmal versuchen.")
     # die drei vielversprechendsten Richtungen auf die Wunschlänge nachjustieren
     first.sort(key=lambda c: -(c["green"] - REP_W * c["rep"] - abs(c["dist"] / target - 1)))
-    for j, c in enumerate(first[:3]):
+    redo = []
+    for c in first[:3]:
         ratio = c["dist"] / target if target else 1
         if abs(ratio - 1) > 0.07 and ratio > 0:
-            try:
-                c2 = build(c["theta"], c["rho"] / ratio)
-                cands.append(c2)
-            except Exception:
-                pass
-        if progress:
-            progress((len(bearings) + j + 1) / total_steps)
+            redo.append((c["theta"], c["rho"] / ratio))
+    done_n[0] += 3 - len(redo)
+    run_many(redo, lambda c: None)
     return cands
 
 
