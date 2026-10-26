@@ -2109,6 +2109,18 @@ def prewarm_tour(start_v, stops_v, end_v, extra_km):
         pass
 
 
+def prewarm_ab(start_v, dest_v):
+    """Route A -> B: sobald Start und Ziel gewählt sind (noch vor dem Klick), den Korridor im Hintergrund laden.
+    Es ist genau das Gebiet, das make_ab_view braucht; der Klick wartet dann nur noch auf den Rest."""
+    try:
+        p1, p2 = tuple(_unpack(start_v)[:2]), tuple(_unpack(dest_v)[:2])
+        bb, span = corridor_bbox(p1, p2)
+        if 30 < span <= MAX_SPAN_M:
+            _prewarm_bbox(tuple(bb), ("ab",) + tuple(round(x, 3) for x in bb))
+    except Exception:
+        pass
+
+
 def green_center(lat, lon):
     """Suchmitte für Grünflächen auf ein 1-km-Raster gelegt: Wer in der Nähe schon gesucht hat, findet die Daten im Speicher."""
     return round(round(lat * 100) / 100, 2), round(round(lon * 100) / 100, 2)
@@ -2789,6 +2801,7 @@ def build_nav(area, path, title, loop=False, waypoints=None):
         "title": title, "total": round(cum[-1]),
         "coords": [[round(la, 6), round(lo, 6)] for la, lo in ll],
         "cum": [round(c, 1) for c in cum],
+        "nidx": list(node_idx),
         "steps": [{"d": round(cum[s["idx"]]), "lat": round(ll[s["idx"]][0], 6),
                    "lon": round(ll[s["idx"]][1], 6), "t": s["t"], "i": s["i"]} for s in steps],
     }
@@ -2827,6 +2840,9 @@ body.nav #side{top:calc(var(--top) + 92px)}
 #chips{display:flex;gap:8px;overflow-x:auto;padding-bottom:8px;-webkit-overflow-scrolling:touch}
 .chip{flex:none;border:1px solid var(--line);background:#fff;border-radius:14px;padding:8px 12px;text-align:left;min-width:108px;color:var(--text)}
 .chip b{display:block;font-size:.92rem}.chip span{font-size:.78rem;opacity:.7}
+#glg{display:flex;flex-wrap:wrap;gap:3px 12px;font-size:.76rem;margin:4px 0 2px}#glg:empty{display:none}
+#glg i{display:inline-block;width:16px;height:5px;border-radius:3px;margin-right:5px;vertical-align:middle}
+.gbar{display:flex;height:5px;border-radius:3px;overflow:hidden;margin-top:6px;background:#E5E0D3}
 .chip{transition:background .25s,border-color .25s,transform .18s,box-shadow .25s}.chip:active{transform:scale(.95)}
 .chip.on{background:#E7EDDB;border-color:var(--sage);box-shadow:0 3px 10px rgba(78,110,69,.25);transform:translateY(-1px)}
 #stats>div{animation:statpop .55s cubic-bezier(.2,.9,.3,1.2) both}#stats>div:nth-child(2){animation-delay:.07s}#stats>div:nth-child(3){animation-delay:.14s}#stats>div:nth-child(4){animation-delay:.21s}
@@ -2884,7 +2900,7 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
 <div id="side"><button id="layers" title="Kartenstil wechseln">🗺️</button><button id="sat" title="Satellit / Luftbild">🛰️</button><button id="fit" title="Ganze Route zeigen">⤢</button><button id="wcbtn" title="Toiletten ein-/ausblenden" style="display:none">🚻</button></div>
 <div id="sheet">
  <div id="ttl"></div>
- <div id="pre"><div id="chips"></div><div id="stats"></div><div id="hint"></div><div id="dogbox"></div></div>
+ <div id="pre"><div id="chips"></div><div id="stats"></div><div id="hint"></div><div id="glg"></div><div id="dogbox"></div></div>
  <div id="navbox"><div id="rem"></div><div id="prog"><div></div></div></div>
  <div id="btns"><button id="go">▶ Navigation starten</button><button class="sq on" id="vbtn" title="Sprachansagen">🔊</button><button class="sq on" id="fbtn" title="Karte folgt mir">🎯</button><button class="sq" id="lbtn" title="Alle Anweisungen">📋</button><button class="sq" id="demo" title="Demo ohne Gehen">🧪</button></div>
 </div>
@@ -3097,6 +3113,7 @@ function drawIn(line, delay) {
     }, delay);
   } catch (e) {}
 }
+const GCOL = ['#2E7D32', '#9CC25A', '#8C9188'], GNAME = ['viel Grün', 'etwas Grün', 'Straße'];
 function showOption(i, fit) {
   const o = D.options[i];
   cur = i; coords = o.coords; cum = o.cum; steps = o.steps; total = Math.max(o.total, 1);
@@ -3107,8 +3124,12 @@ function showOption(i, fit) {
   const showShort = D.mode === 'ab' && i !== 0;
   if (showShort) add(L.polyline(D.options[0].coords, {color: '#C08A47', weight: 4, opacity: .95, dashArray: '8 8'}));
   add(L.polyline(coords, {color: '#fff', weight: 11, opacity: .9}));
-  const mainLine = add(L.polyline(coords, {color: RC, weight: 7, opacity: 1}));
-  drawIn(mainLine, (window.INTRO && !INTRO_DONE) ? 1900 : 0);
+  if (o.gr && o.gr.length) {  // nach Grünanteil eingefärbt: dunkelgrün viel Grün, hellgrün etwas Grün, grau Straße
+    o.gr.forEach(r => add(L.polyline(coords.slice(r[1], r[2] + 1), {color: GCOL[r[0]], weight: 7, opacity: 1, lineCap: 'round', lineJoin: 'round'})));
+  } else {
+    const mainLine = add(L.polyline(coords, {color: RC, weight: 7, opacity: 1}));
+    drawIn(mainLine, (window.INTRO && !INTRO_DONE) ? 1900 : 0);
+  }
   done = add(L.polyline([], {color: RDONE, weight: 7, opacity: 1}));
   (o.dups || []).forEach(sg => add(L.polyline(sg, {color: '#E08A1E', weight: 5, opacity: .95, dashArray: '1 9', lineCap: 'round'})));
   steps.forEach((s, k) => { if (k > 0 && k < steps.length - 1)
@@ -3119,6 +3140,7 @@ function showOption(i, fit) {
   $('stats').innerHTML = o.stats.map(s => '<div><span>' + esc(s[0]) + '</span><b>' + esc(s[1]) + '</b></div>').join('');
   $('hint').textContent = (o.hint || '') + (showShort ? ' · gestrichelt: kürzeste Route' : '');
   $('hint').className = o.warn ? 'warn' : '';
+  $('glg').innerHTML = o.gb ? o.gb.map((v, k) => v > 0 ? '<span><i style="background:' + GCOL[k] + '"></i>' + GNAME[k] + ' ' + v + ' %</span>' : '').join('') : '';
   const dg = o.dog; let dh = '';
   if (dg) {
     dh += '<div class="dsurf">' + (dg.surf || []).map(s => '<span><i style="background:' + s[2] + '"></i>' + esc(s[0]) + ' ' + s[1] + ' %</span>').join('') + '</div>';
@@ -3340,7 +3362,7 @@ function startDemo() {
   }, 500);
 }
 
-$('chips').innerHTML = D.options.map((o, i) => '<button class="chip" data-i="' + i + '"><b>' + esc(o.label) + '</b><span>' + esc(o.sub) + '</span></button>').join('');
+$('chips').innerHTML = D.options.map((o, i) => '<button class="chip" data-i="' + i + '"><b>' + esc(o.label) + '</b><span>' + esc(o.sub) + '</span>' + (o.gb ? '<div class="gbar">' + o.gb.map((v, k) => '<i style="width:' + v + '%;background:' + GCOL[k] + '"></i>').join('') + '</div>' : '') + '</button>').join('');
 $('chips').addEventListener('click', e => { const b = e.target.closest('.chip'); if (b && !navOn) showOption(+b.dataset.i, true); });
 $('ttl').textContent = (D.p1[0] === D.p2[0] && D.p1[1] === D.p2[1]) ? '🔄 Ründchen ab ' + D.t1 : '🚶 ' + D.t1 + '  →  🏁 ' + D.t2;
 $('go').textContent = GO;
@@ -3629,8 +3651,54 @@ def end_context(area, path):
     return ""
 
 
+GREEN_CLASS_HI, GREEN_CLASS_MID = 0.6, 0.25  # Grünscore einer Kante: viel Grün / etwas Grün / Straße
+
+
+def green_runs(area, path, nidx, buf=150):
+    """Route nach Grünanteil einfärben: Abschnitte [Klasse, Index von, Index bis] (Klasse 0 viel Grün, 1 etwas, 2 Straße)
+    als Indizes in die Routenlinie (spart Daten) und der Längenanteil je Klasse in Prozent."""
+    if not nidx or len(nidx) != len(path):
+        return [], []
+    H, L = area["H"], area["lengths"]
+    idx = np.array([H[a][b]["i"] for a, b in zip(path[:-1], path[1:])], dtype=int)
+    if not len(idx):
+        return [], []
+    g = edge_green(area, buf)[idx]
+    cls = np.where(g >= GREEN_CLASS_HI, 0, np.where(g >= GREEN_CLASS_MID, 1, 2))
+    ln = L[idx]
+    runs = []  # [Klasse, i0, i1, Länge]
+    for k in range(len(idx)):
+        c, i0, i1 = int(cls[k]), int(nidx[k]), int(nidx[k + 1])
+        if runs and runs[-1][0] == c:
+            runs[-1][2] = i1
+            runs[-1][3] += float(ln[k])
+        else:
+            runs.append([c, i0, i1, float(ln[k])])
+    merged = []  # ganz kurze Abschnitte (unter 40 m) in den Vorgänger aufnehmen, sonst wird die Linie unruhig
+    for r in runs:
+        if merged and r[3] < 40.0:
+            merged[-1][2] = r[2]
+            merged[-1][3] += r[3]
+        elif merged and merged[-1][0] == r[0]:
+            merged[-1][2] = r[2]
+            merged[-1][3] += r[3]
+        else:
+            merged.append(r)
+    tot = float(ln.sum()) or 1.0
+    share = [round(100 * float(ln[cls == c].sum()) / tot) for c in range(3)]
+    return [[c, i0, i1] for c, i0, i1, _ in merged], share
+
+
 def _option(nav, label, sub, hint, stats, area=None, path=None, endctx=None):
     _resolve_weather()
+    nidx = nav.get("nidx")
+    nav = {k: v for k, v in nav.items() if k != "nidx"}
+    gr, gb = [], []
+    if area is not None and path and nidx:
+        try:
+            gr, gb = green_runs(area, path, nidx)
+        except Exception:
+            gr, gb = [], []
     if endctx is None:
         endctx = end_context(area, path) if (area is not None and path) else ""
     extra = {}
@@ -3665,6 +3733,8 @@ def _option(nav, label, sub, hint, stats, area=None, path=None, endctx=None):
         hint += f" · {share:.0%} Doppelweg"
     if segs and share >= 0.02:
         hint += " · orange markiert = doppelt gelaufen"
+    if gr:
+        extra = {**extra, "gr": gr, "gb": gb}
     return {**nav, "label": label, "sub": sub, "hint": hint, "stats": stats, "dups": segs, "endctx": endctx, **extra}
 
 
@@ -4401,6 +4471,56 @@ def osrm_request(points, alternatives=False):
     if js.get("code") != "Ok" or not js.get("routes"):
         raise ValueError("Für diese Punkte habe ich keinen Fußweg gefunden.")
     return js["routes"]
+
+
+def quick_route(pts, timeout=6):
+    """Nur für die Sofort-Vorschau: schnellste Fußroute (vereinfachte Linie, ohne Wegehinweise), ein Versuch.
+    Rückgabe {"ll": [[lat, lon], ...], "m": Meter} oder None. Nie ein Fehler: die Vorschau ist nur ein Bonus."""
+    try:
+        if len(pts) < 2 or all(dist_m(pts[0], q) < 30 for q in pts[1:]):
+            return None
+        if dist_m(pts[0], pts[-1]) > 15000 and len(pts) == 2:
+            return None
+        with _OSRM_LOCK:
+            wait = _OSRM_LAST[0] + 1.05 - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            _OSRM_LAST[0] = time.time()
+        coords = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in pts)
+        r = requests.get(OSRM_FOOT + coords, headers=UA, timeout=timeout,
+                         params={"overview": "simplified", "geometries": "geojson", "steps": "false"})
+        r.raise_for_status()
+        js = r.json()
+        rt = js["routes"][0]
+        ll = [[y, x] for x, y in rt["geometry"]["coordinates"]]
+        if len(ll) < 2:
+            return None
+        return {"ll": ll, "m": float(rt["distance"])}
+    except Exception:
+        return None
+
+
+def preview_svg(prev, w=300, h=104, pad=10):
+    """Kleine Linienskizze der Vorschau-Route (ohne Kartenkacheln, daher sofort und ohne weiteres Netz)."""
+    ll = prev["ll"]
+    lat0 = sum(p[0] for p in ll) / len(ll)
+    kx = math.cos(math.radians(lat0))
+    xs = [p[1] * kx for p in ll]
+    ys = [-p[0] for p in ll]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    sc = min((w - 2 * pad) / max(x1 - x0, 1e-9), (h - 2 * pad) / max(y1 - y0, 1e-9))
+    ox = (w - (x1 - x0) * sc) / 2
+    oy = (h - (y1 - y0) * sc) / 2
+    pts = [(ox + (x - x0) * sc, oy + (y - y0) * sc) for x, y in zip(xs, ys)]
+    d = " ".join(f"{'M' if i == 0 else 'L'}{a:.1f} {b:.1f}" for i, (a, b) in enumerate(pts))
+    (sx, sy), (ex, ey) = pts[0], pts[-1]
+    loop = math.hypot(sx - ex, sy - ey) < 6
+    end = ("" if loop else f'<circle cx="{ex:.1f}" cy="{ey:.1f}" r="5.5" fill="#B8571A" stroke="#fff" stroke-width="2"/>')
+    return (f'<svg viewBox="0 0 {w} {h}" width="100%" height="{h}" role="img" aria-label="Skizze der schnellsten Route">'
+            f'<path d="{d}" fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" opacity=".9"/>'
+            f'<path class="pv" d="{d}" fill="none" stroke="#7C857A" stroke-width="3.2" stroke-linecap="round" '
+            f'stroke-linejoin="round" stroke-dasharray="1 7"/>{end}'
+            f'<circle cx="{sx:.1f}" cy="{sy:.1f}" r="6" fill="#4E6E45" stroke="#fff" stroke-width="2"/></svg>')
 
 
 def _route_ll(route):
@@ -6626,12 +6746,18 @@ OVERLAY_HTML = """
  background:rgba(251,248,241,.8);border:1px solid #D9CFBC;box-shadow:0 6px 20px rgba(60,50,30,.12);text-align:center}
 #gwload .fact small{display:block;font-size:.68rem;letter-spacing:.07em;text-transform:uppercase;font-weight:700;color:#4E6E45;margin-bottom:6px}
 #gwload .fact p{position:absolute;left:16px;right:16px;top:34px;margin:0;opacity:0;color:#3B3A33;font-size:.95rem;line-height:1.38}
+#gwload .prev{position:relative;width:min(88vw,380px);padding:8px 14px 8px;border-radius:16px;background:rgba(251,248,241,.8);
+ border:1px solid #D9CFBC;box-shadow:0 6px 20px rgba(60,50,30,.12);text-align:center;animation:gwfade .5s ease both}
+#gwload .prev b{display:block;font-size:.86rem;color:#3B3A33;margin-top:2px}
+#gwload .prev small{display:block;font-size:.74rem;color:#6A685E;margin-top:1px}
+#gwload .prev .pv{animation:gwmarch 1.6s linear infinite}
+@keyframes gwmarch{to{stroke-dashoffset:-16}}
 @media (prefers-reduced-motion:reduce){#gwload *{animation-duration:0s!important}#gwload .fact p:first-of-type{opacity:1}}
 __FACTCSS__
 </style>
 <div id="gwload" class="__BGCLS__">__CITYBG__<i class="b"></i><i class="b"></i><i class="b"></i><i class="b"></i>
 <div class="logo"><img src="data:image/svg+xml;base64,__LOGO__" alt=""></div>
-<div class="st">__STAGE__</div><div class="bar"></div>
+<div class="st">__STAGE__</div><div class="bar"></div>__PREVIEW__
 <div class="fact"><small>__LABEL__</small>__FACTS__</div></div>
 """
 
@@ -6966,6 +7092,8 @@ class Overlay:
         self.bg = ""
         self.city = ""
         self._bgt = None
+        self._prev = None        # Sofort-Vorschau (schnellste Route), kommt aus einem Hintergrund-Thread
+        self._prev_shown = False
         if lat is not None:
             def work():
                 try:
@@ -6997,7 +7125,7 @@ class Overlay:
             logo = base64.b64encode(LOGO_SVG.encode()).decode()
             html = (OVERLAY_HTML.replace("__FACTCSS__", css + self._bg_css()).replace("__LOGO__", logo)
                     .replace("__STAGE__", escape(self.stage)).replace("__FACTS__", facts)
-                    .replace("__LABEL__", "Wusstest du?")
+                    .replace("__LABEL__", "Wusstest du?").replace("__PREVIEW__", self._prev_html())
                     .replace("__CITYBG__", self._bg_html()).replace("__BGCLS__", "hasbg"))
             if self.dog:
                 html = html.replace('<div class="logo"><img src="data:image/svg+xml;base64,' + logo + '" alt=""></div>', self._dog_scene())
@@ -7005,6 +7133,39 @@ class Overlay:
             self.ph.markdown(html, unsafe_allow_html=True)
         except Exception:
             pass
+
+    def set_preview(self, pts, what="Schnellste Fußroute"):
+        """Sofort-Vorschau: holt im Hintergrund die schnellste Route und zeigt sie als Skizze, sobald sie da ist.
+        Die grüne Berechnung wartet nicht darauf."""
+        self._prev_what = what
+
+        def work():
+            r = quick_route(pts)
+            if r:
+                self._prev = r
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except Exception:
+            pass
+
+    def _prev_html(self):
+        pv = self._prev
+        if not pv:
+            return ""
+        try:
+            m = pv["m"]
+            mins = max(1, round(m / M_PER_MIN))
+            return (f'<div class="prev">{preview_svg(pv)}<b>{escape(getattr(self, "_prev_what", "Schnellste Fußroute"))}: '
+                    f'{fmt_km(m)} · {mins} min</b><small>Die grünere Route wird noch berechnet …</small></div>')
+        except Exception:
+            return ""
+
+    def _poll_preview(self):
+        """True, wenn die Vorschau seit dem letzten Zeichnen neu dazugekommen ist."""
+        if self._prev and not self._prev_shown:
+            self._prev_shown = True
+            return True
+        return False
 
     def _dog_scene(self):
         """Ladehund passend zu Jahreszeit und aktuellem Wetter (Sonnenbrille, Regencape, Schal, Schweißtropfen)."""
@@ -7045,16 +7206,22 @@ class Overlay:
         except Exception:
             pass
         txt = re.sub(r"\s*\([^)]*\)\s*$", "", str(msg)).strip()
+        newp = self._poll_preview()
         if txt and txt != self.stage and len(txt) < 140:
             self.stage = txt
+            self.render()
+        elif newp:
             self.render()
 
     def step(self, msg):
         """Wie log, aber ohne Textzeile auf der Seite (für die Kartenansicht)."""
         self._lap(msg)
         txt = re.sub(r"\s*\([^)]*\)\s*$", "", str(msg)).strip()
+        newp = self._poll_preview()
         if txt and txt != self.stage and len(txt) < 140:
             self.stage = txt
+            self.render()
+        elif newp:
             self.render()
 
     def _lap(self, msg):
@@ -7385,13 +7552,15 @@ def _san_carry(old, new):
 
 
 @contextmanager
-def map_busy(gw):
+def map_busy(gw, preview_pts=None, preview_what="Schnellste Fußroute"):
     """Während in der Karte neu berechnet wird: Ladeansicht mit Arbeitsstand statt stiller Wartezeit."""
     ov = None
     try:
         ov = loading_overlay(gw.get("start"), bool(gw.get("water", False)))
+        if preview_pts:
+            ov.set_preview(preview_pts, preview_what)
     except Exception:
-        ov = None
+        pass
     try:
         yield (ov.step if ov else (lambda *_: None))
     finally:
@@ -7463,7 +7632,11 @@ def render_map_view():
             st.toast(f"⚠️ {e}"[:220])
     elif gw["mode"] == "ab" and dest_new and dest_new != gw["dest"] and dest_new != gw.get("failed"):
         try:
-            with map_busy(gw) as step:
+            try:
+                _pp = [tuple(_unpack(gw["start"])[:2]), tuple(_unpack(dest_new)[:2])]
+            except Exception:
+                _pp = None
+            with map_busy(gw, _pp) as step:
                 if gw.get("fallback") == "scan":
                     new = scan_ab_view(gw["start"], dest_new, gw["buf"], step)
                 elif gw.get("fallback"):
@@ -7475,7 +7648,11 @@ def render_map_view():
             st.toast(f"⚠️ {e}"[:220])
     elif gw["mode"] == "tour" and add_new and add_new != gw.get("failed"):
         try:
-            with map_busy(gw) as step:
+            try:
+                _pp = tour_points(gw["start"], gw["stops_v"] + [add_new], gw["end_v"])[0]
+            except Exception:
+                _pp = None
+            with map_busy(gw, _pp, "Direkter Weg über die Zwischenziele") as step:
                 new = make_tour_view_safe(gw["start"], gw["stops_v"] + [add_new], gw["end_v"], gw["level"], gw["buf"],
                                           log=step, extra_km=gw.get("extra_km", 0))
             new["sid"] = gw["sid"] + 1  # neues leeres Suchfeld
@@ -7832,6 +8009,8 @@ def home_route():
         san_reach = san_settings("route")
         acc_on = access_toggle("route")
         go = st.button("Route finden", type="primary", use_container_width=True, key="go_ab")
+    if start_v and ziel_v:
+        prewarm_ab(start_v, ziel_v)  # Korridor schon laden, während noch Optionen eingestellt werden
     if not go:
         return
     if not (start_v and ziel_v):
@@ -7844,6 +8023,10 @@ def home_route():
     st.session_state["_temp"] = None
     dog_prefetch(start_v)
     ov = loading_overlay(start_v, water_on)
+    try:
+        ov.set_preview([tuple(_unpack(start_v)[:2]), tuple(_unpack(ziel_v)[:2])])
+    except Exception:
+        pass
     with st.status("Route wird vorbereitet …", expanded=True) as status:
         try:
             view = make_ab_view_safe(start_v, ziel_v, log=ov.log)
@@ -7950,6 +8133,10 @@ def home_tour():
     st.session_state["_temp"] = None
     dog_prefetch(a_v)
     ov = loading_overlay(a_v, water_on)
+    try:
+        ov.set_preview(tour_points(a_v, stops, None if same else b_v)[0], "Direkter Weg über die Zwischenziele")
+    except Exception:
+        pass
     with st.status("Runde mit Zwischenzielen wird berechnet …", expanded=True) as status:
         try:
             view = make_tour_view_safe(a_v, stops, None if same else b_v, level, log=ov.log, extra_km=extra_km)
