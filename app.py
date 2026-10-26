@@ -658,7 +658,14 @@ def _cat_defs(term):
 def _op_post(base, q, timeout):
     r = requests.post(base + "/interpreter", data={"data": q}, headers=UA, timeout=timeout)
     r.raise_for_status()
-    return r.json()
+    js = r.json()
+    # Überlastete Overpass-Server antworten oft mit 200 und einer leeren oder unvollständigen Liste plus Fehlerhinweis
+    # („runtime error: Query timed out …“, „… ran out of memory …“). Das ist KEINE gültige Antwort: sie würde sonst als
+    # „nichts gefunden“ gelten (und stundenlang im Zwischenspeicher liegen). Stattdessen wird der nächste Server gefragt.
+    remark = str(js.get("remark", "")) if isinstance(js, dict) else ""
+    if "runtime error" in remark or "timed out" in remark or "out of memory" in remark:
+        raise RuntimeError(f"{base.split('/')[2]}: {remark[:80]}")
+    return js
 
 
 def _overpass_race(q, timeout=8.0, mirrors=None):
@@ -3874,6 +3881,7 @@ async function fetchDw(bb) {
       clearTimeout(tm);
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const js = await r.json();
+      if (js.remark && /runtime error|timed out|out of memory/.test(js.remark)) throw new Error('Overpass: ' + js.remark);  // überlastet: keine gültige Antwort
       const pts = (js.elements || []).map(el => {
         const t = el.tags || {}, la = el.lat !== undefined ? el.lat : (el.center && el.center.lat), lo = el.lon !== undefined ? el.lon : (el.center && el.center.lon);
         if (la === undefined || lo === undefined || t.drinking_water === 'no' || t.access === 'private') return null;
@@ -8718,6 +8726,11 @@ def render_green_pending():
     opts = gp["options"]
     st.caption("Alles zusammen gibt es hier leider nicht. Ich habe abgewogen und zeige dir die besten Möglichkeiten. "
                "Such dir die aus, die sich für dich richtig anfühlt.")
+    fl = [c for c in opts[0].get("failed", []) if c in gp["prefer"] + gp["avoid"]]
+    if fl:
+        st.warning("Die Kartenserver haben gerade nichts zu " + ", ".join(f"{GREEN_ICON[c]} {CAT_NAME[c]}" for c in fl)
+                   + " geliefert (überlastet). Das ist bei der Auswahl unten nicht berücksichtigt. "
+                     "Probiere es in ein bis zwei Minuten noch einmal.")
     if "access" in gp["prefer"]:
         if all("paccess" not in o["keys"] for o in opts):
             st.success("♿ Barrierefreiheit hat bei der Auswahl Vorrang. Alle Vorschläge erfüllen sie.")
