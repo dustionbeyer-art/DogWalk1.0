@@ -41,6 +41,10 @@ except Exception:  # Grün-Scan braucht scipy; ohne bleibt die einfache Fußrout
     ndimage = None
 from streamlit.components.v1 import html as st_html
 from streamlit_js_eval import get_geolocation
+try:
+    from streamlit_js_eval import streamlit_js_eval
+except Exception:  # ältere Version: Favoriten gelten dann nur für diese Sitzung
+    streamlit_js_eval = None
 from streamlit_searchbox import st_searchbox
 
 
@@ -6400,6 +6404,7 @@ html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp 
 [data-testid="stToggle"],[data-testid="stCheckbox"]{transition:opacity .2s}
 @media (prefers-reduced-motion:reduce){.st-key-card_route,.st-key-card_green,.st-key-card_loop,.st-key-card_tour,.hero{animation:none}}
 /* Handy: Auswahl als lesbare Tipp-Felder (Chips), die umbrechen statt zu quetschen */
+.st-key-favsync{position:absolute!important;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;margin:0!important}
 [class*="st-key-chips_"],[class*="st-key-chips_"] [data-testid="stVerticalBlock"]{flex-direction:row!important;flex-wrap:wrap!important;
  gap:.45rem!important;align-items:stretch!important}
 [class*="st-key-chips_"] [data-testid="stElementContainer"],[class*="st-key-chips_"] .element-container,
@@ -7999,16 +8004,152 @@ def render_green_pending():
         st.rerun()
 
 
+# ---------- Favoriten und zuletzt genutzte Ziele (Schnellstart)
+# Gespeichert im Browser (localStorage) des Geräts: bleibt nach dem Neuladen erhalten, ohne Konto und ohne Server.
+FAV_MAX, REC_MAX = 8, 4
+FAV_LS_KEY = "gw_favs_v1"
+_FAV_JS_GET = "(function(){try{return localStorage.getItem('" + FAV_LS_KEY + "')||''}catch(e){return ''}})()"
+
+
+def _fav_key(v):
+    try:
+        lat, lon, _ = _unpack(v)
+        return (round(lat, 4), round(lon, 4))
+    except Exception:
+        return None
+
+
+def _fav_state():
+    return st.session_state.setdefault("_favs", {"fav": [], "rec": []})
+
+
+def _fav_valid(v):
+    return isinstance(v, str) and _fav_key(v) is not None
+
+
+def _fav_merge(raw):
+    """Gespeicherte Liste aus dem Browser mit dem Stand dieser Sitzung zusammenführen."""
+    try:
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        data = {}
+    stt = _fav_state()
+    for name, mx in (("fav", FAV_MAX), ("rec", REC_MAX)):
+        cur = list(stt[name])
+        seen = {_fav_key(v) for v in cur}
+        for v in (data.get(name) or []) if isinstance(data, dict) else []:
+            if _fav_valid(v) and _fav_key(v) not in seen:
+                cur.append(v)
+                seen.add(_fav_key(v))
+        stt[name] = cur[:mx]
+    fk = {_fav_key(v) for v in stt["fav"]}
+    stt["rec"] = [v for v in stt["rec"] if _fav_key(v) not in fk]
+
+
+def _fav_add(v):
+    stt = _fav_state()
+    k = _fav_key(v)
+    if k is None or any(_fav_key(x) == k for x in stt["fav"]):
+        return
+    if len(stt["fav"]) >= FAV_MAX:
+        st.toast(f"Maximal {FAV_MAX} Favoriten. Bitte erst einen entfernen.")
+        return
+    stt["fav"].append(v)
+    stt["rec"] = [x for x in stt["rec"] if _fav_key(x) != k]
+    st.toast("⭐ Als Favorit gemerkt")
+
+
+def _fav_del(i):
+    stt = _fav_state()
+    if 0 <= i < len(stt["fav"]):
+        stt["fav"].pop(i)
+
+
+def _rec_add(v):
+    """Ziel einer gefundenen Route merken (neueste zuerst; Favoriten stehen schon oben)."""
+    stt = _fav_state()
+    k = _fav_key(v)
+    if k is None or any(_fav_key(x) == k for x in stt["fav"]):
+        return
+    stt["rec"] = ([v] + [x for x in stt["rec"] if _fav_key(x) != k])[:REC_MAX]
+
+
+def _fav_go(v):
+    """Kachel getippt: Reiter „Route“ mit diesem Ziel öffnen und sofort losrechnen (sobald der Standort da ist)."""
+    st.session_state["page_sel"] = "route"
+    st.session_state["_keep_ziel_sb"] = v
+    st.session_state["_quick_dest"] = v
+
+
+def fav_sync():
+    """Favoriten einmal aus dem Browser lesen und Änderungen zurückschreiben (unsichtbare Hilfskomponente)."""
+    ss = st.session_state
+    if streamlit_js_eval is None:
+        ss["_fav_loaded"] = True
+        return
+    try:
+        with st.container(key="favsync"):
+            if not ss.get("_fav_loaded"):
+                raw = streamlit_js_eval(js_expressions=_FAV_JS_GET, key="fav_read")
+                if isinstance(raw, str):
+                    _fav_merge(raw)
+                    ss["_fav_loaded"] = True
+                return
+            payload = json.dumps(_fav_state(), ensure_ascii=False, separators=(",", ":"))
+            js = ("(function(){try{localStorage.setItem('" + FAV_LS_KEY + "'," + json.dumps(payload, ensure_ascii=False)
+                  + ");return 1}catch(e){return 0}})()")
+            k = "fav_w" + hashlib.md5(payload.encode("utf-8")).hexdigest()[:10]
+            try:
+                streamlit_js_eval(js_expressions=js, want_output=False, key=k)
+            except TypeError:
+                streamlit_js_eval(js_expressions=js, key=k)
+    except Exception:
+        ss["_fav_loaded"] = True  # Speichern im Browser nicht möglich: Favoriten gelten für diese Sitzung
+
+
+def home_favs():
+    """Schnellstart-Kacheln: Favoriten (⭐) und zuletzt genutzte Ziele (🕘) auf einen Tipp."""
+    stt = _fav_state()
+    favs, recs = stt["fav"], stt["rec"]
+    if not favs and not recs:
+        return
+    st.markdown('<div class="fld">⭐ Schnellstart · Route von hier</div>', unsafe_allow_html=True)
+    with st.container(key="chips_favs"):
+        for i, v in enumerate(favs):
+            st.button("⭐ " + _short(_unpack(v)[2])[:24], key=f"favgo_c{i}", type="secondary",
+                      on_click=_fav_go, args=(v,))
+        for i, v in enumerate(recs):
+            st.button("🕘 " + _short(_unpack(v)[2])[:24], key=f"recgo_c{i}", type="secondary",
+                      on_click=_fav_go, args=(v,))
+    if favs:
+        with st.expander("Favoriten verwalten"):
+            for i, v in enumerate(favs):
+                c1, c2 = st.columns([5, 1])
+                c1.markdown(f"⭐ {escape(_short(_unpack(v)[2])[:40])}")
+                c2.button("✕", key=f"favdel_{i}", on_click=_fav_del, args=(i,), help="Favorit entfernen")
+
+
 def home_route():
     with st.container(key="card_route"):
         start_v = start_input("Start", "start_sb")
         ziel_v = place_input("Ziel", "ziel_sb")
         st.caption(SEARCH_TIP)
+        if ziel_v and _fav_key(ziel_v) not in {_fav_key(x) for x in _fav_state()["fav"]}:
+            st.button("⭐ Ziel als Favorit merken", key="fav_add_btn", on_click=_fav_add, args=(ziel_v,))
         water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_route", value=False,
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         san_reach = san_settings("route")
         acc_on = access_toggle("route")
         go = st.button("Route finden", type="primary", use_container_width=True, key="go_ab")
+    quick = st.session_state.get("_quick_dest")
+    if quick:
+        if ziel_v is None or ziel_v == quick:
+            ziel_v = quick
+            if start_v:  # Schnellstart: sofort losrechnen (wartet sonst, bis der Standort da ist)
+                go = True
+                st.session_state.pop("_quick_dest", None)
+        else:  # Ziel wurde von Hand geändert
+            st.session_state.pop("_quick_dest", None)
     if start_v and ziel_v:
         prewarm_ab(start_v, ziel_v)  # Korridor schon laden, während noch Optionen eingestellt werden
     if not go:
@@ -8030,6 +8171,7 @@ def home_route():
     with st.status("Route wird vorbereitet …", expanded=True) as status:
         try:
             view = make_ab_view_safe(start_v, ziel_v, log=ov.log)
+            _rec_add(ziel_v)
             status.update(label="Fertig", state="complete", expanded=False)
         except Exception as e:
             status.update(label="Fehler", state="error")
@@ -8204,6 +8346,7 @@ def render_home():
     restore_widgets()
     snap_widgets()
     back_fx()
+    fav_sync()
     dog = bool(st.session_state.get("dog_mode", False))
     st.markdown(DOG_BASE_CSS + (DOG_CSS if dog else ""), unsafe_allow_html=True)
     logo = base64.b64encode(LOGO_SVG.encode()).decode()
@@ -8226,9 +8369,12 @@ def render_home():
         wind_home_info()
     # Nur der gewählte Reiter wird aufgebaut (st.tabs würde alle drei samt Suchfeldern laden = langsam)
     pages = {"route": "🧭 Route", "green": "🌳 Ins Grün", "loop": "🔄 Ründchen", "tour": "🛍️ Ründchen mit Zwischenziel"}
+    home_favs()
     page = chips("", list(pages), "page_sel", default="route", fmt=pages.get)
     page = page or st.session_state.get("page_last", "route")
     st.session_state["page_last"] = page
+    if page != "route":
+        st.session_state.pop("_quick_dest", None)
     if st.session_state.get("_home_drawn") != page:  # Startseite oder Reiter wird neu aufgebaut: frische Suchfelder
         bump_sb_gen()
     st.session_state["_home_drawn"] = page
