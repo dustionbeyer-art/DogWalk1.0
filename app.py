@@ -8984,9 +8984,14 @@ def dog_home_info():
     if wn:
         st.markdown(f'<div class="dogwarn" style="background:#E3F0F8;border-color:#9CC4DC;color:#1E4A66">{escape(wn)}</div>', unsafe_allow_html=True)
     st.caption("Nicht jedes Verbot steht in den Kartendaten. Schilder vor Ort, Leinenpflicht sowie Brut- und Setzzeit gehen vor.")
-    st.markdown('<div class="chayfact"><img src="' + chay_icon_uri(40) + '" width="40" height="40" alt="' + DOG_NAME + '">'
-                f'<div><b>{DOG_NAME}</b>, auch Chayton Wakanda, war ein Black-Tri Australian Shepherd: schön, frech und clever. '
-                'Er wird bis heute geliebt.</div></div>', unsafe_allow_html=True)
+
+
+def chay_info():
+    """Dezent unten auf der Startseite (Hundemodus): kleiner aufklappbarer Abschnitt über Chay."""
+    with st.expander(f"🐾 Über {DOG_NAME}"):
+        st.markdown('<div class="chayfact"><img src="' + chay_icon_uri(40) + '" width="40" height="40" alt="' + DOG_NAME + '">'
+                    f'<div><b>{DOG_NAME}</b>, auch Chayton Wakanda, war ein Black-Tri Australian Shepherd: schön, frech und clever. '
+                    'Er wird bis heute geliebt.</div></div>', unsafe_allow_html=True)
 
 
 def wind_home_info():
@@ -9077,6 +9082,8 @@ def render_home():
         st.markdown(sources_text(150, LEVELS["Ausgewogen"]))
     with st.expander("🔒 Datenschutz"):
         st.markdown(PRIVACY_TEXT)
+    if dog:
+        chay_info()
     laps_ = st.session_state.get("_laps")
     if laps_ and len(laps_) > 1:
         with st.expander("⏱️ Zeiten der letzten Berechnung"):
