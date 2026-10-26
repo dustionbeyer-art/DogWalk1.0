@@ -2918,6 +2918,12 @@ body.nav #banner{display:flex}
 body.fin #sheet,body.fin #banner,body.thx #side{opacity:0;pointer-events:none}
 #thx{font-size:1.08rem;line-height:1.45;color:var(--text);margin-bottom:14px}
 #thxb{border:0;border-radius:12px;background:var(--moss);color:#FBF7EE;padding:10px 22px;font-size:1rem}
+#sum{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin:0 0 12px}
+#sum div{background:#fff;border:1px solid var(--line);border-radius:12px;padding:6px 10px;min-width:84px}
+#sum small{display:block;font-size:.66rem;letter-spacing:.05em;text-transform:uppercase;opacity:.65}
+#sum b{font-size:1.02rem}
+#gpxb{display:block;margin:0 auto 10px;border:1px solid var(--line);border-radius:12px;background:#fff;color:var(--text);padding:8px 16px;font-size:.92rem}
+body.dog #gpxb{border-color:#E3A96B}
 @keyframes thxin{0%{opacity:0;transform:translateY(-46%)}100%{opacity:1;transform:translateY(-50%)}}
 #banner.off{background:#B07A35}#banner.done{background:#3F5B3A}
 #ico{font-size:36px;line-height:1;width:46px;text-align:center;flex:none}
@@ -2970,6 +2976,16 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
 #go{flex:1;height:48px;border:0;border-radius:14px;background:#5E7F52;color:#FBF7EE;font-size:1rem;font-weight:700}
 .sq{width:48px;height:48px;border-radius:14px;border:1px solid var(--line);background:#fff;font-size:20px}
 .sq.on{background:#E7EDDB;border-color:var(--sage)}
+#smenu{display:none;position:absolute;left:0;right:0;bottom:calc(100% + 8px);background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:6px;box-shadow:0 8px 28px rgba(60,50,30,.3)}
+#smenu.on{display:block}
+#smenu button{display:block;width:100%;text-align:left;border:0;background:transparent;border-radius:12px;padding:10px 12px;font-size:.98rem;font-weight:600;color:var(--text)}
+#smenu button:active{background:#E7EDDB}
+#smenu small{display:block;font-weight:400;font-size:.76rem;opacity:.7;margin-top:2px}
+#sbox{display:none;position:fixed;inset:0;z-index:1300;background:rgba(59,58,51,.45);align-items:center;justify-content:center;padding:16px}
+#sbox.on{display:flex}
+#sbox>div{background:var(--paper);border-radius:18px;padding:14px;max-width:420px;width:100%;box-shadow:0 14px 40px rgba(60,50,30,.35)}
+#sbox textarea{display:block;width:100%;margin:8px 0;border:1px solid var(--line);border-radius:10px;padding:8px;font:inherit;font-size:.9rem}
+#sbclose{border:0;border-radius:12px;background:var(--moss);color:#FBF7EE;padding:8px 18px;font-size:.95rem}
 #vbtn,#fbtn{display:none}body.nav #vbtn,body.nav #fbtn{display:block}
 #map .cone{background:none;border:none;pointer-events:none}.coneIn{width:120px;height:120px;transition:transform .35s ease-out;transform-origin:60px 60px;filter:drop-shadow(0 0 3px rgba(255,255,255,.7))}.cone svg{overflow:visible}
 #styletip{position:fixed;z-index:1200;left:50%;top:calc(var(--top) + 14px);transform:translateX(-50%);background:rgba(59,58,51,.88);color:#FBF7EE;padding:6px 12px;border-radius:10px;font-size:.85rem;opacity:0;transition:opacity .3s;pointer-events:none}
@@ -2986,16 +3002,18 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
 </style></head><body>
 <div id="map"></div>
 <div id="clouds"></div>
-<div id="thanks"><div id="thx"></div><button id="thxb">Bis bald im Grünen 🌿</button></div>
+<div id="thanks"><div id="thx"></div><div id="sum"></div><button id="gpxb">💾 Strecke als GPX sichern</button><button id="thxb">Bis bald im Grünen 🌿</button></div>
 <div id="banner"><div id="ico">🧭</div><div><div id="dist"></div><div id="ins"></div></div></div>
-<div id="side"><button id="layers" title="Kartenstil wechseln">🗺️</button><button id="sat" title="Satellit / Luftbild">🛰️</button><button id="fit" title="Ganze Route zeigen">⤢</button><button id="wcbtn" title="Toiletten ein-/ausblenden" style="display:none">🚻</button></div>
+<div id="side"><button id="layers" title="Kartenstil wechseln">🗺️</button><button id="sat" title="Satellit / Luftbild">🛰️</button><button id="fit" title="Ganze Route zeigen">⤢</button><button id="wcbtn" title="Toiletten ein-/ausblenden" style="display:none">🚻</button><button id="home" title="Zurück zum Start">🏠</button></div>
 <div id="sheet">
+ <div id="smenu"><button id="m_gpx">💾 Als GPX speichern<small>für Uhr, Komoot, Organic Maps und andere Apps</small></button><button id="m_off">📴 Offline-Blatt speichern<small>Skizze und Anweisungen als Datei, ohne Netz nutzbar</small></button><button id="m_loc">📍 Standort teilen<small>Link mit deiner Position und der Restzeit</small></button></div>
  <div id="ttl"></div>
  <div id="pre"><div id="chips"></div><div id="stats"></div><div id="hint"></div><div id="glg"></div><div id="dogbox"></div></div>
  <div id="navbox"><div id="rem"></div><div id="prog"><div></div></div></div>
- <div id="btns"><button id="go">▶ Navigation starten</button><button class="sq on" id="vbtn" title="Sprachansagen">🔊</button><button class="sq on" id="fbtn" title="Karte folgt mir">🎯</button><button class="sq" id="lbtn" title="Alle Anweisungen">📋</button><button class="sq" id="demo" title="Demo ohne Gehen">🧪</button></div>
+ <div id="btns"><button id="go">▶ Navigation starten</button><button class="sq on" id="vbtn" title="Sprachansagen">🔊</button><button class="sq on" id="fbtn" title="Karte folgt mir">🎯</button><button class="sq" id="lbtn" title="Alle Anweisungen">📋</button><button class="sq" id="gpx" title="Route als GPX-Datei speichern (für Uhr, Komoot, Wander-Apps)">💾</button><button class="sq" id="demo" title="Demo ohne Gehen">🧪</button></div>
 </div>
 <div id="list"></div>
+<div id="sbox"><div><b>Text zum Teilen</b><textarea id="sbta" readonly rows="5"></textarea><button id="sbclose">Schließen</button></div></div>
 <div id="styletip"></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 <script>
@@ -3146,7 +3164,7 @@ const userAcc = L.circle([0, 0], {radius: 10, color: '#2F6F8F', weight: 1, fillC
 
 let cur = -1, layers = [], coords = [], cum = [], steps = [], total = 1, P = [], lat0 = 0, lon0 = 0, kx = 1, done = null;
 let navOn = false, along = 0, lastIdx = 0, offCount = 0, finished = false, follow = true, lastPos = null,
-    said = {}, voice = true, watchId = null, sim = null, hadFix = false, wake = null;
+    said = {}, voice = true, watchId = null, sim = null, hadFix = false, wake = null, navT0 = 0, demoRun = false;
 
 const toXY = (la, lo) => [(lo - lon0) * kx, (la - lat0) * ky];
 function fmt(m) {
@@ -3333,10 +3351,205 @@ function showThanks() {
   if (i === last) i = (i + 1) % list.length;
   try { localStorage.setItem(lk, String(i)); } catch (e) {}
   $('thx').textContent = list[i];
+  $('sum').innerHTML = summaryHtml();
   if (D.dog && D.chay && !$('thxc')) { const im = document.createElement('img'); im.id = 'thxc'; im.src = D.chay; im.width = 64; im.height = 64; im.alt = D.chayName || ''; im.style.cssText = 'display:block;margin:-46px auto 8px;filter:drop-shadow(0 3px 5px rgba(0,0,0,.3))'; $('thanks').insertBefore(im, $('thx')); }
   $('thxb').textContent = D.dog ? 'Bis zum nächsten Gassi 🐾' : 'Bis zum nächsten Spaziergang 🌿';
   $('thanks').classList.add('on');
 }
+function statOf(o, label) {
+  const r = (o.stats || []).find(x => x[0] === label);
+  return r ? r[1] : null;
+}
+function summaryHtml() {
+  const o = D.options[Math.max(cur, 0)] || {};
+  const cells = [];
+  const len = statOf(o, 'Länge'), plan = statOf(o, 'Dauer'), gr = statOf(o, 'Grünanteil'), lit = statOf(o, 'Beleuchtet');
+  if (len) cells.push(['📏 Strecke', len]);
+  const mins = navT0 && !demoRun ? Math.round((Date.now() - navT0) / 60000) : 0;
+  if (mins >= 1) cells.push(['⏱️ Unterwegs', mins + ' min' + (plan ? ' (geplant ' + plan + ')' : '')]);
+  else if (plan) cells.push(['⏱️ Dauer', plan + ' (geplant)']);
+  if (gr && gr !== '–') cells.push(['🌿 Grünanteil', gr]);
+  if (lit) cells.push(['💡 Beleuchtet', lit]);
+  if (o.label) cells.push(['🧭 Variante', o.label]);
+  return cells.map(c => '<div><small>' + esc(c[0]) + '</small><b>' + esc(c[1]) + '</b></div>').join('');
+}
+function gpxText(o) {
+  const x = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const wpt = (p, n) => '<wpt lat="' + p[0].toFixed(6) + '" lon="' + p[1].toFixed(6) + '"><name>' + x(n) + '</name></wpt>';
+  const loop = D.p1[0] === D.p2[0] && D.p1[1] === D.p2[1];
+  const name = loop ? 'Ründchen ab ' + D.t1 : D.t1 + ' → ' + D.t2;
+  const desc = (o.label || '') + ' · ' + (o.stats || []).map(r => r[0] + ' ' + r[1]).join(' · ');
+  let w = wpt(D.p1, (loop ? 'Start/Ziel: ' : 'Start: ') + D.t1);
+  (D.stops || []).forEach(s => { w += wpt([s[0], s[1]], 'Zwischenziel: ' + s[2]); });
+  if (!loop) w += wpt(D.p2, 'Ziel: ' + D.t2);
+  const pts = (o.coords || []).map(c => '<trkpt lat="' + c[0].toFixed(6) + '" lon="' + c[1].toFixed(6) + '"></trkpt>').join('');
+  return '<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="GreenWalker" xmlns="http://www.topografix.com/GPX/1/1">'
+    + '<metadata><name>' + x(name) + '</name><desc>' + x(desc) + '</desc></metadata>' + w
+    + '<trk><name>' + x(name + ' (' + (o.label || '') + ')') + '</name><trkseg>' + pts + '</trkseg></trk></gpx>';
+}
+function saveFile(text, mime, fn) {
+  const blob = new Blob([text], {type: mime});
+  return (async () => {
+    try {  // Am Handy: Teilen-Menü (In Dateien sichern, an Uhr oder App senden)
+      if (navigator.canShare && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
+        const f = new File([blob], fn, {type: mime});
+        if (navigator.canShare({files: [f]})) { await navigator.share({files: [f], title: 'GreenWalker'}); return; }
+      }
+    } catch (e) { if (e && e.name === 'AbortError') return; }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = fn; a.style.display = 'none'; document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+    tip('Gespeichert: ' + fn);
+  })();
+}
+function baseName(o) {
+  return 'GreenWalker_' + ((D.t1 || '') + '_' + (D.t2 || '') + '_' + (o.label || '')).replace(/[^A-Za-z0-9äöüÄÖÜß]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60);
+}
+function saveGpx() {
+  const o = D.options[Math.max(cur, 0)];
+  if (!o || !o.coords || o.coords.length < 2) { tip('Keine Route zum Speichern'); return; }
+  return saveFile(gpxText(o), 'application/gpx+xml', baseName(o) + '.gpx');
+}
+function saveOffline() {
+  const o = D.options[Math.max(cur, 0)];
+  if (!o || !o.coords || o.coords.length < 2) { tip('Keine Route zum Speichern'); return; }
+  return saveFile(offlineHtml(o), 'text/html', baseName(o) + '_offline.html');
+}
+// Offline-Blatt: eine einzige HTML-Datei ohne Netz: Skizze (Route, Parks, Wasser), Anweisungen, optional GPS-Punkt
+function offlineHtml(o) {
+  const x = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const W = 760, H = 560, M = 34, cs = o.coords;
+  let la0 = 0; cs.forEach(c => { la0 += c[0]; }); la0 /= cs.length;
+  const k = Math.cos(la0 * Math.PI / 180);
+  let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+  cs.forEach(c => { const px = c[1] * k, py = -c[0]; x0 = Math.min(x0, px); x1 = Math.max(x1, px); y0 = Math.min(y0, py); y1 = Math.max(y1, py); });
+  const sc = Math.min((W - 2 * M) / Math.max(x1 - x0, 1e-9), (H - 2 * M) / Math.max(y1 - y0, 1e-9));
+  const ox = (W - (x1 - x0) * sc) / 2, oy = (H - (y1 - y0) * sc) / 2;
+  const P = (la, lo) => [ox + (lo * k - x0) * sc, oy + (-la - y0) * sc];
+  const f1 = n => n.toFixed(1);
+  const ring = r => {
+    let out = [], last = null;
+    r.forEach(c => { const p = P(c[1], c[0]); if (!last || Math.abs(p[0] - last[0]) + Math.abs(p[1] - last[1]) > 1.2) { out.push(p); last = p; } });
+    if (out.length < 3) return '';
+    if (out.every(p => p[0] < -20) || out.every(p => p[0] > W + 20) || out.every(p => p[1] < -20) || out.every(p => p[1] > H + 20)) return '';
+    return 'M' + out.map(p => f1(p[0]) + ' ' + f1(p[1])).join('L') + 'Z';
+  };
+  const fillOf = gj => {
+    let d = '';
+    ((gj && gj.features) || []).forEach(ft => {
+      const g = ft.geometry || {};
+      if (g.type === 'Polygon') g.coordinates.forEach(r => { d += ring(r); });
+      else if (g.type === 'MultiPolygon') g.coordinates.forEach(pg => pg.forEach(r => { d += ring(r); }));
+    });
+    return d;
+  };
+  const linesOf = gj => {
+    let d = '';
+    ((gj && gj.features) || []).forEach(ft => {
+      const g = ft.geometry || {};
+      const ls = g.type === 'LineString' ? [g.coordinates] : (g.type === 'MultiLineString' ? g.coordinates : []);
+      ls.forEach(l => { d += 'M' + l.map(c => { const p = P(c[1], c[0]); return f1(p[0]) + ' ' + f1(p[1]); }).join('L'); });
+    });
+    return d;
+  };
+  const pts = cs.map(c => P(c[0], c[1]));
+  const seg = (a, b) => 'M' + pts.slice(a, b + 1).map(p => f1(p[0]) + ' ' + f1(p[1])).join('L');
+  const runs = o.gr && o.gr.length ? o.gr : [[-1, 0, cs.length - 1]];
+  const casing = '<path d="' + seg(0, cs.length - 1) + '" fill="none" stroke="#fff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>';
+  const line = runs.map(r => '<path d="' + seg(r[1], r[2]) + '" fill="none" stroke="' + (r[0] < 0 ? '#4E6E45' : GCOL[r[0]]) + '" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>').join('');
+  const st = o.steps || [];
+  let marks = '', rows = '';
+  st.forEach((s, i) => {
+    const last = i === st.length - 1, first = i === 0, p = P(s.lat, s.lon);
+    if (!first && !last) marks += '<g><circle cx="' + f1(p[0]) + '" cy="' + f1(p[1]) + '" r="12" fill="#fff" stroke="#3B3A33" stroke-width="2"/><text x="' + f1(p[0]) + '" y="' + f1(p[1] + 5) + '" text-anchor="middle" font-size="14" font-weight="700" fill="#3B3A33">' + i + '</text></g>';
+    rows += '<li id="s' + i + '" data-d="' + (s.d || 0) + '"><span class="n">' + (first ? 'S' : (last ? 'Z' : i)) + '</span><span class="ic">' + x(s.i || '') + '</span><span class="t">' + x(s.t) + '</span><span class="d">' + (s.d ? fmt(s.d) : '') + '</span></li>';
+  });
+  const a = pts[0], b = pts[pts.length - 1];
+  const stops = (D.stops || []).map(s => { const p = P(s[0], s[1]); return '<g><circle cx="' + f1(p[0]) + '" cy="' + f1(p[1]) + '" r="9" fill="#B07A35" stroke="#fff" stroke-width="2.5"/><text x="' + f1(p[0] + 13) + '" y="' + f1(p[1] + 6) + '" font-size="18" fill="#3B3A33" stroke="#fff" stroke-width="4" paint-order="stroke">' + x(s[2]) + '</text></g>'; }).join('');
+  const loop = Math.hypot(a[0] - b[0], a[1] - b[1]) < 6;
+  const pxm = sc / 111320;
+  let sb = 100; [100, 200, 250, 500, 1000, 2000].forEach(v => { if (v * pxm <= 150) sb = v; });
+  const stats = (o.stats || []).map(r => '<div><small>' + x(r[0]) + '</small><b>' + x(r[1]) + '</b></div>').join('');
+  const title = loop ? 'Ründchen ab ' + D.t1 : D.t1 + ' → ' + D.t2;
+  const data = JSON.stringify({la0: la0, k: k, x0: x0, y0: y0, sc: sc, ox: ox, oy: oy, W: W, H: H, c: cs.map(c => [+c[0].toFixed(5), +c[1].toFixed(5)]), cum: o.cum});
+  const css = 'body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#F4EFE6;color:#3B3A33}main{max-width:820px;margin:0 auto;padding:14px}h1{font-size:1.25rem;margin:4px 0}.sub{opacity:.7;font-size:.85rem;margin-bottom:10px}'
+    + '.st{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}.st div{background:#fff;border:1px solid #D9CFBC;border-radius:12px;padding:6px 10px}.st small{display:block;font-size:.66rem;text-transform:uppercase;letter-spacing:.05em;opacity:.65}'
+    + 'svg{width:100%;height:auto;background:#EFE9DB;border:1px solid #D9CFBC;border-radius:14px}ol{list-style:none;padding:0;margin:12px 0}li{display:flex;gap:10px;align-items:center;padding:9px 6px;border-bottom:1px solid #E4DBC8}'
+    + 'li.cur{background:#E7EDDB;border-radius:10px;font-weight:700}.n{width:24px;height:24px;border-radius:50%;background:#fff;border:1.6px solid #3B3A33;text-align:center;font-size:.72rem;line-height:21px;flex:none}.ic{width:26px;text-align:center;font-size:1.2rem;flex:none}.t{flex:1}.d{opacity:.65;font-size:.85rem;white-space:nowrap}'
+    + '.leg{display:flex;gap:12px;flex-wrap:wrap;font-size:.8rem;margin:6px 0}.leg i{display:inline-block;width:18px;height:5px;border-radius:3px;margin-right:5px;vertical-align:middle}.foot{font-size:.72rem;opacity:.65;margin-top:14px}#gps{font-size:.85rem;margin:6px 0;opacity:.85}@media print{#gps{display:none}}';
+  const leg = o.gr && o.gr.length ? '<div class="leg">' + [0, 1, 2].map(i => '<span><i style="background:' + GCOL[i] + '"></i>' + GNAME[i] + '</span>').join('') + '</div>' : '';
+  const js = '(function(){var D=' + data + ',dot=document.getElementById("dot"),g=document.getElementById("gps"),li=document.querySelectorAll("li");'
+    + 'function hav(a,b,c,d){var R=6371000,p=Math.PI/180,u=(c-a)*p,v=(d-b)*p,h=Math.sin(u/2)*Math.sin(u/2)+Math.cos(a*p)*Math.cos(c*p)*Math.sin(v/2)*Math.sin(v/2);return 2*R*Math.asin(Math.sqrt(h))}'
+    + 'function upd(p){var la=p.coords.latitude,lo=p.coords.longitude,px=D.ox+(lo*D.k-D.x0)*D.sc,py=D.oy+(-la-D.y0)*D.sc,bi=0,bd=1e12;'
+    + 'D.c.forEach(function(c,i){var d=hav(la,lo,c[0],c[1]);if(d<bd){bd=d;bi=i}});'
+    + 'if(px>-20&&px<D.W+20&&py>-20&&py<D.H+20){dot.setAttribute("cx",px);dot.setAttribute("cy",py);dot.style.display="block"}else dot.style.display="none";'
+    + 'var al=D.cum[bi]||0,nx=-1;li.forEach(function(e,i){e.className="";if(nx<0&&+e.getAttribute("data-d")>al-8)nx=i});'
+    + 'if(nx>=0){li[nx].className="cur"}'
+    + 'g.textContent=bd>150?"Du bist ca. "+Math.round(bd)+" m von der Route entfernt.":"Auf der Route · noch ca. "+Math.max(0,Math.round(D.cum[D.cum.length-1]-al))+" m";}'
+    + 'if(navigator.geolocation){g.textContent="GPS wird gesucht …";navigator.geolocation.watchPosition(upd,function(){g.textContent="GPS nicht verfügbar. Die Skizze und die Liste funktionieren trotzdem."},{enableHighAccuracy:true,maximumAge:2000,timeout:20000})}else g.textContent=""})();';
+  return '<!DOCTYPE html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + x(title) + ' · GreenWalker offline</title><style>' + css + '</style></head><body><main>'
+    + '<h1>' + x(title) + '</h1><div class="sub">GreenWalker · ' + x(o.label || '') + ' · Offline-Blatt, funktioniert ohne Netz</div><div class="st">' + stats + '</div>'
+    + '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Skizze der Route">'
+    + '<path d="' + fillOf(D.parks) + '" fill="#CFE0B8" fill-rule="evenodd" stroke="#A9C58C" stroke-width="1"/>'
+    + '<path d="' + fillOf(D.water) + '" fill="#BCD9EA" fill-rule="evenodd" stroke="#8DBBD6" stroke-width="1"/>'
+    + '<path d="' + linesOf(D.water) + '" fill="none" stroke="#8DBBD6" stroke-width="2.5"/>'
+    + casing + line + marks + stops
+    + '<circle cx="' + f1(a[0]) + '" cy="' + f1(a[1]) + '" r="9" fill="#4E6E45" stroke="#fff" stroke-width="3"/>'
+    + (loop ? '' : '<circle cx="' + f1(b[0]) + '" cy="' + f1(b[1]) + '" r="9" fill="#B8571A" stroke="#fff" stroke-width="3"/>')
+    + '<circle id="dot" cx="0" cy="0" r="8" fill="#1E6FE0" stroke="#fff" stroke-width="3" style="display:none"/>'
+    + '<g transform="translate(' + (W - 30) + ',34)"><path d="M0 -18 L8 8 L0 3 L-8 8Z" fill="#3B3A33"/><text y="26" text-anchor="middle" font-size="16" font-weight="700" fill="#3B3A33">N</text></g>'
+    + '<g transform="translate(' + M + ',' + (H - 20) + ')"><path d="M0 0H' + f1(sb * pxm) + '" stroke="#3B3A33" stroke-width="3"/><text x="0" y="-9" font-size="16" fill="#3B3A33" stroke="#EFE9DB" stroke-width="4" paint-order="stroke">' + (sb >= 1000 ? (sb / 1000) + ' km' : sb + ' m') + '</text></g>'
+    + '</svg>' + leg + '<div id="gps"></div><ol>' + rows + '</ol>'
+    + '<div class="foot">Kartendaten © OpenStreetMap-Mitwirkende (ODbL). Skizze ohne Kartenhintergrund. Die Route folgt dem, was in OpenStreetMap erfasst ist: Bitte vor Ort auf Hinweise achten.</div>'
+    + '<scr' + 'ipt>' + js + '</scr' + 'ipt></main></body></html>';
+}
+// Standort teilen: Link mit aktueller Position und Restzeit (einmalig, kein Live-Tracking)
+function locText(p) {
+  const url = 'https://www.openstreetmap.org/?mlat=' + p[0].toFixed(5) + '&mlon=' + p[1].toFixed(5) + '#map=17/' + p[0].toFixed(5) + '/' + p[1].toFixed(5);
+  let t = (D.dog ? (D.chayName || 'Der Hund') + ' und ich sind' : 'Ich bin') + ' gerade hier unterwegs: ' + url;
+  if (navOn && !finished && total > 0) {
+    const rem = Math.max(0, total - along), mins = Math.max(1, Math.round(rem / (D.speed || 80)));
+    t += '\nNoch ' + fmt(rem) + ' bis ' + (D.t2 || 'zum Ziel') + ', ca. ' + mins + ' min.';
+  } else if (finished) t += '\nIch bin angekommen.';
+  return t + '\n– GreenWalker';
+}
+function showShareBox(t) {
+  $('sbta').value = t; $('sbox').classList.add('on');
+  try { $('sbta').focus(); $('sbta').select(); } catch (e) {}
+}
+async function shareLoc() {
+  let p = lastPos;
+  if (!p && navigator.geolocation) {
+    tip('Standort wird ermittelt …');
+    p = await new Promise(res => navigator.geolocation.getCurrentPosition(q => res([q.coords.latitude, q.coords.longitude]), () => res(null), {enableHighAccuracy: true, timeout: 8000, maximumAge: 30000}));
+  }
+  if (!p) { tip('Standort nicht verfügbar. Bitte Freigabe erlauben.'); return; }
+  const t = locText(p);
+  try { if (navigator.share) { await navigator.share({title: 'Mein Standort', text: t}); return; } } catch (e) { if (e && e.name === 'AbortError') return; }
+  try { await navigator.clipboard.writeText(t); tip('Text mit Standort kopiert'); return; } catch (e) {}
+  showShareBox(t);
+}
+function backToApp() {  // „←“-Knopf der App auslösen (Zurück zur Startseite)
+  try {
+    const b = parent.document.querySelector('.st-key-gw_back button') || parent.document.querySelector('[class*="st-key-gw_back"] button');
+    if (b) { b.click(); return true; }
+  } catch (e) {}
+  return false;
+}
+let homeArmed = false;
+$('home').addEventListener('click', () => {
+  if (navOn && !finished && !homeArmed) { homeArmed = true; tip('Nochmal tippen: Navigation beenden, zurück zum Start'); setTimeout(() => { homeArmed = false; }, 3200); return; }
+  homeArmed = false;
+  if (!backToApp()) tip('Bitte oben links ← tippen');
+});
+function toggleMenu(on) { $('smenu').classList.toggle('on', on === undefined ? !$('smenu').classList.contains('on') : on); }
+$('gpx').addEventListener('click', e => { e.stopPropagation(); toggleMenu(); });
+document.addEventListener('click', e => { if (!e.target.closest || !e.target.closest('#smenu')) toggleMenu(false); });
+$('m_gpx').addEventListener('click', () => { toggleMenu(false); saveGpx(); });
+$('m_off').addEventListener('click', () => { toggleMenu(false); saveOffline(); });
+$('m_loc').addEventListener('click', () => { toggleMenu(false); shareLoc(); });
+$('sbclose').addEventListener('click', () => { $('sbox').classList.remove('on'); });
+$('gpxb').addEventListener('click', saveGpx);
 $('thxb').addEventListener('click', () => {
   $('thanks').classList.remove('on');
   // Zurück zur Startseite: den „←“-Knopf der App auslösen (gwdone ist gesetzt, es geht ohne Vorauswahl zurück)
@@ -3410,7 +3623,7 @@ function stopWatch() {
   try { if (wake) wake.release(); } catch (e) {} wake = null;
 }
 function enterNav() {
-  navOn = true; finished = false; said = {}; hadFix = false; lastIdx = 0; along = 0; offCount = 0;
+  navOn = true; finished = false; said = {}; hadFix = false; lastIdx = 0; along = 0; offCount = 0; navT0 = Date.now(); demoRun = false;
   document.body.classList.add('nav'); $('go').textContent = '⏹ Beenden';
   if (map.hasLayer(startPin)) map.removeLayer(startPin);
   if (chayMk && map.hasLayer(chayMk)) map.removeLayer(chayMk);
@@ -3445,7 +3658,7 @@ function pointAt(s) {
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
 }
 function startDemo() {
-  enterNav(); $('demo').classList.add('on'); follow = true; $('fbtn').classList.add('on');
+  enterNav(); demoRun = true; $('demo').classList.add('on'); follow = true; $('fbtn').classList.add('on');
   let s = 0;
   sim = setInterval(() => {
     s = Math.min(total, s + 10); const p = pointAt(s); onFix(p[0], p[1], 5, null, 0);
@@ -8588,6 +8801,37 @@ def wind_home_info():
         pass
 
 
+PRIVACY_TEXT = """
+**Kurz:** GreenWalker braucht keinen Account, zeigt keine Werbung und enthält keine eigene Nutzungsanalyse. Es ist ein privates
+Hobbyprojekt und keine Rechtsberatung. Der Betrieb läuft auf Streamlit Community Cloud, die technische Zugriffsdaten
+(z. B. IP-Adresse) protokollieren kann.
+
+**Standort**
+- Dein Standort wird nur nach deiner Freigabe im Browser abgefragt und für die Routenberechnung an die App gesendet.
+  Die App speichert ihn nicht dauerhaft. Zwischengespeichert werden nur Kartendaten für gerundete Gebiete.
+- 📍 *Standort teilen* in der Karte erzeugt nur dann einen Link mit deiner Position, wenn du den Knopf tippst. Der Link geht
+  an die Person oder App, die du im Teilen-Menü wählst. Es ist eine einmalige Momentaufnahme, kein Live-Tracking.
+
+**Anfragen an Kartendienste (nötig für Karten, Suche und Routen)**
+- Vom Server der App aus: Overpass-Server (Wege und Grünflächen eines Gebiets), Photon und Nominatim (Ortssuche, mit
+  ungefährer Umgebung), FOSSGIS-Routing (Start, Ziel und Zwischenpunkte), OpenFreeMap (Kartenkacheln für den Grün-Scan),
+  Open-Meteo (Wetter am Startpunkt) und Wikipedia/Wikimedia (Stadtbild und Namen im Ladebildschirm).
+- Direkt von deinem Gerät aus: Kartenkacheln (Esri, OpenTopoMap, OpenStreetMap, EOX, Geobasis NRW) und die Kartenbibliothek
+  Leaflet (cdnjs). Diese Dienste sehen deine IP-Adresse und den angezeigten Kartenausschnitt.
+- Nur wenn der Betreiber einen KI-Schlüssel hinterlegt hat: ein unbekannter Suchbegriff (ohne Standort) kann an einen
+  KI-Dienst gehen, damit passende Orte gefunden werden.
+
+**Auf deinem Gerät gespeichert (Browser, localStorage)**
+- Favoriten und zuletzt genutzte Ziele. Sie liegen nur in diesem Browser. Entfernen: „Favoriten verwalten“ oder Browserdaten löschen.
+- Eine Merkhilfe, welcher Dankestext zuletzt gezeigt wurde.
+
+**Dateien, die du selbst erzeugst**
+- GPX und Offline-Blatt entstehen im Browser und gehen nirgendwohin, solange du sie nicht selbst teilst.
+
+Kartendaten © OpenStreetMap-Mitwirkende (ODbL).
+"""
+
+
 def render_home():
     restore_widgets()
     snap_widgets()
@@ -8627,6 +8871,8 @@ def render_home():
     {"route": home_route, "green": home_green, "loop": home_loop, "tour": home_tour}[page]()
     with st.expander("Datenquellen und Gewichtung"):
         st.markdown(sources_text(150, LEVELS["Ausgewogen"]))
+    with st.expander("🔒 Datenschutz"):
+        st.markdown(PRIVACY_TEXT)
     laps_ = st.session_state.get("_laps")
     if laps_ and len(laps_) > 1:
         with st.expander("⏱️ Zeiten der letzten Berechnung"):
