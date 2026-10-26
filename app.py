@@ -1689,8 +1689,18 @@ def build_loop_path(area, g, ng, lam, o, t, theta, rho, mu=None, wq=0.0):
     for alpha in (90, 180, 270):
         ang = theta + math.pi + math.radians(alpha)
         wps.append(pick_waypoint(area, ng, cx + rho * math.cos(ang), cy + rho * math.sin(ang), 0.3 * rho))
-    seq = [o] + wps + [t]
-    full = [o]
+    return route_seq(area, g, lam, [o] + wps + [t], mu, wq)
+
+
+def route_seq(area, g, lam, seq, mu, wq):
+    """Teilstrecken über die Punkte in seq, jede grün-optimal; Gelaufenes wird teurer (keine Doppelwege)."""
+    L = area["lengths"]
+    nz = area.get("noise")
+    nz = np.zeros(len(L)) if nz is None else nz
+    wd = area.get("wide")
+    wd = np.zeros(len(L)) if wd is None else wd
+    ap = area_accp(area)
+    full = [seq[0]]
     usedm = np.zeros(len(L), dtype=bool)
     base = L * (1 + lam * (1 - g) + mu * nz + wq * wd + ap)
     for s, e in zip(seq[:-1], seq[1:]):
@@ -1700,6 +1710,72 @@ def build_loop_path(area, g, ng, lam, o, t, theta, rho, mu=None, wq=0.0):
         full += p[1:]
         mark_used_both(area, usedm, p)
     return full
+
+
+PARK_W = 0.25          # Bonus in der Rundenwahl für Strecke mitten im Park (nicht nur am Rand entlang)
+PARK_MIN_LEN = 120.0   # m Wege im Park, ab denen ein Park gezielt angesteuert wird
+
+
+def park_inside(area):
+    """Kanten, die (fast) ganz im Park liegen."""
+    ins = area.get("_pins")
+    if ins is None:
+        ins = (area["D"] <= 0.5).mean(axis=0) >= 0.7
+        area["_pins"] = ins
+    return ins
+
+
+def park_clusters(area):
+    """Zusammenhängende Parkwege (Knotenindizes + Länge je Park)."""
+    c = area.get("_pcl")
+    if c is not None:
+        return c
+    c = []
+    ins = park_inside(area)
+    if int(ins.sum()) >= 2:
+        try:
+            from scipy.sparse import coo_matrix
+            from scipy.sparse.csgraph import connected_components
+            n = len(area["node_list"])
+            eu, ev = area["eu"][ins], area["ev"][ins]
+            _, lab = connected_components(coo_matrix((np.ones(len(eu)), (eu, ev)), shape=(n, n)), directed=False)
+            tot = np.bincount(lab[eu], weights=area["lengths"][ins], minlength=int(lab.max()) + 1)
+            nodes_in = np.unique(np.concatenate([eu, ev]))
+            for comp in np.unique(lab[nodes_in]):
+                if tot[comp] / 2 >= PARK_MIN_LEN:
+                    c.append({"nodes": nodes_in[lab[nodes_in] == comp], "len": float(tot[comp] / 2)})
+        except Exception:
+            c = []
+    area["_pcl"] = c
+    return c
+
+
+def park_pairs(area, o, target, limit=2):
+    """Je nahem Park: Eingang (nächster Parkknoten) und fernster Punkt im Park. Die Runde führt hinein und quer hindurch."""
+    nl, xy = area["node_list"], area["xy"]
+    ox, oy = area["pos"][o]
+    found = []
+    for cl in park_clusters(area):
+        nd = cl["nodes"]
+        d_o = np.hypot(xy[nd, 0] - ox, xy[nd, 1] - oy)
+        if d_o.min() > 0.4 * target + 100:
+            continue
+        entry = nd[int(d_o.argmin())]
+        d_e = np.hypot(xy[nd, 0] - xy[entry, 0], xy[nd, 1] - xy[entry, 1])
+        d_e = np.where(d_e <= 0.5 * target, d_e, 0)
+        far = nd[int(d_e.argmax())]
+        if d_e[int(d_e.argmax())] < 60:
+            continue
+        found.append((float(d_o.min()), nl[entry], nl[far]))
+    found.sort(key=lambda z: z[0])
+    return [(e, f) for _, e, f in found[:limit]]
+
+
+def path_inside_share(area, path):
+    H, L, ins = area["H"], area["lengths"], park_inside(area)
+    idx = [H[a][b]["i"] for a, b in zip(path[:-1], path[1:])]
+    tot = float(L[idx].sum()) if idx else 0.0
+    return float(L[idx][ins[idx]].sum() / tot) if tot > 0 else 0.0
 
 
 def edge_set(path):
@@ -1842,8 +1918,45 @@ def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None):
             rho /= ratio
         if progress:
             progress((k + 1) / LOOP_BEARINGS)
+    # Zusätzlich: Runden, die gezielt in einen nahen Park hinein und quer hindurch führen (statt nur am Rand entlang)
+    if lam > 0:
+        mu_, wq_ = quiet or (None, 0.0)
+        mu_ = (QUIET if lam > 0 else 0.0) if mu_ is None else mu_
+        try:
+            pairs = park_pairs(area, o, target)
+        except Exception:
+            pairs = []
+        for entry, far in pairs:
+            ox, oy = area["pos"][o]
+            fx, fy = area["pos"][far]
+            ax_, ay_ = fx - ox, fy - oy
+            nrm = math.hypot(ax_, ay_) or 1.0
+            variants_ = [None] + [(sd, 0.2 * target) for sd in (1, -1)]
+            for var in variants_:
+                rho, sd = (None, 0) if var is None else (var[1], var[0])
+                for _ in range(1 if var is None else 3):
+                    try:
+                        seq = [o, entry, far]
+                        if rho:
+                            wx = (ox + fx) / 2 - sd * ay_ / nrm * rho
+                            wy = (oy + fy) / 2 + sd * ax_ / nrm * rho
+                            seq.append(pick_waypoint(area, ng, wx, wy, max(0.3 * rho, 60.0)))
+                        seq.append(t)
+                        path = undouble(area, route_seq(area, g, lam, seq, mu_, wq_), target=target)
+                    except (nx.NetworkXNoPath, nx.NodeNotFound):
+                        break
+                    st_ = loop_stats(area, g, path)
+                    if not st_:
+                        break
+                    dist, green, rep, noise = st_
+                    cands.append({"path": path, "dist": dist, "green": green, "rep": rep, "noise": noise})
+                    ratio = dist / target
+                    if rho is None or abs(ratio - 1) <= LOOP_TOLERANCE:
+                        break
+                    rho = min(max(rho / ratio, 0.04 * target), 0.45 * target)
     for c in cands:
-        c["score"] = (c["green"] - REP_W * c["rep"] - 0.4 * ((quiet[0] if quiet else QUIET) if lam > 0 else 0) * c["noise"]
+        c["inside"] = path_inside_share(area, c["path"]) if lam > 0 else 0.0
+        c["score"] = (c["green"] + PARK_W * c["inside"] - REP_W * c["rep"] - 0.4 * ((quiet[0] if quiet else QUIET) if lam > 0 else 0) * c["noise"]
                       - 2.0 * abs(c["dist"] / target - 1))
     cands.sort(key=lambda c: -c["score"])
     picked = []
@@ -2825,7 +2938,7 @@ def make_ab_view_safe(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda
 # Jede Wegvariante wird alle paar Meter abgetastet und bewertet; die beste je Grünstufe gewinnt.
 OFM_TILEJSON = "https://tiles.openfreemap.org/planet"
 VT_ZOOM = 14
-INSIDE_FACTOR = 0.8       # Wert für „nur am Parkrand entlang“ gegenüber „im Park“ (1.0)
+INSIDE_FACTOR = 0.65      # Wert für „nur am Parkrand entlang“ gegenüber „im Park“ (1.0)
 GREEN_FALLOFF = 1.5       # >1: Grün zählt nur nahe am Park viel, nicht schon 100 m davon entfernt
 REP_W = 1.4               # Gewicht für Doppelwege (Strecke zweimal gehen) bei der Auswahl von Runden
 WATER_SCAN_NEAR = 70.0    # m: so nah am Gewässer gilt ein Wegstück im Scan als „am Wasser“
