@@ -1798,6 +1798,62 @@ def prefetch_osm(bbox):
     threading.Thread(target=work, daemon=True).start()
 
 
+_WG_CACHE = {}
+
+
+def scan_water_geo(bbox):
+    """Nur die Gewässer (Seen, Flüsse) aus den Vektorkacheln als GeoJSON. Deutlich schneller als der volle Grün-Scan,
+    denn es werden nur die Ebenen water und waterway gelesen und nichts in Raster umgerechnet."""
+    hit = _WG_CACHE.get(bbox)
+    if hit is not None:
+        return hit
+    w, s, e, n = bbox
+    tpl = _ofm_template()
+    x0, y0 = _tile_of(n, w, VT_ZOOM)
+    x1, y1 = _tile_of(s, e, VT_ZOOM)
+    tiles = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+    if len(tiles) > 64:
+        raise ValueError("Gebiet zu groß")
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        datas = list(ex.map(lambda t: _fetch_tile(tpl, VT_ZOOM, t[0], t[1]), tiles))
+    lat0, lon0 = (s + n) / 2, (w + e) / 2
+    ky = 111_320.0
+    kx = ky * math.cos(math.radians(lat0))
+    wgeo = []
+    for (tx, ty), data in zip(tiles, datas):
+        if not data:
+            continue
+        for lname, feats in mvt_decode(data, {"water", "waterway"}).items():
+            for extent, gtype, parts, props in feats:
+                if len(wgeo) >= 600:
+                    break
+                if gtype == 3 and lname == "water" and props.get("class") != "ocean":
+                    for ring in parts:
+                        if len(ring) < 4:
+                            continue
+                        lon, lat = _tile_lonlat(tx, ty, VT_ZOOM, extent, ring)
+                        X, Y = (lon - lon0) * kx, (lat - lat0) * ky
+                        if 0.5 * abs(np.dot(X[:-1], Y[1:]) - np.dot(X[1:], Y[:-1])) >= 400:
+                            step = max(1, len(lon) // 140)
+                            ring_ll = [[round(float(a), 5), round(float(b), 5)] for a, b in zip(lon[::step], lat[::step])]
+                            ring_ll.append(ring_ll[0])
+                            wgeo.append({"type": "Feature", "properties": {},
+                                         "geometry": {"type": "Polygon", "coordinates": [ring_ll]}})
+                elif gtype == 2 and lname == "waterway":
+                    for part in parts:
+                        if len(part) < 2:
+                            continue
+                        lon, lat = _tile_lonlat(tx, ty, VT_ZOOM, extent, part)
+                        wgeo.append({"type": "Feature", "properties": {}, "geometry": {
+                            "type": "LineString", "coordinates": [[round(float(a), 5), round(float(b), 5)]
+                                                                  for a, b in zip(lon[::2], lat[::2])]}})
+    out = {"type": "FeatureCollection", "features": wgeo}
+    if len(_WG_CACHE) > 8:
+        _WG_CACHE.clear()
+    _WG_CACHE[bbox] = out
+    return out
+
+
 def prefetch_water(bbox):
     """Wassernähe aktiv: Kacheldaten schon während des Wegenetz-Ladens holen (landen im Cache von scan_area)."""
     try:
@@ -1808,7 +1864,7 @@ def prefetch_water(bbox):
 
     def work():
         try:
-            scan_area(bbox, True)
+            scan_water_geo(tuple(bbox))
         except Exception:
             pass
     t = threading.Thread(target=work, daemon=True)
@@ -1825,8 +1881,7 @@ def ensure_water(area, log=None):
     try:
         if log:
             log("💧 Gewässer prüfen und ergänzen")
-        sa = scan_area(area["bbox"], True)
-        feats = (sa.get("wgeo") or {}).get("features", [])
+        feats = scan_water_geo(tuple(area["bbox"])).get("features", [])
         if not feats:
             return
         gs = gpd.GeoDataFrame(geometry=[shapely.geometry.shape(f["geometry"]) for f in feats], crs=4326).to_crs(area["crs"])
@@ -1909,7 +1964,11 @@ def prewarm(lat, lon):
 
     def work():
         try:
-            load_area_any(bb, own=ev)
+            ar_ = load_area_any(bb, own=ev)
+            try:
+                scan_water_geo(tuple(ar_["bbox"]))  # Gewässerdaten schon bereit, falls „Wassernähe“ gewählt wird
+            except Exception:
+                pass
         except Exception:
             _PREWARMED.discard(key)
         finally:
@@ -2701,7 +2760,7 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
 </style></head><body>
 <div id="map"></div>
 <div id="clouds"></div>
-<div id="thanks"><div id="thx"></div><button id="thxb">Danke, gern</button></div>
+<div id="thanks"><div id="thx"></div><button id="thxb">Bis bald im Grünen 🌿</button></div>
 <div id="banner"><div id="ico">🧭</div><div><div id="dist"></div><div id="ins"></div></div></div>
 <div id="side"><button id="layers" title="Kartenstil wechseln">🗺️</button><button id="sat" title="Satellit / Luftbild">🛰️</button><button id="fit" title="Ganze Route zeigen">⤢</button><button id="wcbtn" title="Toiletten ein-/ausblenden" style="display:none">🚻</button></div>
 <div id="sheet">
@@ -3038,6 +3097,7 @@ function showThanks() {
   if (i === last) i = (i + 1) % list.length;
   try { localStorage.setItem(lk, String(i)); } catch (e) {}
   $('thx').textContent = list[i];
+  $('thxb').textContent = D.dog ? 'Bis zum nächsten Gassi 🐾' : 'Bis zum nächsten Spaziergang 🌿';
   $('thanks').classList.add('on');
 }
 $('thxb').addEventListener('click', () => {
@@ -5966,13 +6026,14 @@ html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp 
 .stButton button[kind="primary"]:hover{box-shadow:0 6px 18px rgba(78,110,69,.4);transform:translateY(-1px)}
 [data-testid="stToggle"],[data-testid="stCheckbox"]{transition:opacity .2s}
 @media (prefers-reduced-motion:reduce){.st-key-card_route,.st-key-card_green,.st-key-card_loop,.st-key-card_tour,.hero{animation:none}}
-/* Handy: Auswahl als große Tipp-Felder statt Aufklapp-Listen */
-[data-testid="stButtonGroup"]{gap:.45rem!important;flex-wrap:wrap!important}
-[data-testid="stButtonGroup"] button{min-height:46px!important;padding:.35rem .95rem!important;border-radius:999px!important;
- font-size:.95rem!important;line-height:1.2!important}
-[data-testid="stButtonGroup"] button[kind$="Active"],[data-testid="stButtonGroup"] button[aria-pressed="true"]{
- background:#4E6E45!important;border-color:#4E6E45!important;color:#fff!important}
-[data-testid="stButtonGroup"] button[kind$="Active"] *,[data-testid="stButtonGroup"] button[aria-pressed="true"] *{color:#fff!important}
+/* Handy: Auswahl als lesbare Tipp-Felder (Chips), die umbrechen statt zu quetschen */
+[class*="st-key-chips_"],[class*="st-key-chips_"] [data-testid="stVerticalBlock"]{flex-direction:row!important;flex-wrap:wrap!important;
+ gap:.45rem!important;align-items:stretch!important}
+[class*="st-key-chips_"] [data-testid="stElementContainer"],[class*="st-key-chips_"] .element-container,
+[class*="st-key-chips_"] [data-testid="stButton"]{width:auto!important;flex:0 0 auto!important;min-width:0!important}
+[class*="st-key-chips_"] button{white-space:nowrap!important;min-height:44px!important;padding:.3rem 1rem!important;
+ border-radius:999px!important;font-size:.96rem!important;line-height:1.2!important;width:auto!important}
+[class*="st-key-chips_"] button p{white-space:nowrap!important;margin:0!important}
 [data-testid="stRadio"] label{padding:.5rem .2rem}
 @media (max-width:640px){
  [data-testid="stRadio"] [role="radiogroup"]{gap:.15rem}
@@ -6929,6 +6990,7 @@ def snap_widgets():
         st.session_state["_saved_widgets"] = {k: v for k, v in st.session_state.items()
                                               if isinstance(k, str) and k.startswith(_KEEP_KEYS)
                                               and not k.endswith("_sb") and k != "green_pending"
+                                              and not re.search(r"_c\d+$", k)
                                               and k not in _BUTTON_KEYS}
     except Exception:
         pass
@@ -7281,35 +7343,33 @@ def replan_with_stops(view, cands):
     return new
 
 
-def _keep_one(key, default):
-    """Immer genau eine Auswahl: wird sie abgewählt, springt sie auf den letzten Wert zurück."""
-    if not st.session_state.get(key):
-        st.session_state[key] = st.session_state.get(f"_prev_{key}", default)
+def _chip_click(key, opt, multi):
+    cur = st.session_state.get(key)
+    if multi:
+        cur = list(cur or [])
+        cur.remove(opt) if opt in cur else cur.append(opt)
+        st.session_state[key] = cur
     else:
-        st.session_state[f"_prev_{key}"] = st.session_state[key]
+        st.session_state[key] = opt
 
 
-def pick_one(label, options, key, default, help=None, fmt=None):
-    """Einzelauswahl als Tipp-Felder (Handy-freundlich). Fällt bei älteren Streamlit-Versionen auf Schieberegler zurück."""
+def chips(label, options, key, multi=False, default=None, fmt=None, help=None):
+    """Auswahl als Tipp-Felder, die auf dem Handy umbrechen (statt Aufklapp-Liste oder winziger Schalter).
+    Gewählt = gefüllt. Rückgabe: Liste (multi) oder der gewählte Wert."""
     options = list(options)
-    try:
-        kw = {} if key in st.session_state else {"default": default}
-        if fmt:
-            kw["format_func"] = fmt
-        v = st.pills(label, options, selection_mode="single", key=key, help=help, on_change=_keep_one,
-                     args=(key, default), **kw)
-        return v or st.session_state.get(f"_prev_{key}", default)
-    except AttributeError:
-        return st.select_slider(label, options=options, value=default, key=key, help=help, format_func=fmt or str)
-
-
-def pick_multi(label, options, key, help=None):
-    """Mehrfachauswahl als Tipp-Felder statt Aufklapp-Liste."""
-    options = list(options)
-    try:
-        return list(st.pills(label, options, selection_mode="multi", key=key, help=help) or [])
-    except AttributeError:
-        return st.multiselect(label, options, key=key, placeholder="Auswählen …", help=help)
+    if key not in st.session_state:
+        st.session_state[key] = [] if multi else (default if default in options else options[0])
+    cur = st.session_state[key]
+    if label:
+        st.markdown(f'<div class="fld">{escape(label)}</div>', unsafe_allow_html=True)
+    with st.container(key=f"chips_{key}"):
+        for i, o in enumerate(options):
+            on = (o in cur) if multi else (o == cur)
+            st.button(fmt(o) if fmt else str(o), key=f"{key}_c{i}", type="primary" if on else "secondary",
+                      on_click=_chip_click, args=(key, o, multi))
+    if help:
+        st.caption(help)
+    return list(cur) if multi else cur
 
 
 def home_green():
@@ -7325,13 +7385,14 @@ def home_green():
                     st.session_state[k_] = [v for v in st.session_state[k_] if v in o_]
             except Exception:
                 pass
-        prefer = pick_multi("Bevorzugt", opts_p, "green_prefer",
+        prefer = chips("Bevorzugt", opts_p, "green_prefer", multi=True,
                                 help=("Hundefreilaufflächen: Wiesen und Plätze, auf denen Hunde ohne Leine laufen dürfen (aus den Kartendaten). "
                                       "Sportangebote: Outdoor-Fitness, Skatepark, Tretboot u. a." if dogm else
                                       "Sportangebote: Fußball, Basketball, Tischtennis, Outdoor-Fitness, Skatepark, "
                                       "Hundepark, Tretboot u. a. (als Suchabfrage im Umkreis)."))
-        avoid = pick_multi("Vermeiden", opts_a, "green_avoid")
-        size = pick_one("Bevorzugte Grünflächengröße", GREEN_SIZES, "green_size", "Mittel (2–15 ha)")
+        avoid = chips("Vermeiden", opts_a, "green_avoid", multi=True)
+        size = st.select_slider("Bevorzugte Grünflächengröße", options=list(GREEN_SIZES), value="Mittel (2–15 ha)",
+                                key="green_size")
         go = st.button("Los, das Grün finden", type="primary", use_container_width=True, key="go_green")
     if not go:
         return
@@ -7476,7 +7537,8 @@ def home_loop():
         km = st.slider("Gewünschte Länge (km)", 1.0, LOOP_MAX_KM, 3.0, 0.5, key="loop_km")
         st.markdown(f'<div class="hint">ca. {max(1, round(km * 1000 / M_PER_MIN))} min zu Fuß</div>',
                     unsafe_allow_html=True)
-        level = pick_one("Wie grün soll es sein?", LEVELS, "level_loop", "Sehr grün")
+        level = st.select_slider("Wie grün soll es sein?", options=list(LEVELS), value="Sehr grün",
+                                 key="level_loop")
         water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_loop", value=False,
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         san_reach = san_settings("loop")
@@ -7536,10 +7598,9 @@ def home_tour():
         same = st.checkbox("Runde endet wieder am Startpunkt", value=True, key="tour_same")
         b_v = None if same else place_input("Endpunkt", "tour_b_sb")
         st.caption(SEARCH_TIP)
-        extra_opt = pick_one("Extra Strecke (optional)", ["Keine"] + [f"+ {k} km" for k in range(1, 11)],
-                             "tour_extra", "Keine", help="Verlängert die Runde um diese Strecke, zusätzlich zum Weg über die Zwischenziele.")
-        extra_km = 0 if extra_opt == "Keine" else int(extra_opt.replace("+", "").replace("km", "").strip())
-        level = pick_one("Wie grün soll es sein?", TOUR_LEVELS, "level_tour", "Sehr grün")
+        extra_km = st.slider("Extra Strecke (km, optional)", 0, 10, 0, 1, key="tour_extra_km",
+                             help="Verlängert die Runde um diese Strecke, zusätzlich zum Weg über die Zwischenziele. 0 = keine.")
+        level = st.select_slider("Wie grün soll es sein?", options=TOUR_LEVELS, value="Sehr grün", key="level_tour")
         water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_tour", value=False,
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         san_reach = san_settings("tour")
@@ -7641,13 +7702,7 @@ def render_home():
         wind_home_info()
     # Nur der gewählte Reiter wird aufgebaut (st.tabs würde alle drei samt Suchfeldern laden = langsam)
     pages = {"route": "🧭 Route", "green": "🌳 Ins Grün", "loop": "🔄 Ründchen", "tour": "🛍️ Ründchen mit Zwischenziel"}
-    try:
-        page = st.segmented_control("Ansicht", list(pages), format_func=pages.get,
-                                    **({} if "page_sel" in st.session_state else {"default": "route"}),
-                                    key="page_sel", label_visibility="collapsed")
-    except Exception:
-        page = st.radio("Ansicht", list(pages), format_func=pages.get, horizontal=True, key="page_sel_r",
-                        label_visibility="collapsed")
+    page = chips("", list(pages), "page_sel", default="route", fmt=pages.get)
     page = page or st.session_state.get("page_last", "route")
     st.session_state["page_last"] = page
     if st.session_state.get("_home_drawn") != page:  # Startseite oder Reiter wird neu aufgebaut: frische Suchfelder
