@@ -1257,7 +1257,9 @@ def load_area(bbox):
         ox.settings.useful_tags_way = sorted(set(ox.settings.useful_tags_way) | {"surface", "smoothness", "wheelchair", "incline", "dog"})
     except Exception:
         pass
+    _tm0 = time.time()
     path = fetch_osm(bbox, time.time() + LOAD_DEADLINE_S)
+    _tm_dl = time.time()
     def _features():
         parks, waters, dogz = None, None, None
         try:
@@ -1479,7 +1481,17 @@ def load_area(bbox):
             "names": names, "kinds": kinds, "noise": noise, "wide": wide, "accp": accp,
             "surf": surf_est, "surf_known": surf_known, "hard": hard, "dogno": dogno, "dogtag": dogtag,
             "dogz_json": dogz_json, "n_dogz": n_dogz,
-            "parks_json": parks_json, "n_parks": n_parks, "n_edges": len(keys)}
+            "parks_json": parks_json, "n_parks": n_parks, "n_edges": len(keys),
+            "tm": (round(_tm_dl - _tm0, 1), round(time.time() - _tm_dl, 1))}
+
+
+def _tm_txt(area):
+    """Zeitaufteilung beim Laden eines Gebiets (Download / Aufbereiten) für die Ladeanzeige."""
+    try:
+        d, v = area["tm"]
+        return f": Download {d:.0f} s, Aufbereiten {v:.0f} s"
+    except Exception:
+        return ""
 
 
 def nearest_node(area, lat, lon):
@@ -2070,6 +2082,10 @@ def prewarm(lat, lon):
         return
     bb = loop_bbox((lat, lon), (lat, lon), LOAD_TIERS[0] * 1000)
     _prewarm_bbox(bb, key)
+    try:  # Ründchen über 3,5 km brauchen das nächstgrößere Gebiet: Download schon vorab (erst nach kurzer Pause)
+        prefetch_osm(loop_bbox((lat, lon), (lat, lon), LOAD_TIERS[1] * 1000))
+    except Exception:
+        pass
 
     def work_green():
         try:
@@ -3667,7 +3683,7 @@ def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: 
         prefetch_water(bbox)
         area = load_area_any(bbox)
         bbox = tuple(area.get("bbox") or bbox)
-        log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
+        log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s{_tm_txt(area)})")
     ensure_water(area, log)
     o, t = nearest_node(area, *p1), nearest_node(area, *p2)
     log("🧭 Routen und Wegehinweise berechnen")
@@ -3723,7 +3739,7 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
         prefetch_water(_lb)
         area = load_area_any(_lb)
         bbox_km = load_km
-        log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
+        log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s{_tm_txt(area)})")
     if bbox_km < LOOP_MAX_KM:  # nächstgrößeres Gebiet schon im Hintergrund holen
         prefetch_osm(loop_bbox(p1, p2, next(t for t in LOAD_TIERS if t > bbox_km) * 1000))
     ensure_water(area, log)
@@ -4780,7 +4796,7 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
     have = _area_lookup(bbox)
     prefetch_water(tuple(have["bbox"]) if have is not None and have.get("bbox") else load_bb)
     area = load_area_any(bbox, load_bbox=load_bb)
-    log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
+    log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s{_tm_txt(area)})")
     ensure_water(area, log)
     nodes = [nearest_node(area, *p) for p in pts]
     if len(set(nodes)) < 2:
@@ -6191,6 +6207,8 @@ DOG_CSS = """
 DOG_BASE_CSS = """<style>
 .st-key-dog_mode{background:rgba(251,248,241,.98);border:1px solid #D9CFBC;border-radius:16px;padding:8px 14px 4px;margin:0 0 10px;
  box-shadow:0 4px 14px rgba(60,50,30,.12)}
+.chayfact{display:flex;gap:10px;align-items:center;font-size:.84rem;line-height:1.35;padding:8px 10px;margin:6px 0 4px;border-radius:12px;background:#FBEEDB;border:1px solid #EBCBA3;color:#5A3A1E}
+.chayfact img{flex:none;border-radius:50%}
 .dogchip{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center;font-size:.86rem;font-weight:600;padding:8px 12px;margin:0 0 10px;
  border-radius:14px;background:#FFF1DD;border:1px solid #E3A96B;color:#5A3513}
 .dogwarn{padding:10px 12px;border-radius:14px;background:#FDE6DD;border:1px solid #E9A58E;color:#8A2A12;font-size:.88rem;font-weight:600;margin:0 0 10px;line-height:1.4}
@@ -7976,6 +7994,9 @@ def dog_home_info():
     if wn:
         st.markdown(f'<div class="dogwarn" style="background:#E3F0F8;border-color:#9CC4DC;color:#1E4A66">{escape(wn)}</div>', unsafe_allow_html=True)
     st.caption("Nicht jedes Verbot steht in den Kartendaten. Schilder vor Ort, Leinenpflicht sowie Brut- und Setzzeit gehen vor.")
+    st.markdown('<div class="chayfact"><img src="' + chay_icon_uri(40) + '" width="40" height="40" alt="' + DOG_NAME + '">'
+                f'<div><b>{DOG_NAME}</b>, auch Chayton Wakanda, war ein Black-Tri Australian Shepherd: schön, frech und clever. '
+                'Er wird bis heute geliebt.</div></div>', unsafe_allow_html=True)
 
 
 def wind_home_info():
