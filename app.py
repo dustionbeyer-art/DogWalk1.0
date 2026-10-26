@@ -2901,6 +2901,39 @@ const THX_GREEN = [
   'Ziel erreicht. Ab hier zählt nur noch Spaß. Viel Freude im Grün!',
   'Grün erreicht. Tief durchatmen, losziehen, Spaß haben.',
   'Geschafft, jetzt beginnt der schöne Teil. Viel Spaß da draußen!'];
+const THX_DOG_PARK = [
+  'Angekommen im Grünen! Jetzt darf geschnuppert werden. Leinenregeln im Park bitte im Blick behalten.',
+  'Park erreicht. Nase hoch, Schwanz hoch: Hier darf er sich Zeit lassen. Schilder und Leinenpflicht beachten.',
+  'Da seid ihr. Ein paar Schnüffelminuten im Grünen, dann geht es entspannt weiter.',
+  'Ziel im Park erreicht. Dein Hund hat jetzt Auslauf verdient. Bitte nur dort ableinen, wo es erlaubt ist.',
+  'Willkommen im Grünen! Zeit zum Schnuppern, Spielen und Stöckchen suchen.'];
+const THX_DOG_FREE = [
+  'Hundefreilauf erreicht! Wenn hier laut Schild Freilauf gilt: Leine ab und los.',
+  'Angekommen auf der Hundewiese. Toben, schnüffeln, Hundefreunde treffen: Jetzt ist seine Zeit.',
+  'Freilauffläche erreicht. Bitte kurz die Hinweise vor Ort prüfen, dann darf er flitzen.'];
+const THX_DOG_WATER = [
+  'Am Wasser angekommen! Eine Pfotenabkühlung tut gut. Bei Algen oder Schaum aber lieber nicht trinken lassen.',
+  'Wasser erreicht. Kurz planschen oder trinken lassen, sofern das Wasser sauber aussieht.'];
+const THX_DOG_ARRIVE = [
+  'Angekommen! Dein Hund hat sich eine Pause und einen Schluck Wasser verdient.',
+  'Ziel erreicht. Gut gelaufen, gut geschnüffelt. Danke fürs Gassigehen!',
+  'Geschafft! Schwanzwedeln im Dauerbetrieb, Pause ist jetzt dran.'];
+const THX_WATER = [
+  'Am Wasser angekommen. Durchatmen, schauen, Ruhe genießen.',
+  'Ziel erreicht. Wasser, Weite und frische Luft: Besser lässt sich ein Weg kaum beenden.'];
+function thxList() {
+  const o = D.options[Math.max(cur, 0)] || {}, ctx = o.endctx || '';
+  if (D.dog) {
+    if (ctx === 'dogrun') return THX_DOG_FREE;
+    if (ctx === 'park' || D.kind === 'green') return THX_DOG_PARK;
+    if (ctx === 'water') return THX_DOG_WATER;
+    return D.mode === 'ab' ? THX_DOG_ARRIVE : THX_DOG;  // Ründchen: zurück zu Hause, Pfoten checken, Sofa
+  }
+  if (D.kind === 'green') return THX_GREEN;
+  if (D.mode === 'ab' && ctx === 'park') return THX_GREEN;
+  if (D.mode === 'ab' && ctx === 'water') return THX_WATER;
+  return THX_WALK;
+}
 function doneFlag(on) {  // merkt sich im Adressfeld der App: Strecke beendet (Python liest es beim Zurückgehen)
   try {
     const u = new parent.URL(parent.location.href);
@@ -2910,11 +2943,11 @@ function doneFlag(on) {  // merkt sich im Adressfeld der App: Strecke beendet (P
 }
 function showThanks() {
   document.body.classList.add('fin', 'thx'); doneFlag(true);
-  const list = D.dog ? THX_DOG : (D.kind === 'green' ? THX_GREEN : THX_WALK);
+  const list = thxList(), lk = 'gw_thx_' + (D.dog ? 'd' : '') + list.length + (D.kind || 'walk');
   let i = Math.floor(Math.random() * list.length), last = -1;
-  try { last = +(localStorage.getItem('gw_thx_' + (D.kind || 'walk')) || -1); } catch (e) {}
+  try { last = +(localStorage.getItem(lk) || -1); } catch (e) {}
   if (i === last) i = (i + 1) % list.length;
-  try { localStorage.setItem('gw_thx_' + (D.kind || 'walk'), String(i)); } catch (e) {}
+  try { localStorage.setItem(lk, String(i)); } catch (e) {}
   $('thx').textContent = list[i];
   $('thanks').classList.add('on');
 }
@@ -3224,6 +3257,36 @@ def dog_zone_rings(s, w, n, e):
     return rings
 
 
+_DZ_CACHE = {}
+_DZ_EX = ThreadPoolExecutor(max_workers=3)
+
+
+def dog_zone_rings_async(s, w, n, e):
+    """Verbotszonen im Rechteck als Future. Ein schon laufender oder fertiger Abruf, der das Rechteck abdeckt, wird
+    mitbenutzt: So kann er starten, während die Route noch berechnet wird."""
+    now = time.time()
+    for k, (t, f) in list(_DZ_CACHE.items()):
+        if now - t < 1800 and k[0] <= s and k[1] <= w and k[2] >= n and k[3] >= e and not (f.done() and f.exception()):
+            return f
+    f = _DZ_EX.submit(dog_zone_rings, s, w, n, e)
+    if len(_DZ_CACHE) > 20:
+        _DZ_CACHE.clear()
+    _DZ_CACHE[(s, w, n, e)] = (now, f)
+    return f
+
+
+def dog_zones_prefetch(p1, p2, pad=0.02):
+    """Schon beim Start der Berechnung die Verbotszonen zwischen Start und Ziel holen (nur Hundemodus)."""
+    try:
+        if _dog():
+            s, n = min(p1[0], p2[0]) - pad, max(p1[0], p2[0]) + pad
+            w, e = min(p1[1], p2[1]) - pad, max(p1[1], p2[1]) + pad
+            dog_zone_rings_async(math.floor(s * 100) / 100, math.floor(w * 100) / 100,
+                                 math.ceil(n * 100) / 100, math.ceil(e * 100) / 100)
+    except Exception:
+        pass
+
+
 def dog_osrm_check(coords):
     """Läuft eine Route (Liste [lat, lon]) durch eine bekannte Hunde-Verbotszone? -> (Meter, Linien, Namen)."""
     if not coords or len(coords) < 2:
@@ -3233,7 +3296,7 @@ def dog_osrm_check(coords):
     pad = 0.0015
     s, w = math.floor((min(la) - pad) * 100) / 100, math.floor((min(lo) - pad) * 100) / 100
     n, e = math.ceil((max(la) + pad) * 100) / 100, math.ceil((max(lo) + pad) * 100) / 100
-    rings = dog_zone_rings(round(s, 2), round(w, 2), round(n, 2), round(e, 2))
+    rings = dog_zone_rings_async(round(s, 2), round(w, 2), round(n, 2), round(e, 2)).result(timeout=30)
     if not rings:
         return 0.0, [], []
     boxes = [(min(p[0] for p in r), min(p[1] for p in r), max(p[0] for p in r), max(p[1] for p in r)) for _, r in rings]
@@ -3265,8 +3328,33 @@ def dog_osrm_check(coords):
     return meters, runs[:60], sorted(names)
 
 
-def _option(nav, label, sub, hint, stats, area=None, path=None):
+def end_context(area, path):
+    """Was liegt am Ende der Route? "park" (im bzw. am Park), "water" (am Wasser) oder "" – aus den Kartendaten, für die
+    Abschlussnachricht. Endet die Route dort, wo sie begann (Ründchen, Zuhause), zählt nur „mitten im Park“."""
+    try:
+        if area is None or not path or len(path) < 2:
+            return ""
+        i = area["H"][path[-2]][path[-1]]["i"]
+        pos = area["pos"]
+        home = math.dist(pos[path[0]], pos[path[-1]]) < 80
+        if park_inside(area)[i]:
+            return "park"
+        if home:
+            return ""
+        if float((area["D"][:, i] <= 30).mean()) >= 0.5:
+            return "park"
+        w = edge_water(area)
+        if w is not None and float(w[i]) > WATER_NEAR:
+            return "water"
+    except Exception:
+        pass
+    return ""
+
+
+def _option(nav, label, sub, hint, stats, area=None, path=None, endctx=None):
     _resolve_weather()
+    if endctx is None:
+        endctx = end_context(area, path) if (area is not None and path) else ""
     extra = {}
     if _dog() and area is not None and path:
         try:
@@ -3299,7 +3387,7 @@ def _option(nav, label, sub, hint, stats, area=None, path=None):
         hint += f" · {share:.0%} Doppelweg"
     if segs and share >= 0.02:
         hint += " · orange markiert = doppelt gelaufen"
-    return {**nav, "label": label, "sub": sub, "hint": hint, "stats": stats, "dups": segs, **extra}
+    return {**nav, "label": label, "sub": sub, "hint": hint, "stats": stats, "dups": segs, "endctx": endctx, **extra}
 
 
 def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: None):
@@ -4702,14 +4790,14 @@ def _green_part(lat, lon, r, sel):
     """Eine kleine Abfrage (Bereichsfilter statt Umkreis = schneller). Alle Server werden der Reihe nach probiert."""
     box = _box(lat, lon, r)
     body = ";".join(f"{x}{box}" for x in sel.split(";"))
-    q = f"[out:json][timeout:40];({body};);out tags bb 6000;"  # bb: Rechteck je Objekt (nicht mit „center“ mischen!)
+    q = f"[out:json][timeout:30];({body};);out tags bb 6000;"  # bb: Rechteck je Objekt (nicht mit „center“ mischen!)
     last = None
     ms = _ranked_mirrors()
-    for chunk in (ms[:3], ms[3:6], ms[:2]):
+    for chunk, to in ((ms[:4], 26.0), (ms[2:6], 20.0)):
         if not chunk:
             continue
         try:
-            return _overpass_race(q, 30.0, chunk)
+            return _overpass_race(q, to, chunk)
         except Exception as e:
             last = e
     raise last or RuntimeError("Overpass nicht erreichbar")
@@ -4721,18 +4809,21 @@ def _green_fetch(lat, lon, r, cats):
     jobs = {("g", k): v for k, v in GREEN_QUERIES.items()}
     jobs.update({("f", c): FEAT_QUERIES[c] for c in cats})
     greens, feats, failed = [], [], []
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futs = {k: ex.submit(_green_part, lat, lon, r, v) for k, v in jobs.items()}
-        for (kind, name), f in futs.items():
-            try:
-                els = f.result().get("elements", [])
-            except Exception as e:
-                if kind == "g":
-                    failed.append(("g", e))
-                else:
-                    failed.append((name, e))
-                continue
-            (greens if kind == "g" else feats).extend(els)
+    ex = ThreadPoolExecutor(max_workers=len(jobs))
+    futs = {k: ex.submit(_green_part, lat, lon, r, v) for k, v in jobs.items()}
+    ex.shutdown(wait=False)  # nicht fertige Abrufe laufen im Hintergrund weiter und landen im Zwischenspeicher
+    t_end = time.time() + 28.0  # Zeitbudget: langsame Zusatzangaben werden übersprungen statt minutenlang abgewartet
+    for (kind, name), f in sorted(futs.items(), key=lambda kv: kv[0][0] != "g"):
+        try:
+            left = max(0.5, t_end - time.time())
+            els = f.result(timeout=left).get("elements", [])
+        except Exception as e:
+            if kind == "g":
+                failed.append(("g", e))
+            else:
+                failed.append((name, e))
+            continue
+        (greens if kind == "g" else feats).extend(els)
     if not greens:
         errs = [e for k, e in failed if k == "g"]
         raise errs[0] if errs else ValueError("Im Umkreis von 10 km habe ich keine Grünfläche gefunden.")
@@ -4883,6 +4974,7 @@ def green_view(start_v, g, prefer, avoid):
     dog_weather(start_v)
     lat1, lon1, lab1 = _unpack(start_v)
     p1, p2 = (lat1, lon1), g["target"]
+    dog_zones_prefetch(p1, p2)  # Verbotszonen holen, während der Routenserver rechnet
     t1 = lab1.split(" · ")[0]
     t2 = f"{g['name']} ({fmt_ha(g['ha'])})"
     nav = osrm_nav(osrm_route(p1, p2), f"{t1} → {t2}")
@@ -4904,7 +4996,8 @@ def green_view(start_v, g, prefer, avoid):
         hint += " · ⚠️ " + g["note"]
     opt = _option(nav, "Schnellste", f"{fmt_km(nav['total'])} · {mins} min", hint,
                   [["Länge", fmt_km(nav["total"])], ["Dauer", f"{mins} min"], ["Fläche", fmt_ha(g["ha"])],
-                   ["Passt zu", " ".join(GREEN_ICON[c] for c in g["counts"]) or "–"]])
+                   ["Passt zu", " ".join(GREEN_ICON[c] for c in g["counts"]) or "–"]],
+                  endctx="dogrun" if "dogrun" in g.get("counts", {}) else "park")
     payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=None, kind="green",
                    options=[opt], default=0, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
@@ -5099,10 +5192,15 @@ def find_green(pos, prefer, avoid, size_range, log=lambda *_: None):
         raise NoGreen("Im Umkreis von 10 km habe ich keine Grünfläche gefunden. Das kann an fehlenden "
                       "OpenStreetMap-Daten oder überlasteten Servern liegen. Bitte in ein paar Minuten noch einmal "
                       "versuchen oder den Start an einen anderen Ort legen." + f" (Treffer im Kartenabruf: {len(greens)})")
-    for g in ranked[:3]:  # Ziel mitten in die Fläche legen (nicht an den Rand/die Straße)
-        if not g.get("inside"):
+    todo = [g for g in ranked[:3] if not g.get("inside")]  # Ziel mitten in die Fläche legen (nicht an den Rand/die Straße)
+    if todo:
+        ex_ = ThreadPoolExecutor(max_workers=len(todo))
+        futs_ = [(g, ex_.submit(green_inside_point, g, pos)) for g in todo]
+        ex_.shutdown(wait=False)
+        t_end = time.time() + 9.0  # gleichzeitig und mit Zeitgrenze statt nacheinander
+        for g, f in futs_:
             try:
-                g["target"] = green_inside_point(g, pos) or g["target"]
+                g["target"] = f.result(timeout=max(0.3, t_end - time.time())) or g["target"]
             except Exception:
                 pass
     for g in ranked:
@@ -5642,7 +5740,13 @@ D.addEventListener('click',function(e){if(Date.now()-swallow<400&&e.target.close
 # Suchfeldern abgeschaltet (Suchfelder laufen in eigenen Rahmen; ein Wächter im Elternfenster erledigt das).
 SB_JS = """<script>(function(){
 try{var P=window.parent;if(P.__gwSb)return;P.__gwSb=1;
-function fix(doc){try{[].slice.call(doc.querySelectorAll('input')).forEach(function(i){
+function guard(doc){try{if(doc.__gwG)return;doc.__gwG=1;var last=0,prev=0;
+ function mark(e){var t=e.target;if(!t||t.tagName!=='INPUT')return;var v=t.value||'';
+  if(v.length-prev>3||(e.inputType&&/Replacement|Autofill|Paste|Drop/i.test(e.inputType)))last=Date.now();prev=v.length}
+ doc.addEventListener('input',mark,true);doc.addEventListener('change',mark,true);
+ doc.addEventListener('focusout',function(e){if(Date.now()-last<1500&&e.target&&e.target.tagName==='INPUT'){e.stopImmediatePropagation();e.stopPropagation()}},true);
+}catch(e){}}
+function fix(doc){guard(doc);try{[].slice.call(doc.querySelectorAll('input')).forEach(function(i){
  if(i.__gw)return;i.__gw=1;
  i.setAttribute('autocomplete','off');i.setAttribute('autocorrect','off');i.setAttribute('autocapitalize','none');
  i.setAttribute('spellcheck','false');i.setAttribute('enterkeyhint','search');i.setAttribute('inputmode','search');
@@ -5772,6 +5876,18 @@ html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp 
 .stButton button[kind="primary"]:hover{box-shadow:0 6px 18px rgba(78,110,69,.4);transform:translateY(-1px)}
 [data-testid="stToggle"],[data-testid="stCheckbox"]{transition:opacity .2s}
 @media (prefers-reduced-motion:reduce){.st-key-card_route,.st-key-card_green,.st-key-card_loop,.st-key-card_tour,.hero{animation:none}}
+/* Handy: Auswahl als große Tipp-Felder statt Aufklapp-Listen */
+[data-testid="stButtonGroup"]{gap:.45rem!important;flex-wrap:wrap!important}
+[data-testid="stButtonGroup"] button{min-height:46px!important;padding:.35rem .95rem!important;border-radius:999px!important;
+ font-size:.95rem!important;line-height:1.2!important}
+[data-testid="stButtonGroup"] button[kind$="Active"],[data-testid="stButtonGroup"] button[aria-pressed="true"]{
+ background:#4E6E45!important;border-color:#4E6E45!important;color:#fff!important}
+[data-testid="stButtonGroup"] button[kind$="Active"] *,[data-testid="stButtonGroup"] button[aria-pressed="true"] *{color:#fff!important}
+[data-testid="stRadio"] label{padding:.5rem .2rem}
+@media (max-width:640px){
+ [data-testid="stRadio"] [role="radiogroup"]{gap:.15rem}
+ [data-testid="stRadio"] label{min-height:44px;align-items:center}
+}
 </style>
 """
 
@@ -6506,7 +6622,7 @@ SEARCH_STYLE = {
                     "boxShadow": "0 1px 2px rgba(60,50,30,.06)"},
         "menu": {"borderRadius": 14, "overflow": "hidden", "border": "1px solid #D9CFBC",
                  "boxShadow": "0 8px 24px rgba(60,50,30,.18)"},
-        "option": {"padding": "10px 14px"},
+        "option": {"padding": "14px 16px", "fontSize": "16px", "lineHeight": "1.3"},
     },
 }
 
@@ -6525,45 +6641,6 @@ def bump_sb_gen():
             del st.session_state[k]
     except Exception:
         pass
-
-
-def _alt_pick(altk, val):
-    st.session_state[altk] = val
-
-
-def _alt_clear(altk):
-    st.session_state.pop(altk, None)
-
-
-def alt_input(key, fn):
-    """Notausgang neben dem Suchfeld: normales Textfeld (Return) und Treffer als Tasten zum Antippen. Funktioniert
-    auch dann, wenn das Suchfeld auf dem Handy zickt. Rückgabe: gewählter Ort (gepackt) oder None."""
-    altk = f"_alt_{key}"
-    sel = st.session_state.get(altk)
-    if sel:
-        try:
-            lab = _unpack(sel)[2]
-        except Exception:
-            lab = "Ort"
-        c1, c2 = st.columns([6, 1])
-        c1.markdown(f'<div style="padding:.55rem .8rem;border:1px solid #9DB38A;border-radius:12px;background:rgba(157,179,138,.18);font-size:.92rem;line-height:1.3">✅ {escape(lab)}</div>', unsafe_allow_html=True)
-        c2.button("✕", key=f"{altk}_x", on_click=_alt_clear, args=(altk,), help="Auswahl entfernen")
-        return sel
-    with st.expander("⌨️ Suche hakt? Hier eintippen und auswählen"):
-        q = st.text_input("Ort oder Adresse", key=f"g{_sb_gen()}_{key}_altq", autocomplete="off",
-                          placeholder="Eintippen, dann Return/Los auf der Tastatur",
-                          label_visibility="collapsed")
-        if q and len(q.strip()) >= 3:
-            try:
-                res = fn(q)
-            except Exception:
-                res = []
-            if not res:
-                st.caption("Keine Treffer. Bitte anders schreiben (z. B. mit Stadt).")
-            for i, (lab, val) in enumerate(res[:6]):
-                st.button(lab, key=f"g{_sb_gen()}_{key}_alt{i}", on_click=_alt_pick, args=(altk, val),
-                          use_container_width=True)
-    return None
 
 
 def place_input(label, key):
@@ -6590,12 +6667,7 @@ def place_input(label, key):
             v = st_searchbox(fn, **kw)
     if v:
         st.session_state[keep] = v
-    alt = None
-    try:
-        alt = alt_input(key, fn)
-    except Exception:
-        alt = None
-    return alt or v
+    return v
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -7035,8 +7107,8 @@ def render_san_pending():
             labels = [("🚻 " if c["kind"] == "pub" else "🍽️ ") + f"{c['name']} · {_fmt_dist(c['d'])} vom Weg"
                       + (" · öffentlich" if c["kind"] == "pub" else " · private Sanitäranlagen") for c in cands]
             opts = [None] + list(range(len(cands)))
-            pick = st.selectbox(z["label"], opts, index=1, key=f"san_pick_{i}",
-                                format_func=lambda j, L=labels: "– nicht einplanen –" if j is None else L[j])
+            pick = st.radio(z["label"], opts, index=1, key=f"san_pick_{i}",
+                            format_func=lambda j, L=labels: "– nicht einplanen –" if j is None else L[j])
             if pick is not None:
                 chosen.append(cands[pick])
         if any(c["kind"] != "pub" for c in chosen) or any(c.get("cands") and c["cands"][0]["kind"] != "pub" for c in missing):
@@ -7095,6 +7167,37 @@ def replan_with_stops(view, cands):
     return new
 
 
+def _keep_one(key, default):
+    """Immer genau eine Auswahl: wird sie abgewählt, springt sie auf den letzten Wert zurück."""
+    if not st.session_state.get(key):
+        st.session_state[key] = st.session_state.get(f"_prev_{key}", default)
+    else:
+        st.session_state[f"_prev_{key}"] = st.session_state[key]
+
+
+def pick_one(label, options, key, default, help=None, fmt=None):
+    """Einzelauswahl als Tipp-Felder (Handy-freundlich). Fällt bei älteren Streamlit-Versionen auf Schieberegler zurück."""
+    options = list(options)
+    try:
+        kw = {} if key in st.session_state else {"default": default}
+        if fmt:
+            kw["format_func"] = fmt
+        v = st.pills(label, options, selection_mode="single", key=key, help=help, on_change=_keep_one,
+                     args=(key, default), **kw)
+        return v or st.session_state.get(f"_prev_{key}", default)
+    except AttributeError:
+        return st.select_slider(label, options=options, value=default, key=key, help=help, format_func=fmt or str)
+
+
+def pick_multi(label, options, key, help=None):
+    """Mehrfachauswahl als Tipp-Felder statt Aufklapp-Liste."""
+    options = list(options)
+    try:
+        return list(st.pills(label, options, selection_mode="multi", key=key, help=help) or [])
+    except AttributeError:
+        return st.multiselect(label, options, key=key, placeholder="Auswählen …", help=help)
+
+
 def home_green():
     with st.container(key="card_green"):
         st.markdown("Ich suche vom Standort aus die Grünfläche im Umkreis von 10 km, die am besten passt, "
@@ -7108,14 +7211,13 @@ def home_green():
                     st.session_state[k_] = [v for v in st.session_state[k_] if v in o_]
             except Exception:
                 pass
-        prefer = st.multiselect("Bevorzugt", opts_p, key="green_prefer", placeholder="Auswählen …",
+        prefer = pick_multi("Bevorzugt", opts_p, "green_prefer",
                                 help=("Hundefreilaufflächen: Wiesen und Plätze, auf denen Hunde ohne Leine laufen dürfen (aus den Kartendaten). "
                                       "Sportangebote: Outdoor-Fitness, Skatepark, Tretboot u. a." if dogm else
                                       "Sportangebote: Fußball, Basketball, Tischtennis, Outdoor-Fitness, Skatepark, "
                                       "Hundepark, Tretboot u. a. (als Suchabfrage im Umkreis)."))
-        avoid = st.multiselect("Vermeiden", opts_a, key="green_avoid", placeholder="Auswählen …")
-        size = st.select_slider("Bevorzugte Grünflächengröße", options=list(GREEN_SIZES), value="Mittel (2–15 ha)",
-                                key="green_size")
+        avoid = pick_multi("Vermeiden", opts_a, "green_avoid")
+        size = pick_one("Bevorzugte Grünflächengröße", GREEN_SIZES, "green_size", "Mittel (2–15 ha)")
         go = st.button("Los, das Grün finden", type="primary", use_container_width=True, key="go_green")
     if not go:
         return
@@ -7145,13 +7247,15 @@ def home_green():
                 status.update(label="Vorschläge bereit", state="complete", expanded=False)
                 st.rerun()
             ov.log("🚶 Schnellsten Weg berechnen")
-            err = None
+            err, t_try = None, time.time()
             for g in (options[:1] + ranked)[:5]:
                 try:
                     view = green_view(start_v, g, pc, ac)
                     break
                 except Exception as e:
                     err = e
+                    if not isinstance(e, ValueError) or time.time() - t_try > 45:
+                        break  # Server nicht erreichbar: weitere Ziele probieren würde nur länger warten
             if not view:
                 raise err or ValueError("Keine erreichbare Grünfläche gefunden.")
             status.update(label="Fertig", state="complete", expanded=False)
@@ -7258,8 +7362,7 @@ def home_loop():
         km = st.slider("Gewünschte Länge (km)", 1.0, LOOP_MAX_KM, 3.0, 0.5, key="loop_km")
         st.markdown(f'<div class="hint">ca. {max(1, round(km * 1000 / M_PER_MIN))} min zu Fuß</div>',
                     unsafe_allow_html=True)
-        level = st.select_slider("Wie grün soll es sein?", options=list(LEVELS), value="Sehr grün",
-                                 key="level_loop")
+        level = pick_one("Wie grün soll es sein?", LEVELS, "level_loop", "Sehr grün")
         water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_loop", value=False,
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         san_reach = san_settings("loop")
@@ -7319,10 +7422,10 @@ def home_tour():
         same = st.checkbox("Runde endet wieder am Startpunkt", value=True, key="tour_same")
         b_v = None if same else place_input("Endpunkt", "tour_b_sb")
         st.caption(SEARCH_TIP)
-        extra_opt = st.selectbox("Extra Strecke (optional)", ["Keine"] + [f"+ {k} km" for k in range(1, 11)],
-                                 key="tour_extra", help="Verlängert die Runde um diese Strecke, zusätzlich zum Weg über die Zwischenziele.")
+        extra_opt = pick_one("Extra Strecke (optional)", ["Keine"] + [f"+ {k} km" for k in range(1, 11)],
+                             "tour_extra", "Keine", help="Verlängert die Runde um diese Strecke, zusätzlich zum Weg über die Zwischenziele.")
         extra_km = 0 if extra_opt == "Keine" else int(extra_opt.replace("+", "").replace("km", "").strip())
-        level = st.select_slider("Wie grün soll es sein?", options=TOUR_LEVELS, value="Sehr grün", key="level_tour")
+        level = pick_one("Wie grün soll es sein?", TOUR_LEVELS, "level_tour", "Sehr grün")
         water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_tour", value=False,
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         san_reach = san_settings("tour")
