@@ -250,13 +250,16 @@ def extreme_note(n_ok):
             f"{EXTREME_GREEN_MIN:.0%} Grün erreichbar") if not n_ok else ""
 
 
-def greenest_within(run, budget):
+def greenest_within(run, budget, sink=None):
     """Grünste Route mit höchstens `budget` Meter Länge. run(lam, mu, wq) liefert {"dist", "green", ...}.
-    Das Grün-Gewicht lam wird je Stil per Halbierung gesucht (grösstes lam, das noch ins Längenbudget passt)."""
+    Das Grün-Gewicht lam wird je Stil per Halbierung gesucht (grösstes lam, das noch ins Längenbudget passt).
+    Alle dabei berechneten Strecken landen zusätzlich in `sink` (Auswahl für Wenig-/Viel-grün)."""
     best = None
     for mu, wq in EXTREME_QUIET:
         cands = []
         r = run(300.0, mu, wq)
+        if sink is not None:
+            sink.append(r)
         if r["dist"] <= budget:
             cands.append(r)
         else:
@@ -264,6 +267,8 @@ def greenest_within(run, budget):
             for _ in range(8):
                 mid = math.sqrt(lo * hi)
                 r = run(mid, mu, wq)
+                if sink is not None:
+                    sink.append(r)
                 if r["dist"] <= budget:
                     cands.append(r)
                     lo = mid
@@ -289,6 +294,94 @@ LEVEL_HINT = {
     "Maximal grün": "Grün zuerst, Hauptstraßen und breite Straßen meiden: kleine Gassen und Nebenstraßen.",
     "Grünster Umweg": "Auch große Umwege, solange der Grünanteil steigt; ruhige Gassen bevorzugt.",
 }
+
+
+# ------------------------------------------------------- Varianten-Auswahl: immer drei Strecken plus „Extrem grün“
+# Schnellste, Wenig grün (kleiner Umweg), Viel grün (mäßiger Umweg) und, wenn möglich, Extrem grün (bis 35 % Umweg,
+# über 70 % Grün). Die Strecken müssen sich wirklich unterscheiden: Eine Variante, die einer schon gewählten zu sehr
+# gleicht, wird nicht stillschweigend weggelassen, sondern durch die nächstbeste andere Strecke ersetzt.
+VAR_FAST, VAR_LOW, VAR_HIGH = "Schnellste", "Wenig grün", "Viel grün"
+VAR_HINT = {
+    VAR_FAST: "Nur die Distanz zählt.",
+    VAR_LOW: "Kleiner Umweg für spürbar mehr Grün.",
+    VAR_HIGH: "Mäßiger Umweg für deutlich mehr Grün und ruhigere Wege.",
+}
+VAR_MIN_DIFF = 0.12  # so viel der Strecke (nach Länge) muss mindestens anders sein als bei jeder anderen Variante
+
+
+def ks_diff(a, b):
+    """Anteil der Strecke, der bei a und b verschieden ist (0 = gleich, 1 = nichts gemeinsam). a, b: {Kante: Länge}."""
+    if not a or not b:
+        return 1.0
+    shared = sum(w for k, w in a.items() if k in b)
+    return 1.0 - shared / max(sum(a.values()), sum(b.values()), 1e-9)
+
+
+def pick_variants(short, pool, alt=None):
+    """Wählt aus `pool` (Strecken als {"dist", "green", "ks", ...}) die Varianten und liefert [(Name, Strecke), ...] in der
+    Reihenfolge Schnellste, Wenig grün, Viel grün, Extrem grün. `alt(taken)` darf bei Bedarf eine neue, andere Strecke
+    liefern (gleiche Form), wenn der Pool keine passende hergibt."""
+    sd = short["dist"]
+    md0 = VAR_MIN_DIFF if sd >= 600 else VAR_MIN_DIFF / 2
+    taken, chosen = [short], {}
+
+    def rank(c):
+        return (round((c["green"] - REP_W * c.get("rep", 0.0)) / 0.005), -c["dist"])
+
+    def get(budgets):
+        for md in (md0, md0 / 2):
+            for need_gain in (True, False):
+                for f in budgets:
+                    lim = sd * (1 + f) + (80 if f <= 0.25 else 0)
+                    cs = [c for c in pool if c["dist"] <= lim
+                          and (not need_gain or c["green"] >= short["green"] + 0.005)
+                          and all(ks_diff(c["ks"], t["ks"]) >= md for t in taken)]
+                    if cs:
+                        return max(cs, key=rank)
+        return None
+
+    cs = [c for c in pool if c["dist"] <= (1 + EXTREME_DETOUR) * sd and c["green"] > EXTREME_GREEN_MIN
+          and all(ks_diff(c["ks"], t["ks"]) >= md0 / 2 for t in taken)]
+    if cs:
+        chosen[EXTREME_NAME] = max(cs, key=rank)
+        taken.append(chosen[EXTREME_NAME])
+    ed = chosen[EXTREME_NAME]["dist"] / sd - 1 if EXTREME_NAME in chosen else 0.0
+    for name, near, far in ((VAR_HIGH, (0.25, max(0.25, ed)), (0.4, 0.6)), (VAR_LOW, (0.12, 0.25), (0.4, 0.6))):
+        c = get(near)
+        if c is None and alt is not None:  # keine passende Strecke im Pool: eine andere erzwingen
+            try:
+                c = alt(list(taken))
+            except Exception:
+                c = None
+            if c is not None and (c["dist"] > sd * 1.6 + 200 or any(ks_diff(c["ks"], t["ks"]) < md0 / 2 for t in taken)):
+                c = None
+        if c is None:
+            c = get(far)
+        if c is not None:
+            chosen[name] = c
+            taken.append(c)
+    lo, hi = chosen.get(VAR_LOW), chosen.get(VAR_HIGH)
+    if lo is not None and hi is not None and (lo["green"] > hi["green"] + 0.002
+                                              or (abs(lo["green"] - hi["green"]) <= 0.002 and lo["dist"] > hi["dist"])):
+        chosen[VAR_LOW], chosen[VAR_HIGH] = hi, lo
+    return [(VAR_FAST, short)] + [(n, chosen[n]) for n in (VAR_LOW, VAR_HIGH, EXTREME_NAME) if n in chosen]
+
+
+def pick_diverse(cands, dev, n=3, passes=((0.2, 0.6), (0.2, 0.8), (0.3, 0.8), (0.3, 0.92))):
+    """Bis zu n Kandidaten (beste zuerst, jeder mit "es" = Kantenmenge) aus einer nach Güte sortierten Liste. Erst streng
+    (wenig Überlappung, nah an der Wunschlänge), dann schrittweise großzügiger, damit es nach Möglichkeit immer n sind.
+    dev(c) = Abweichung von der Wunschlänge (relativ)."""
+    picked = []
+    for tol, ov in passes:
+        for c in cands:
+            if len(picked) >= n:
+                return picked
+            if any(c is p for p in picked) or abs(dev(c)) > tol:
+                continue
+            es = c["es"]
+            if all(len(es & p["es"]) / max(len(es | p["es"]), 1) < ov for p in picked):
+                picked.append(c)
+    return picked
 
 
 # ------------------------------------------------------- Ortssuche
@@ -2686,7 +2779,7 @@ def loop_stats(area, g, path):
     return dist, float((l * g[idx]).sum() / dist), float(rep), noise
 
 
-def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None, bearings=None):
+def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None, bearings=None, phase=0.0):
     """Probiert mehrere Richtungen, passt den Kreisradius an die Wunschlänge an und
     liefert bis zu 3 deutlich verschiedene Varianten (beste zuerst)."""
     g = edge_green(area, buf)
@@ -2694,7 +2787,7 @@ def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None, bearings
     cands = []
     nb = bearings or LOOP_BEARINGS
     for k in range(nb):
-        theta = 2 * math.pi * k / nb
+        theta = 2 * math.pi * k / nb + phase
         rho = target / (2 * math.pi * 1.35)
         for _ in range(3):
             try:
@@ -2714,7 +2807,7 @@ def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None, bearings
         if progress:
             progress((k + 1) / nb)
     # Zusätzlich: Runden, die gezielt in einen nahen Park hinein und quer hindurch führen (statt nur am Rand entlang)
-    if lam > 0:
+    if lam > 0 and not phase:
         mu_, wq_ = quiet or (None, 0.0)
         mu_ = (QUIET if lam > 0 else 0.0) if mu_ is None else mu_
         try:
@@ -2754,20 +2847,27 @@ def find_loops(area, o, t, target, lam, buf, progress=None, quiet=None, bearings
         c["score"] = (c["green"] + PARK_W * c["inside"] - REP_W * c["rep"] - 0.4 * ((quiet[0] if quiet else QUIET) if lam > 0 else 0) * c["noise"]
                       - 2.0 * abs(c["dist"] / target - 1))
     cands.sort(key=lambda c: -c["score"])
-    picked = []
     for c in cands:
-        if abs(c["dist"] / target - 1) > 0.2:
-            continue
-        es = edge_set(c["path"])
-        if all(len(es & p["es"]) / len(es | p["es"]) < 0.6 for p in picked):
-            c["es"] = es
-            picked.append(c)
-        if len(picked) == 3:
-            break
+        c["es"] = edge_set(c["path"])
+    picked = pick_diverse(cands, lambda c: c["dist"] / target - 1)
+    if len(picked) < 3 and not phase and not bearings:
+        # zu wenige verschiedene Runden: zusätzliche Richtungen dazwischen probieren
+        more = find_loops(area, o, t, target, lam, buf, quiet=quiet, bearings=nb, phase=math.pi / nb)
+        both = sorted(cands + more, key=lambda c: -c["score"])
+        picked = pick_diverse(both, lambda c: c["dist"] / target - 1)
     if not picked and cands:
-        cands[0]["es"] = edge_set(cands[0]["path"])
         picked = [cands[0]]
     return picked
+
+
+def too_similar(path, existing, thr=0.9):
+    """Gleicht `path` einer der Strecken in `existing` (Pfadlisten) zu mindestens `thr` (Anteil gemeinsamer Wegstücke)?"""
+    es = edge_set(path)
+    for q in existing:
+        eq = edge_set(q)
+        if len(es & eq) / max(len(es | eq), 1) >= thr:
+            return True
+    return False
 
 
 def extreme_loop(area, o, t, target, buf, existing=()):
@@ -2775,9 +2875,8 @@ def extreme_loop(area, o, t, target, buf, existing=()):
     Grün-Gewicht eine Runde um etwa 1,22 × Wunschlänge; nur was ≤ 1,35 × Wunschlänge bleibt und über 70 % Grün hat, zählt."""
     lam = LEVELS["Grünster Umweg"]
     vs = find_loops(area, o, t, target * 1.22, lam, buf, quiet=LEVEL_QUIET["Grünster Umweg"], bearings=6)
-    have = {tuple(v["path"]) for v in existing}
     ok = [v for v in vs if v["dist"] <= (1 + EXTREME_DETOUR) * target and v["green"] > EXTREME_GREEN_MIN
-          and tuple(v["path"]) not in have]
+          and not too_similar(v["path"], [e["path"] for e in existing])]
     return max(ok, key=lambda v: (v["green"] - REP_W * v["rep"])) if ok else None
 
 
@@ -3837,8 +3936,29 @@ def inside(bbox, p, margin=0.002):
     return left + margin <= p[1] <= right - margin and bottom + margin <= p[0] <= top - margin
 
 
+AB_LADDER = ((0.7, 1.0, 0.0), (1.5, 1.0, 0.0), (2.5, 1.0, 0.0), (4.0, 1.0, 0.0), (6.0, 1.0, 0.0), (8.0, 1.0, 0.0),
+             (8.0, 4.0, 6.0), (14.0, 4.0, 6.0), (25.0, 4.0, 6.0), (40.0, 6.0, 10.0))  # (Grün-, Hauptstraßen-, Breiten-Gewicht)
+
+
+def edge_ks(area, path):
+    """Kanten einer Strecke als {Kantenindex: Länge} (zum Vergleichen von Varianten)."""
+    L, H = area["lengths"], area["H"]
+    return {H[a][b]["i"]: float(L[H[a][b]["i"]]) for a, b in zip(path[:-1], path[1:])}
+
+
+def dedupe_paths(cands):
+    seen, out = set(), []
+    for c in cands:
+        k = tuple(c["path"])
+        if k not in seen:
+            seen.add(k)
+            out.append(c)
+    return out
+
+
 def solve_levels(area, o, t, buf):
-    """Kürzeste Route + grüne Route je Grünstufe (alle vorab, damit die Karte sofort umschalten kann)."""
+    """Schnellste Route + Wenig grün + Viel grün (+ Extrem grün, wenn möglich): [(Name, Strecke), ...]. Gerechnet wird mit vielen
+    Grün-Gewichten; pick_variants wählt daraus Strecken, die sich wirklich unterscheiden."""
     g = edge_green(area, buf)
     L, H = area["lengths"], area["H"]
     nz = area.get("noise")
@@ -3854,53 +3974,27 @@ def solve_levels(area, o, t, buf):
         share = float((L[idx] * g[idx]).sum() / dist) if dist > 0 else 0.0
         noise = float((L[idx] * nz[idx]).sum() / dist) if dist > 0 else 0.0
         narrow = float((L[idx] * (wd[idx] <= NARROW)).sum() / dist) if dist > 0 else 0.0
-        return {"path": path, "dist": dist, "green": share, "noise": noise, "narrow": narrow}
+        return {"path": path, "dist": dist, "green": share, "noise": noise, "narrow": narrow, "ks": edge_ks(area, path)}
 
     def cost(lam, mu, wq):
         return L * (1 + lam * (1 - g) + mu * nz + wq * wd + ap)
 
     short = run(L * (1 + ap))
-    out = []
-    for name, lam in LEVELS.items():
-        mu, wq = level_quiet(name)
-        if lam >= 30:
-            # „Grünster Umweg“: darf deutlich länger sein, aber nicht ausufern und muss wirklich grüner sein
-            best = max((r_ for _, r_ in out), key=lambda r_: r_["green"])
-            r = None
-            for f in (1.0, 0.5, 0.25):
-                cand = run(cost(lam * f, mu, wq))
-                if cand["dist"] <= 3.0 * short["dist"] + 600:
-                    r = cand
-                    break
-            if r is None or r["path"] == best["path"] or r["green"] < best["green"] + 0.01:
-                continue
-            out.append((name, r))
-            continue
-        out.append((name, short if lam == 0 else run(cost(lam, mu, wq))))
-    return short, out
+    pool = [short] + [run(cost(*step)) for step in AB_LADDER]
+    try:  # auch die Suche nach „Extrem grün“ liefert Strecken für den Pool
+        sink = []
+        greenest_within(lambda lam, mu, wq: run(cost(lam, mu, wq)), (1 + EXTREME_DETOUR) * short["dist"], sink)
+        pool += sink
+    except nx.NetworkXNoPath:
+        pass
 
+    def alt(taken):  # Notlösung: bereits gewählte Wege verteuern, damit eine andere Strecke entsteht
+        pen = np.zeros(len(L))
+        for c in taken:
+            pen[list(c["ks"])] = 1.0
+        return run(cost(1.5, 1.0, 0.0) * (1 + 2.0 * pen))
 
-def solve_extreme(area, o, t, buf, short):
-    """Route A -> B „Extrem grün“: grünste Strecke mit höchstens 35 % Umweg. Nur mit mehr als 70 % Grün, sonst None."""
-    g = edge_green(area, buf)
-    L, H = area["lengths"], area["H"]
-    nz = area.get("noise")
-    nz = np.zeros(len(L)) if nz is None else nz
-    wd = area.get("wide")
-    wd = np.zeros(len(L)) if wd is None else wd
-    ap = area_accp(area)
-
-    def run(lam, mu, wq):
-        path = fast_path(area, L * (1 + lam * (1 - g) + mu * nz + wq * wd + ap), o, t)
-        idx = [H[a][b]["i"] for a, b in zip(path[:-1], path[1:])]
-        dist = float(L[idx].sum()) if idx else 0.0
-        share = float((L[idx] * g[idx]).sum() / dist) if dist > 0 else 0.0
-        noise = float((L[idx] * nz[idx]).sum() / dist) if dist > 0 else 0.0
-        narrow = float((L[idx] * (wd[idx] <= NARROW)).sum() / dist) if dist > 0 else 0.0
-        return {"path": path, "dist": dist, "green": share, "noise": noise, "narrow": narrow}
-
-    best = greenest_within(run, (1 + EXTREME_DETOUR) * short["dist"])
-    return best if best and best["green"] > EXTREME_GREEN_MIN else None
+    return short, pick_variants(short, dedupe_paths(pool), alt)
 
 
 def parks_geo(area):
@@ -4213,35 +4307,20 @@ def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: 
             continue
         detour = r["dist"] / short["dist"] - 1 if short["dist"] else 0.0
         mins = max(1, round(r["dist"] / M_PER_MIN))
+        ext = name == EXTREME_NAME
         options.append(_option(
             nav, name, f"{fmt_km(r['dist'])} · {r['green']:.0%} grün",
-            f"{LEVEL_HINT[name]} · Umweg {detour:+.0%}"
-            + (f" · {r['narrow']:.0%} kleine Wege" if LEVELS[name] >= 12 else "")
+            (extreme_hint(f" · Umweg {detour:+.0%}") if ext else f"{VAR_HINT[name]} · Umweg {detour:+.0%}")
+            + (f" · {r['narrow']:.0%} kleine Wege" if name in (VAR_HIGH, EXTREME_NAME) else "")
             + (water_note(area, r['path']) if _water() else ""),
             [["Länge", fmt_km(r["dist"])], ["Dauer", f"{mins} min"],
              ["Grünanteil", f"{r['green']:.0%}"], ["Hauptstraße", f"{r['noise']:.0%}"]],
             area=area, path=r["path"]))
     if not options:
         raise ValueError("Start und Ziel liegen zu nah beieinander.")
-    default = next((i for i, o_ in enumerate(options) if o_["label"] == "Ausgewogen"), 0)
-    try:  # Zusatz: „Extrem grün“ (bis 35 % Umweg, über 70 % Grün)
-        ext = solve_extreme(area, o, t, buf, short)
-        if ext and ext["path"] not in [r_["path"] for _, r_ in levels]:
-            nav = build_nav(area, ext["path"], f"{t1} → {t2}")
-            if nav:
-                detour = ext["dist"] / short["dist"] - 1 if short["dist"] else 0.0
-                mins = max(1, round(ext["dist"] / M_PER_MIN))
-                options.append(_option(
-                    nav, EXTREME_NAME, f"{fmt_km(ext['dist'])} · {ext['green']:.0%} grün",
-                    extreme_hint(f" · Umweg {detour:+.0%}") + (f" · {ext['narrow']:.0%} kleine Wege")
-                    + (water_note(area, ext['path']) if _water() else ""),
-                    [["Länge", fmt_km(ext["dist"])], ["Dauer", f"{mins} min"],
-                     ["Grünanteil", f"{ext['green']:.0%}"], ["Hauptstraße", f"{ext['noise']:.0%}"]],
-                    area=area, path=ext["path"]))
-        elif not ext and short["dist"] > 300:
-            options[default]["hint"] += extreme_note(False)
-    except (nx.NetworkXNoPath, nx.NodeNotFound):
-        pass
+    default = next((i for i, o_ in enumerate(options) if o_["label"] == VAR_LOW), 0)
+    if short["dist"] > 300 and not any(o_["label"] == EXTREME_NAME for o_ in options):
+        options[default]["hint"] += extreme_note(False)
     payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=parks_geo(area), water=water_geo(area), dogz=dogz_geo(area),
                    options=options, default=default, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
@@ -5148,28 +5227,26 @@ def scan_ab_view(start_v, dest_v, buf=150, log=lambda *_: None):
     scored = [(rt, sc) for rt, sc in scored if sc["dist"] > 0]
     if not scored:
         raise ValueError("Für diese Punkte habe ich keinen Fußweg gefunden.")
-    short = min(sc["dist"] for _, sc in scored)
+    pool = [{"rt": rt, "sc": sc, "dist": sc["dist"], "green": sc["green"], "rep": 0.0,
+             "ks": {k: 1.0 for k in _grid_keys(_route_ll(rt))}} for rt, sc in scored]
+    fast = min(pool, key=lambda c: c["dist"])
+    short = fast["dist"]
     t1, t2 = lab1.split(" · ")[0], lab2.split(" · ")[0]
-    options, used = [], set()
-    for name, lam in LEVELS.items():
-        mu = level_quiet(name)[0]
-        pool = [i for i in range(len(scored)) if lam < 30 or scored[i][1]["dist"] <= 3.0 * short + 600]
-        j = min(pool, key=lambda i: scored[i][1]["dist"] * (
-            1 + lam * (1 - scored[i][1]["green"]) + mu * scored[i][1]["noise"]))
-        if j in used or (lam >= 30 and scored[j][1]["green"] < max(scored[u][1]["green"] for u in used) + 0.01):
-            continue
-        used.add(j)
-        rt, sc = scored[j]
+    options = []
+    for name, c in pick_variants(fast, [c for c in pool if c is not fast] + [fast]):
+        rt, sc = c["rt"], c["sc"]
         nav = osrm_nav(rt, f"{t1} → {t2}")
         if not nav:
             continue
         detour = sc["dist"] / short - 1 if short else 0.0
+        hint = extreme_hint(f" · Umweg {detour:+.0%}") if name == EXTREME_NAME else f"{VAR_HINT[name]} · Umweg {detour:+.0%}"
         options.append(_scan_option(nav, name, f"{fmt_km(sc['dist'])} · {sc['green']:.0%} grün",
-                                    f"{LEVEL_HINT[name]} · Umweg {detour:+.0%}{scan_water_note(sc)}", sc))
+                                    f"{hint}{scan_water_note(sc)}", sc))
     if not options:
         raise ValueError("Start und Ziel liegen zu nah beieinander.")
-    order = list(LEVELS)
-    default = min(range(len(options)), key=lambda i: abs(order.index(options[i]["label"]) - 2))
+    default = next((i for i, o_ in enumerate(options) if o_["label"] == VAR_LOW), 0)
+    if short > 300 and not any(o_["label"] == EXTREME_NAME for o_ in options):
+        options[default]["hint"] += extreme_note(False)
     payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=sa["geo"], water=sa.get("wgeo"),
                    options=options, default=default, speed=M_PER_MIN, topPad=TOP_PAD, attrib=SCAN_ATTRIB)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
@@ -5204,16 +5281,10 @@ def scan_loop_view(start_v, end_v, km, level, buf=150, log=lambda *_: None, prog
         c["score"] = (w_green * c["green"] - REP_W * c["rep"] - 0.25 * mu * c["noise"]
                       - 2.0 * abs(c["dist"] / target - 1))
     cands.sort(key=lambda c: -c["score"])
-    picked = []
     for c in cands:
-        if abs(c["dist"] / target - 1) > 0.25:
-            continue
-        ks = _grid_keys(_route_ll(c["route"]))
-        if all(len(ks & p["ks"]) / max(len(ks | p["ks"]), 1) < 0.6 for p in picked):
-            c["ks"] = ks
-            picked.append(c)
-        if len(picked) == 3:
-            break
+        c["es"] = _grid_keys(_route_ll(c["route"]))
+    picked = pick_diverse(cands, lambda c: c["dist"] / target - 1,
+                          passes=((0.25, 0.6), (0.25, 0.8), (0.35, 0.8), (0.35, 0.92)))
     if not picked:
         picked = cands[:1]
     t1, t2 = lab1.split(" · ")[0], lab2.split(" · ")[0]
@@ -5304,7 +5375,7 @@ def tour_bboxes(pts, extra_m=0.0):
     return need, load, span
 
 
-def tour_path(area, g, lam, mu, wq, nodes):
+def tour_path(area, g, lam, mu, wq, nodes, pen=None):
     """Teilstrecken Start -> Zwischenziele -> Ende, jede grün-optimal; schon gelaufene Wegstücke werden
     teurer, damit der Rückweg möglichst ein anderer ist. marks: Index der Zwischenziele im Pfad."""
     H, L = area["H"], area["lengths"]
@@ -5316,6 +5387,8 @@ def tour_path(area, g, lam, mu, wq, nodes):
     full, marks = [nodes[0]], []
     usedm = np.zeros(len(L), dtype=bool)
     base = L * (1 + lam * (1 - g) + mu * nz + wq * wd + ap)
+    if pen is not None:  # bestimmte Wegstücke verteuern (für eine bewusst andere Strecke)
+        base = base * (1 + 2.0 * pen)
     for s_, e in zip(nodes[:-1], nodes[1:]):
         if s_ != e:
             p = fast_path(area, np.where(usedm, base * LOOP_REUSE_PENALTY, base), s_, e)
@@ -5364,45 +5437,56 @@ def tour_extra_variants(area, g, lam, mu, wq, nodes, extra_m):
     for c in cands:
         c["score"] = c["green"] - REP_W * c["rep"] - 0.4 * mu * c["noise"] - 2.0 * abs(c["got"] / extra_m - 1)
     cands.sort(key=lambda c: -c["score"])
-    picked = []
     for c in cands:
-        if abs(c["got"] / extra_m - 1) > 0.35:
-            continue
-        es = edge_set(c["path"])
-        if all(len(es & p["es"]) / len(es | p["es"]) < 0.6 for p in picked):
-            c["es"] = es
-            picked.append(c)
-        if len(picked) == 3:
-            break
-    return picked
+        c["es"] = edge_set(c["path"])
+    return pick_diverse(cands, lambda c: c["got"] / extra_m - 1,
+                        passes=((0.35, 0.6), (0.35, 0.8), (0.6, 0.8), (0.6, 0.92)))
+
+
+def tour_default(level):
+    """Welche Variante beim Öffnen vorgewählt ist: der Regler „Wie grün“ entscheidet zwischen Wenig und Viel grün."""
+    return VAR_LOW if level == "Ausgewogen" else VAR_HIGH
+
+
+TOUR_LADDER = ((1.5, 1.0, 0.0), (3.0, 1.0, 0.0), (6.0, 1.0, 0.0), (8.0, 4.0, 6.0), (14.0, 4.0, 6.0), (40.0, 6.0, 10.0))
+
+
+def tour_variants(area, g, nodes):
+    """Ründchen mit Zwischenzielen: Schnellste, Wenig grün, Viel grün (+ Extrem grün) als [(Name, Strecke)], Strecken mit
+    "path", "marks", "dist", "green", "rep", "noise"."""
+    def run(lam, mu, wq, pen=None):
+        path, marks = tour_path(area, g, lam, mu, wq, nodes, pen)
+        st_ = loop_stats(area, g, path)
+        if not st_:
+            return {"path": path, "marks": marks, "dist": 1e12, "green": 0.0, "rep": 1.0, "noise": 0.0, "ks": {}}
+        return {"path": path, "marks": marks, "dist": st_[0], "green": st_[1], "rep": st_[2], "noise": st_[3],
+                "ks": edge_ks(area, path)}
+
+    def alt(taken):  # Notlösung: schon gewählte Wege verteuern
+        pen = np.zeros(len(area["lengths"]))
+        for c in taken:
+            pen[list(c["ks"])] = 1.0
+        return run(1.5, 1.0, 0.0, pen)
+
+    short = run(0.0, 0.0, 0.0)
+    pool = [short] + [run(*step) for step in TOUR_LADDER]
+    sink = []
+    greenest_within(run, (1 + EXTREME_DETOUR) * short["dist"], sink)
+    return pick_variants(short, dedupe_paths(pool + sink), alt)
 
 
 def tour_extreme(area, g, nodes, extra_m, existing=()):
-    """Ründchen mit Zwischenziel „Extrem grün“: bis 35 % länger als der direkte Weg über die Zwischenziele (mit
-    Extra-Strecke: als Wunschweg + Extra), aber über 70 % Grün. Ergebnis {"path", "marks", "dist", "green", ...} oder None."""
+    """Ründchen mit Zwischenzielen und Extra-Strecke „Extrem grün“: bis 35 % länger als der direkte Weg über die Zwischenziele
+    plus Extra-Strecke, aber über 70 % Grün. Ergebnis {"path", "marks", "dist", "green", ...} oder None."""
     p0, _ = tour_path(area, g, 0.0, 0.0, 0.0, nodes)
     st0 = loop_stats(area, g, p0)
     if not st0:
         return None
     budget = (1 + EXTREME_DETOUR) * (st0[0] + extra_m)
-    have = {tuple(x) for x in existing}
-    if extra_m > 0:
-        q = LEVEL_QUIET["Grünster Umweg"]
-        vs = tour_extra_variants(area, g, LEVELS["Grünster Umweg"], q[0], q[1], nodes, extra_m * 1.1)
-        ok = [v for v in vs if v["dist"] <= budget and v["green"] > EXTREME_GREEN_MIN and tuple(v["path"]) not in have]
-        return max(ok, key=lambda v: v["green"] - REP_W * v["rep"]) if ok else None
-
-    def run(lam, mu, wq):
-        path, marks = tour_path(area, g, lam, mu, wq, nodes)
-        st_ = loop_stats(area, g, path)
-        if not st_:
-            return {"path": path, "marks": marks, "dist": 1e12, "green": 0.0, "rep": 1.0, "noise": 0.0}
-        return {"path": path, "marks": marks, "dist": st_[0], "green": st_[1], "rep": st_[2], "noise": st_[3]}
-
-    best = greenest_within(run, budget)
-    if best and best["green"] > EXTREME_GREEN_MIN and tuple(best["path"]) not in have:
-        return best
-    return None
+    q = LEVEL_QUIET["Grünster Umweg"]
+    vs = tour_extra_variants(area, g, LEVELS["Grünster Umweg"], q[0], q[1], nodes, extra_m * 1.1)
+    ok = [v for v in vs if v["dist"] <= budget and v["green"] > EXTREME_GREEN_MIN and not too_similar(v["path"], existing)]
+    return max(ok, key=lambda v: v["green"] - REP_W * v["rep"]) if ok else None
 
 
 def _tour_payload(mode_extra, p1, pe, t1, t2, stops, options, parks, default, attrib=None, water=None, dogz=None):
@@ -5450,22 +5534,24 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
             runs.append((f"Variante {i + 1}", v["path"], v["marks"],
                          f"Extra {fmt_km(v['got'])} (Wunsch +{extra_km} km) · "))
     else:
-        for name in TOUR_LEVELS:
-            mu, wq = level_quiet(name)
-            try:
-                path, marks = tour_path(area, g, LEVELS[name], mu, wq, nodes)
-            except (nx.NetworkXNoPath, nx.NodeNotFound):
-                raise ValueError("Zwischen den Punkten gibt es keinen Fußweg im geladenen Gebiet.")
-            runs.append((name, path, marks, f"{LEVEL_HINT[name]} · "))
+        try:
+            for name, v in tour_variants(area, g, nodes):
+                runs.append((name, v["path"], v["marks"],
+                             (extreme_hint(" · ") if name == EXTREME_NAME else f"{VAR_HINT[name]} · ")))
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            raise ValueError("Zwischen den Punkten gibt es keinen Fußweg im geladenen Gebiet.")
     ext_ok = None
-    try:  # Zusatz: „Extrem grün“ (bis 35 % Umweg, über 70 % Grün)
-        log("🌿 Extrem grüne Variante suchen")
-        ext = tour_extreme(area, g, nodes, extra_m, [r_[1] for r_ in runs])
-        ext_ok = bool(ext)
-        if ext:
-            runs.append((EXTREME_NAME, ext["path"], ext["marks"], extreme_hint(" · ")))
-    except (nx.NetworkXNoPath, nx.NodeNotFound):
-        pass
+    if extra_m > 0:
+        try:  # Zusatz: „Extrem grün“ (bis 35 % Umweg, über 70 % Grün)
+            log("🌿 Extrem grüne Variante suchen")
+            ext = tour_extreme(area, g, nodes, extra_m, [r_[1] for r_ in runs])
+            ext_ok = bool(ext)
+            if ext:
+                runs.append((EXTREME_NAME, ext["path"], ext["marks"], extreme_hint(" · ")))
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            pass
+    else:
+        ext_ok = any(r_[0] == EXTREME_NAME for r_ in runs)
     for name, path, marks, pre in runs:
         key = tuple(path)
         if key in seen:
@@ -5482,14 +5568,13 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
         mins = max(1, round(dist / M_PER_MIN))
         options.append(_option(
             nav, name, f"{fmt_km(dist)} · {green:.0%} grün",
-            f"{pre}{1 - rep:.0%} ohne Doppelweg" + (f" · {narrow:.0%} kleine Wege" if LEVELS.get(level if (extra_m > 0 and name != EXTREME_NAME) else name,
-                                                                                                LEVELS["Grünster Umweg"]) >= 12 else "")
+            f"{pre}{1 - rep:.0%} ohne Doppelweg" + (f" · {narrow:.0%} kleine Wege" if (name in (VAR_HIGH, EXTREME_NAME) or (extra_m > 0 and LEVELS[level] >= 12)) else "")
             + (water_note(area, path) if _water() else ""),
             [["Länge", fmt_km(dist)], ["Dauer", f"{mins} min"], ["Grünanteil", f"{green:.0%}"],
              ["Hauptstraße", f"{noise:.0%}"]], area=area, path=path))
     if not options:
         raise ValueError("Ich konnte keine Runde mit diesen Zwischenzielen finden.")
-    default = next((i for i, o_ in enumerate(options) if o_["label"] == level), 0)
+    default = next((i for i, o_ in enumerate(options) if o_["label"] == (level if extra_m > 0 else tour_default(level))), 0)
     if ext_ok is False and options:
         options[default]["hint"] += extreme_note(False)
     payload = _tour_payload(None, pts[0], pts[-1], names[0], names[-1], stops, options, parks_geo(area), default,
@@ -5595,7 +5680,7 @@ def scan_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
         legs.append([(rt, x, _grid_keys(_route_ll(rt))) for rt, x in sc])
     loop = pts[0] == pts[-1]
     title = " → ".join(names)
-    options, seen = [], set()
+    options = []
     if extra_m > 0:
         lam, mu = LEVELS[level], level_quiet(level)[0]
         chosen, used = [], set()
@@ -5617,35 +5702,51 @@ def scan_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
                 nav, f"Variante {i + 1}", f"{fmt_km(c['sc']['dist'])} · {c['sc']['green']:.0%} grün",
                 f"Extra {fmt_km(c['got'])} (Wunsch +{extra_km} km) · {1 - c['sc']['rep']:.0%} ohne Doppelweg{scan_water_note(c['sc'])}",
                 c["sc"]))
-        runs_levels = []
     else:
-        runs_levels = TOUR_LEVELS
-    for name in runs_levels:
-        lam, mu = LEVELS[name], level_quiet(name)[0]
-        chosen, used = [], set()
-        for cands in legs:
-            def cost(c):
-                rt, x, ks = c
-                ov = len(ks & used) / max(len(ks), 1) if used else 0.0
-                return x["dist"] * (1 + lam * (1 - x["green"]) + mu * x["noise"]) * (1 + 1.5 * ov)
-            best = min(cands, key=cost)
-            chosen.append(best)
-            used |= best[2]
-        key = tuple(id(c[0]) for c in chosen)
-        if key in seen:
-            continue
-        seen.add(key)
-        merged, marks = _merge_routes([c[0] for c in chosen])
-        sc = scan_score(sa, _route_ll(merged), buf)
-        nav = osrm_nav(merged, title)
-        if not nav or sc["dist"] <= 0:
-            continue
-        nav = _add_waypoint_steps(nav, marks[:-1], names[1:-1])
-        options.append(_scan_option(nav, name, f"{fmt_km(sc['dist'])} · {sc['green']:.0%} grün",
-                                    f"{LEVEL_HINT[name]} · {1 - sc['rep']:.0%} ohne Doppelweg{scan_water_note(sc)}", sc))
+        def assemble(lam, mu):
+            chosen, used = [], set()
+            for cands in legs:
+                def cost(c):
+                    rt, x, ks = c
+                    ov = len(ks & used) / max(len(ks), 1) if used else 0.0
+                    return x["dist"] * (1 + lam * (1 - x["green"]) + mu * x["noise"]) * (1 + 1.5 * ov)
+                best = min(cands, key=cost)
+                chosen.append(best)
+                used |= best[2]
+            merged, marks = _merge_routes([c[0] for c in chosen])
+            sc = scan_score(sa, _route_ll(merged), buf)
+            if sc["dist"] <= 0:
+                return None
+            ks = {}
+            for c in chosen:
+                for k in c[2]:
+                    ks[k] = 1.0
+            return {"merged": merged, "marks": marks, "sc": sc, "dist": sc["dist"], "green": sc["green"],
+                    "rep": sc["rep"], "ks": ks}
+
+        pool, seen_ = [], set()
+        for lam, mu in ((0.0, 0.0), (0.7, 1.0), (1.5, 1.0), (2.5, 1.0), (4.0, 1.0), (6.0, 1.0), (8.0, 1.0),
+                        (8.0, 4.0), (14.0, 4.0), (25.0, 4.0), (40.0, 6.0)):
+            c = assemble(lam, mu)
+            if c is None:
+                continue
+            key = tuple(sorted(c["ks"]))
+            if key not in seen_:
+                seen_.add(key)
+                pool.append(c)
+        if pool:
+            for name, c in pick_variants(pool[0], pool):
+                sc = c["sc"]
+                nav = osrm_nav(c["merged"], title)
+                if not nav:
+                    continue
+                nav = _add_waypoint_steps(nav, c["marks"][:-1], names[1:-1])
+                pre = extreme_hint(" · ") if name == EXTREME_NAME else f"{VAR_HINT[name]} · "
+                options.append(_scan_option(nav, name, f"{fmt_km(sc['dist'])} · {sc['green']:.0%} grün",
+                                            f"{pre}{1 - sc['rep']:.0%} ohne Doppelweg{scan_water_note(sc)}", sc))
     if not options:
         raise ValueError("Ich konnte keine Runde mit diesen Zwischenzielen finden.")
-    default = next((i for i, o_ in enumerate(options) if o_["label"] == level), 0)
+    default = next((i for i, o_ in enumerate(options) if o_["label"] == (level if extra_m > 0 else tour_default(level))), 0)
     payload = _tour_payload(None, pts[0], pts[-1], names[0], names[-1], stops, options, sa["geo"], default,
                             attrib=SCAN_ATTRIB, water=sa.get("wgeo"))
     return {"mode": "tour", "html": map_html(payload), "p1": pts[0], "p2": pts[-1], "t1": names[0],
@@ -8811,7 +8912,9 @@ def home_tour():
         st.caption(SEARCH_TIP)
         extra_km = st.slider("Extra Strecke (km, optional)", 0, 10, 0, 1, key="tour_extra_km",
                              help="Verlängert die Runde um diese Strecke, zusätzlich zum Weg über die Zwischenziele. 0 = keine.")
-        level = st.select_slider("Wie grün soll es sein?", options=TOUR_LEVELS, value="Sehr grün", key="level_tour")
+        level = st.select_slider("Wie grün soll es sein?", options=TOUR_LEVELS, value="Sehr grün", key="level_tour",
+                                 help="Du bekommst immer alle Varianten (Schnellste, Wenig grün, Viel grün, wenn möglich Extrem grün) "
+                                      "zur Auswahl. Der Regler bestimmt nur, welche zuerst gezeigt wird. Mit Extra Strecke legt er das Grün-Gewicht fest.")
         water_on = st.toggle("💧 Wassernähe bevorzugen", key="water_tour", value=False,
                              help="Führt die Route bevorzugt an Seen, Teichen und Flüssen entlang – für zusätzliche Entspannung.")
         san_reach = san_settings("tour")
