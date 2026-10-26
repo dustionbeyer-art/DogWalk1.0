@@ -612,9 +612,50 @@ def _safe_poi(label, lat, lon):
         return []
 
 
+def _tile_kw_items(selectors, lat, lon, radius):
+    """Orte zu den Auswahlen (Tags) aus den freien Vektorkacheln (OpenFreeMap, POI-Ebene): schnell, lokal
+    zwischengespeichert und unabhängig von Overpass. Format wie _nearby_multi."""
+    tpl = _ofm_template()
+    dlat = radius / 110540.0
+    dlon = dlat / max(math.cos(math.radians(lat)), 0.3)
+    x0, y1 = _tile_of(lat - dlat, lon - dlon, VT_ZOOM)
+    x1, y0 = _tile_of(lat + dlat, lon + dlon, VT_ZOOM)
+    tiles = [(x, y) for x in range(min(x0, x1), max(x0, x1) + 1) for y in range(min(y0, y1), max(y0, y1) + 1)]
+    if len(tiles) > 36:
+        tiles = sorted(tiles, key=lambda t: abs(t[0] - (x0 + x1) / 2) + abs(t[1] - (y0 + y1) / 2))[:36]
+    kvs = [_sel_kv(x) for x in selectors]
+    vals = {v for k, v in kvs if k}
+    with ThreadPoolExecutor(max_workers=6) as ex_:
+        datas = list(ex_.map(lambda t: _fetch_tile(tpl, VT_ZOOM, t[0], t[1]), tiles))
+    res = []
+    for (tx, ty), data in zip(tiles, datas):
+        if not data:
+            continue
+        for extent, gtype, parts, props in mvt_decode(data, {"poi"}).get("poi", []):
+            if gtype != 1 or not parts:
+                continue
+            name = props.get("name") or props.get("name:latin") or ""
+            cls, sub = str(props.get("class") or ""), str(props.get("subclass") or "")
+            hit = {sub} & vals or {cls} & vals  # subclass ist der OSM-Wert, class nur die grobe Gruppe
+            if not name or not hit:
+                continue
+            kv = frozenset((k, v) for k, v in kvs if k and v in hit)
+            for part in parts:
+                lons, lats = _tile_lonlat(tx, ty, VT_ZOOM, extent, part[:1])
+                la, lo = float(lats[0]), float(lons[0])
+                if dist_m((lat, lon), (la, lo)) <= radius * 1.1:
+                    res.append((la, lo, str(name), "", "", kv))
+    return res
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _tile_kw_cached(selectors, lat, lon, radius):
+    return _tile_kw_items(selectors, lat, lon, radius)
+
+
 def keyword_places(term, bias):
     """Schlagwort -> nahe Orte als Vorschläge (nach Entfernung, jedes Geschäft nur einmal).
-    Erst 1 km, dann 2,5 km, dann 6 km Umkreis."""
+    Zwei unabhängige Quellen gleichzeitig: Vektorkacheln (schnell, lokal) und Overpass (vollständig, mit Adresse)."""
     if not bias:
         return []
     defs = _cat_defs(term)
@@ -622,7 +663,6 @@ def keyword_places(term, bias):
         return []
     lat, lon = round(bias[0], 3), round(bias[1], 3)
     allsel = tuple(sorted({sel for _, _, sels in defs for sel in sels}))
-    items = []
 
     def near(radius):
         try:
@@ -630,24 +670,39 @@ def keyword_places(term, bias):
         except Exception:
             return None
 
-    # Kleiner und mittlerer Umkreis gleichzeitig; der große nur, wenn beide zu wenig liefern
-    with ThreadPoolExecutor(max_workers=2) as ex_:
-        r_small, r_mid = ex_.map(near, (1000, 2500))
-    ok_any = r_small is not None or r_mid is not None
-    items = r_small if (r_small is not None and len(r_small) >= 6) else (r_mid or r_small or [])
-    if ok_any and len(items) < 6:
-        big = near(6000)
-        if big:
-            items = big
+    def tiles(radius):
+        try:
+            return [it for it in _tile_kw_cached(allsel, lat, lon, radius) if it[2]]
+        except Exception:
+            return None
+
+    from concurrent.futures import wait as _wait
+    t0 = time.time()
+    ex_ = ThreadPoolExecutor(max_workers=4)
+    f_t, f_s, f_m = ex_.submit(tiles, 2500), ex_.submit(near, 1000), ex_.submit(near, 2500)
+    _wait([f_t], timeout=7.0)  # die Kacheln sind meist in 1-2 s da
+    have_t = f_t.done() and f_t.result() is not None and len(f_t.result()) >= 6
+    _wait([f_s, f_m], timeout=max(0.5, (2.5 if have_t else 9.0) - (time.time() - t0)))
+    results = [f.result() for f in (f_t, f_s, f_m) if f.done() and f.result() is not None]
+    items = [it for r_ in results for it in r_]
+    n_places = len(merge_same_places(items, bias))
+    if n_places < 6:
+        # zu wenig im Umkreis: größeren Umkreis aus beiden Quellen
+        f_tb, f_b = ex_.submit(tiles, 5500), ex_.submit(near, 6000)
+        _wait([f_tb, f_b], timeout=8.0)
+        for f in (f_tb, f_b):
+            if f.done() and f.result():
+                items += f.result()
+    ex_.shutdown(wait=False)
     if not items:
-        # Ersatz: Nominatim (andere Server, anderer Zugang), auch wenn Overpass nur leer antwortet
-        with ThreadPoolExecutor(max_workers=3) as ex_:
-            for part in ex_.map(lambda lb: _safe_poi(lb, lat, lon), [lb for _, lb, _s in defs[:3]]):
+        # Ersatz: Nominatim (andere Server, anderer Zugang)
+        with ThreadPoolExecutor(max_workers=3) as ex2:
+            for part in ex2.map(lambda lb: _safe_poi(lb, lat, lon), [lb for _, lb, _s in defs[:3]]):
                 items += part
-    items.sort(key=lambda it: dist_m((bias[0], bias[1]), (it[0], it[1])))
+    items.sort(key=lambda it: (dist_m((bias[0], bias[1]), (it[0], it[1])), 0 if it[3] else 1))
     groups = merge_same_places(items, bias)
     out = []
-    for g in groups[:40]:
+    for g in groups[:60]:
         cats = []  # passende Kategorien, in der Reihenfolge der Suchbegriff-Treffer
         for icon, label, sels in defs:
             kvs = {_sel_kv(x) for x in sels}
@@ -784,6 +839,28 @@ def coord_from_text(term):
     return None
 
 
+def _search_bias():
+    """Bezugspunkt der Suche (für Schlagworte wie „Bier“ und für die Umkreissuche): Startpunkt, sonst geteilter
+    Standort, sonst ein bereits gewählter Startpunkt eines Reiters, sonst der zuletzt bekannte Punkt."""
+    ss = st.session_state
+    for getter in (lambda: ss.get("bias"),
+                   lambda: ss.get("loc_shared"),
+                   lambda: next((_unpack(v)[:2] for k, v in list(ss.items())
+                                 if isinstance(k, str) and k.startswith("_keep_") and k.endswith("_a_sb") and v), None),
+                   lambda: next((_unpack(v)[:2] for k, v in list(ss.items())
+                                 if isinstance(k, str) and k.startswith("_keep_") and v), None),
+                   lambda: ss.get("_bias_last")):
+        try:
+            b = getter()
+            if b and b[0] is not None and b[1] is not None and abs(float(b[0])) > 0.5:
+                b = (float(b[0]), float(b[1]))
+                ss["_bias_last"] = b
+                return b
+        except Exception:
+            continue
+    return None
+
+
 def search_places(term):
     """Ziel-/Zwischenziel-Suche: zuerst im 10-km-Umfeld des Startpunkts."""
     return _search_places(term, False)
@@ -806,7 +883,7 @@ def _search_places(term, free):
     if ll:
         lab = f"📍 Koordinaten · {ll[0]:.5f}, {ll[1]:.5f}"
         return [(lab, _pack(ll[0], ll[1], lab))]
-    bias = st.session_state.get("bias")
+    bias = _search_bias()
     blat, blon = (round(bias[0], 2), round(bias[1], 2)) if bias else (None, None)
 
     def ask(q, tag=None, box=False):
@@ -1925,9 +2002,10 @@ def _area_lookup(bbox):
     return None
 
 
-def load_area_any(bbox, own=None):
-    """Wie load_area, nutzt aber ein schon geladenes (oder gerade ladendes) Gebiet, das den Bedarf abdeckt. Wer in
-    der Nähe schon einmal gerechnet hat, wartet so nicht erneut auf die Kartenserver."""
+def load_area_any(bbox, own=None, load_bbox=None):
+    """Wie load_area, nutzt aber ein schon geladenes (oder gerade ladendes) Gebiet, das den Bedarf (bbox) abdeckt. Wer in
+    der Nähe schon einmal gerechnet hat, wartet so nicht erneut auf die Kartenserver. Muss nachgeladen werden, wird
+    load_bbox (etwas größer, in Stufen) geladen, damit Änderungen wie die Extra-Strecke kein neues Gebiet brauchen."""
     ar = _area_lookup(bbox)
     if ar is not None:
         return ar
@@ -1938,9 +2016,9 @@ def load_area_any(bbox, own=None):
         ar = _area_lookup(bbox)
         if ar is not None:
             return ar
-    ar = load_area(bbox)
+    ar = load_area(load_bbox or bbox)
     with _AREA_LOCK:
-        _AREA_REG.append((tuple(ar.get("bbox") or bbox), ar))
+        _AREA_REG.append((tuple(ar.get("bbox") or load_bbox or bbox), ar))
         del _AREA_REG[:-3]
     return ar
 
@@ -1948,23 +2026,25 @@ def load_area_any(bbox, own=None):
 _PREWARMED = set()
 
 
-def prewarm(lat, lon):
-    """Sobald der Standort bekannt ist, im Hintergrund Wegenetz (für ein Ründchen von ca. 3 km und Routen in der Nähe)
-    und Grünflächen holen. Die erste Berechnung findet die Daten dann schon vor."""
-    key = (round(lat, 2), round(lon, 2))
+def _prewarm_bbox(bb, key, need=None):
+    """Gebiet bb im Hintergrund laden (samt Gewässerdaten), falls es nicht schon da ist oder gerade geladen wird."""
     if key in _PREWARMED:
-        return
+        return False
     _PREWARMED.add(key)
     if len(_PREWARMED) > 100:
         _PREWARMED.clear()
-    bb = loop_bbox((lat, lon), (lat, lon), LOAD_TIERS[0] * 1000)
+    need = need or bb
+    if _area_lookup(need) is not None:
+        return False
     ev = threading.Event()
     with _AREA_LOCK:
+        if any(_bbox_covers(pb, need) for pb, _e in _AREA_PEND):
+            return False
         _AREA_PEND.append((bb, ev))
 
     def work():
         try:
-            ar_ = load_area_any(bb, own=ev)
+            ar_ = load_area_any(need, own=ev, load_bbox=bb)
             try:
                 scan_water_geo(tuple(ar_["bbox"]))  # Gewässerdaten schon bereit, falls „Wassernähe“ gewählt wird
             except Exception:
@@ -1978,6 +2058,18 @@ def prewarm(lat, lon):
                 except ValueError:
                     pass
             ev.set()
+    threading.Thread(target=work, daemon=True).start()
+    return True
+
+
+def prewarm(lat, lon):
+    """Sobald der Standort bekannt ist, im Hintergrund Wegenetz (für ein Ründchen von ca. 3 km und Routen in der Nähe)
+    und Grünflächen holen. Die erste Berechnung findet die Daten dann schon vor."""
+    key = (round(lat, 2), round(lon, 2))
+    if key in _PREWARMED:
+        return
+    bb = loop_bbox((lat, lon), (lat, lon), LOAD_TIERS[0] * 1000)
+    _prewarm_bbox(bb, key)
 
     def work_green():
         try:
@@ -1986,8 +2078,19 @@ def prewarm(lat, lon):
                 _green_part(glat, glon, GREEN_RADIUS + 900, v)
         except Exception:
             pass
-    threading.Thread(target=work, daemon=True).start()
     threading.Thread(target=work_green, daemon=True).start()
+
+
+def prewarm_tour(start_v, stops_v, end_v, extra_km):
+    """Ründchen mit Zwischenziel: sobald Start und Ziele gewählt sind (noch vor dem Klick auf „finden“), das passende
+    Gebiet im Hintergrund laden. Wer danach noch Länge, Grünstufe oder Optionen einstellt, muss nicht mehr warten."""
+    try:
+        pts, _n, _s = tour_points(start_v, stops_v, end_v)
+        need, load, span = tour_bboxes(pts, extra_km * 1000.0)
+        if span <= MAX_SPAN_M:
+            _prewarm_bbox(load, ("tour",) + tuple(round(x, 3) for x in load), need)
+    except Exception:
+        pass
 
 
 def green_center(lat, lon):
@@ -3445,7 +3548,7 @@ def dog_osrm_check(coords):
     pad = 0.0015
     s, w = math.floor((min(la) - pad) * 100) / 100, math.floor((min(lo) - pad) * 100) / 100
     n, e = math.ceil((max(la) + pad) * 100) / 100, math.ceil((max(lo) + pad) * 100) / 100
-    rings = dog_zone_rings_async(round(s, 2), round(w, 2), round(n, 2), round(e, 2)).result(timeout=30)
+    rings = dog_zone_rings_async(round(s, 2), round(w, 2), round(n, 2), round(e, 2)).result(timeout=16)
     if not rings:
         return 0.0, [], []
     boxes = [(min(p[0] for p in r), min(p[1] for p in r), max(p[0] for p in r), max(p[1] for p in r)) for _, r in rings]
@@ -4562,6 +4665,15 @@ def points_bbox(pts, extra_m=0.0):
             round(max(lons) + pad / kx, 4), round(max(lats) + pad / ky, 4)), span
 
 
+def tour_bboxes(pts, extra_m=0.0):
+    """(benötigtes Gebiet, zu ladendes Gebiet, Abstand der Punkte). Geladen wird für die nächsthöhere Stufe der
+    Extra-Strecke (2/4/7/10 km), damit ein Verschieben des Reglers kein neues Gebiet braucht."""
+    need, span = points_bbox(pts, extra_m)
+    tier = 0.0 if extra_m <= 0 else next((t for t in (2000.0, 4000.0, 7000.0, 10000.0) if extra_m <= t), extra_m)
+    load, _ = points_bbox(pts, tier)
+    return need, load, span
+
+
 def tour_path(area, g, lam, mu, wq, nodes):
     """Teilstrecken Start -> Zwischenziele -> Ende, jede grün-optimal; schon gelaufene Wegstücke werden
     teurer, damit der Rückweg möglichst ein anderer ist. marks: Index der Zwischenziele im Pfad."""
@@ -4649,14 +4761,15 @@ def _tour_payload(mode_extra, p1, pe, t1, t2, stops, options, parks, default, at
 def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None, extra_km=0):
     pts, names, stops = tour_points(start_v, stops_v, end_v)
     extra_m = extra_km * 1000.0
-    bbox, span = points_bbox(pts, extra_m)
+    bbox, load_bb, span = tour_bboxes(pts, extra_m)
     if span > MAX_SPAN_M:
         raise ValueError(f"Die Punkte liegen {span / 1000:.1f} km auseinander. "
                          f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
     log("🗺️ Wegenetz und Grünflächen laden")
     t0 = time.time()
-    prefetch_water(bbox)
-    area = load_area_any(bbox)
+    have = _area_lookup(bbox)
+    prefetch_water(tuple(have["bbox"]) if have is not None and have.get("bbox") else load_bb)
+    area = load_area_any(bbox, load_bbox=load_bb)
     log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
     ensure_water(area, log)
     nodes = [nearest_node(area, *p) for p in pts]
@@ -4918,7 +5031,7 @@ FEAT_QUERIES = {
     "san": 'nwr["amenity"="toilets"]',
     "play": 'nwr["leisure"="playground"]',
     "dogrun": ('nwr["leisure"="dog_park"];nwr["dog"="off_leash"];'
-               'nwr["leisure"]["name"~"Hundewiese|Hundeauslauf|Hundefreilauf|Freilauffläche|Hundespielwiese",i]'),
+               'nwr["leisure"~"^(park|garden|pitch|common|nature_reserve)$"]["name"~"Hundewiese|Hundeauslauf|Hundefreilauf|Freilauffläche|Hundespielwiese",i]'),
     "sport": 'nwr["leisure"~"^(pitch|fitness_station|sports_centre|skate_park|dog_park|track)$"];nwr["amenity"="boat_rental"]',
     "water": 'wr["natural"="water"];wr["landuse"~"^(reservoir|basin)$"];wr["waterway"~"^(river|canal|riverbank)$"]',
     "access": 'nwr["amenity"="toilets"]["wheelchair"~"^(yes|designated)$"];wr["highway"~"^(footway|path|pedestrian|cycleway)$"]["wheelchair"~"^(yes|designated)$"];nwr["leisure"~"^(park|playground|garden)$"]["wheelchair"~"^(yes|designated)$"]',
@@ -4947,10 +5060,21 @@ def _green_part(lat, lon, r, sel):
         if not chunk:
             continue
         try:
-            return _overpass_race(q, to, chunk)
+            res = _overpass_race(q, to, chunk)
+            _GP_OK.add((lat, lon, r, sel))
+            return res
         except Exception as e:
             last = e
     raise last or RuntimeError("Overpass nicht erreichbar")
+
+
+_GP_OK = set()  # (lat, lon, r, Auswahl) der Abfragen, die schon im Zwischenspeicher liegen
+
+
+def _green_ready(lat, lon, r, cats):
+    """Liegen alle Abfragen für diesen Umkreis schon im Zwischenspeicher (z. B. durch das Vorwärmen)?"""
+    sels = list(GREEN_QUERIES.values()) + [FEAT_QUERIES[c] for c in cats]
+    return all((lat, lon, r, v) in _GP_OK for v in sels)
 
 
 def _green_fetch(lat, lon, r, cats):
@@ -5208,7 +5332,7 @@ def green_inside_point(g, pos):
     typ, oid = g.get("id", (None, None))
     if not typ or not oid:
         return None
-    js = _overpass_race(f"[out:json][timeout:20];{typ}({oid});out geom;", 20.0, _ranked_mirrors()[:3])
+    js = _overpass_race(f"[out:json][timeout:10];{typ}({oid});out geom;", 8.0, _ranked_mirrors()[:3])
     el = (js.get("elements") or [None])[0]
     if not el:
         return None
@@ -5311,14 +5435,70 @@ def _nominatim_greens(pos):
     return out
 
 
+GREEN_NEAR_RADIUS = 4500
+
+
+def _green_good(ranked, use_p):
+    """Reicht das Ergebnis, um nicht weiter zu suchen? Mehrere Kandidaten, und (falls Ausstattung gewünscht)
+    mindestens einer der ersten davon hat sie."""
+    if len(ranked) < 3:
+        return False
+    return (not use_p) or any(all(c in g["counts"] for c in use_p) for g in ranked[:3])
+
+
+def _green_progressive(clat, clon, cats, prefer, avoid, size_range, pos, log):
+    """Erst der nahe Umkreis (schnell, kleine Abfragen), der große nur bei Bedarf. Liegt der große schon im
+    Zwischenspeicher (Vorwärmen), wird gleich er genommen. Rückgabe: greens, feats, ausgefallene, Rangliste."""
+    big_r = GREEN_RADIUS + 900
+    if _green_ready(clat, clon, big_r, cats):
+        g_, f_, fl_ = _green_fetch(clat, clon, big_r, cats)
+        return g_, f_, fl_, None
+    ex = ThreadPoolExecutor(max_workers=2)
+    f_small = ex.submit(_green_fetch, clat, clon, GREEN_NEAR_RADIUS, cats)
+    f_big = None
+    t0 = time.time()
+    small = None
+    try:
+        small = f_small.result(timeout=4.0)  # meist schnell da
+    except Exception:
+        f_big = ex.submit(_green_fetch, clat, clon, big_r, cats)  # langsam oder gescheitert: den großen schon starten
+        try:
+            small = f_small.result(timeout=14.0)
+        except Exception:
+            small = None
+    ranked = None
+    if small is not None:
+        g_, f_, fl_ = small
+        up = [c for c in prefer if c not in fl_]
+        ua = [c for c in avoid if c not in fl_]
+        ranked = rank_greens(g_, f_, up, ua, size_range, pos)
+        if _green_good(ranked, up):
+            ex.shutdown(wait=False)
+            if f_big is None:
+                log("🌳 Grünflächen in der Nähe gefunden")
+            return g_, f_, fl_, ranked
+    log("🌳 Zu wenig Passendes in der Nähe, ich suche im Umkreis von 10 km")
+    if f_big is None:
+        f_big = ex.submit(_green_fetch, clat, clon, big_r, cats)
+    ex.shutdown(wait=False)
+    try:
+        return (*f_big.result(timeout=max(8.0, 30.0 - (time.time() - t0))), None)
+    except Exception:
+        if small is not None:
+            return small[0], small[1], small[2], ranked  # lieber das Nahe als gar nichts
+        raise
+
+
 def find_green(pos, prefer, avoid, size_range, log=lambda *_: None):
     """Beste Grünfläche samt Hinweisen. Fehlende Daten führen nie zum Abbruch: es wird gelockert, ausgewichen
     und der Hinweis später an der Route angezeigt."""
-    log("🌳 Grünflächen im Umkreis von 10 km suchen")
+    log("🌳 Grünflächen in der Nähe suchen")
     cats = list(dict.fromkeys(list(prefer) + list(avoid)))
     greens, feats, failed = [], [], []
+    clat, clon = green_center(pos[0], pos[1])
+    ranked = None
     try:
-        greens, feats, failed = _green_fetch(*green_center(pos[0], pos[1]), GREEN_RADIUS + 900, cats)
+        greens, feats, failed, ranked = _green_progressive(clat, clon, cats, prefer, avoid, size_range, pos, log)
     except Exception:
         log("⚠️ Kartenserver antworten nicht, ich nutze die Ortssuche")
     if failed:
@@ -5327,7 +5507,8 @@ def find_green(pos, prefer, avoid, size_range, log=lambda *_: None):
     use_p = [c for c in prefer if c not in failed]
     use_a = [c for c in avoid if c not in failed]
     note = ""
-    ranked = rank_greens(greens, feats, use_p, use_a, size_range, pos)
+    if ranked is None:
+        ranked = rank_greens(greens, feats, use_p, use_a, size_range, pos)
     if not ranked and greens:
         log("ℹ️ Nichts Passendes in Wunschgröße, ich lockere die Suche")
         ranked = rank_greens(greens, feats, use_p, use_a, size_range, pos, min_ha=0.05, min_d=30.0)
@@ -5347,7 +5528,7 @@ def find_green(pos, prefer, avoid, size_range, log=lambda *_: None):
         ex_ = ThreadPoolExecutor(max_workers=len(todo))
         futs_ = [(g, ex_.submit(green_inside_point, g, pos)) for g in todo]
         ex_.shutdown(wait=False)
-        t_end = time.time() + 9.0  # gleichzeitig und mit Zeitgrenze statt nacheinander
+        t_end = time.time() + 6.0  # gleichzeitig und mit Zeitgrenze statt nacheinander
         for g, f in futs_:
             try:
                 g["target"] = f.result(timeout=max(0.3, t_end - time.time())) or g["target"]
@@ -6775,10 +6956,10 @@ html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stMain"],secti
 """
 st.markdown(BASE_CSS, unsafe_allow_html=True)
 
-PLACEHOLDER = "Wohin? Ort, Café, Park, Geschäft …"
+PLACEHOLDER = "Wohin? Ort, Adresse, Café, Bier, Essen …"
 SEARCH_TIP = ("Tipp: Tippe mindestens 3 Buchstaben, dann erscheinen Vorschläge. "
               "Tippfehler sind okay, es werden ähnliche Orte angezeigt. "
-              "Du kannst auch Adressen einfügen. Der Start lässt sich überall in Deutschland setzen (am besten mit Stadt, z. B. „Torstraße Berlin“), "
+              "Du kannst auch Adressen einfügen oder Schlagworte wie „Bier“, „Essen“ oder „Bäcker“ tippen (dann kommen Kneipen, Restaurants bzw. Bäckereien in der Nähe). Der Start lässt sich überall in Deutschland setzen (am besten mit Stadt, z. B. „Torstraße Berlin“), "
               "das Ziel sollte höchstens 10 km vom Start entfernt sein und wird zuerst dort gesucht.")
 
 
@@ -6809,6 +6990,20 @@ def bump_sb_gen():
         pass
 
 
+def searchbox(fn, **kw):
+    """Eine einzige Suchleiste für alle Reiter und die Karte: gleiche Suche, gleiches Aussehen, gleiche Vorschläge
+    (Orte, Adressen und Schlagworte wie „Bier“ oder „Essen“)."""
+    try:
+        return st_searchbox(fn, style_overrides=SEARCH_STYLE, **kw)
+    except TypeError:  # ältere Version ohne style_overrides / default_searchterm
+        for k in ("default", "default_searchterm"):
+            kw.pop(k, None)
+        try:
+            return st_searchbox(fn, style_overrides=SEARCH_STYLE, **kw)
+        except TypeError:
+            return st_searchbox(fn, **kw)
+
+
 def place_input(label, key):
     """Ortseingabe. Die zuletzt gewählte Adresse bleibt im Feld stehen, auch nach einem Ausflug in die Karte."""
     dot = "s" if label.startswith("Start") else "z"
@@ -6822,15 +7017,7 @@ def place_input(label, key):
         except Exception:
             st.session_state.pop(keep, None)
     fn = search_start if label.startswith("Start") else search_places
-    try:
-        v = st_searchbox(fn, style_overrides=SEARCH_STYLE, **kw)
-    except TypeError:  # ältere Version ohne style_overrides / default_searchterm
-        for k in ("default", "default_searchterm"):
-            kw.pop(k, None)
-        try:
-            v = st_searchbox(fn, style_overrides=SEARCH_STYLE, **kw)
-        except TypeError:
-            v = st_searchbox(fn, **kw)
+    v = searchbox(fn, **kw)
     if v:
         st.session_state[keep] = v
     return v
@@ -7097,16 +7284,16 @@ def render_map_view():
                 c1, c2 = st.columns([1, 6])
             c1.button("←", key="gw_back", use_container_width=True, on_click=close_map, help="Zurück zur Suche")
             with c2:
-                dest_new = st_searchbox(search_places, key=f"gw_dest_{gw['sid']}",
-                                        placeholder=f"🏁 {gw['t2']} · Ziel ändern …", clear_on_submit=False)
+                dest_new = searchbox(search_places, key=f"gw_dest_{gw['sid']}",
+                                     placeholder=f"🏁 {gw['t2']} · Ziel ändern …", clear_on_submit=False)
         elif gw["mode"] == "tour":
             c1, c2 = st.columns([1, 6])
             c1.button("←", key="gw_back", use_container_width=True, on_click=close_map, help="Zurück zur Suche")
             n_ = len(gw.get("stops", []))
             with c2:
                 if n_ < TOUR_MAX_MAP_STOPS:
-                    add_new = st_searchbox(search_places, key=f"gw_add_{gw['sid']}", clear_on_submit=False,
-                                           placeholder=f"🛍️ {n_} Zwischenziel{'e' if n_ != 1 else ''} · ➕ weiteres Ziel …")
+                    add_new = searchbox(search_places, key=f"gw_add_{gw['sid']}", clear_on_submit=False,
+                                        placeholder=f"🛍️ {n_} Zwischenziel{'e' if n_ != 1 else ''} · ➕ weiteres Ziel …")
                 else:
                     st.markdown(f'<div class="looptitle">🛍️ Ründchen · <b>{n_} Zwischenziele</b> (Maximum)</div>',
                                 unsafe_allow_html=True)
@@ -7606,6 +7793,8 @@ def home_tour():
         san_reach = san_settings("tour")
         acc_on = access_toggle("tour")
         go = st.button("Ründchen mit Zwischenziel finden", type="primary", use_container_width=True, key="go_tour")
+    if a_v and all(stops) and (same or b_v):
+        prewarm_tour(a_v, stops, None if same else b_v, extra_km)  # Gebiet schon laden, während noch eingestellt wird
     if not go:
         return
     if not a_v or not all(stops) or (not same and not b_v):
