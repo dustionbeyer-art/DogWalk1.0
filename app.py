@@ -28,6 +28,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from html import escape
 
 import networkx as nx
@@ -289,8 +290,35 @@ STATION_WORDS = {"bahnhof", "bhf", "bf", "hbf", "hauptbahnhof", "station", "halt
 STATION_TAGS = ["railway:station", "railway:halt", "public_transport:station"]
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+_PH_CACHE, _PH_FAIL, _PH_LOCK = {}, {}, threading.Lock()
+
+
 def _photon(q, blat, blon, tag=None, box=False):
+    """Photon-Suche mit eigenem, thread-sicherem Zwischenspeicher (1 h). Ein Fehlschlag wird 20 s lang gemerkt,
+    damit die Suche nicht mehrfach auf denselben toten Server wartet."""
+    key = (q, blat, blon, tag, box)
+    now = time.time()
+    with _PH_LOCK:
+        hit = _PH_CACHE.get(key)
+        if hit and now - hit[0] < 3600:
+            return hit[1]
+        if now - _PH_FAIL.get(key, 0) < 20:
+            raise RuntimeError("Photon kurz nicht erreichbar")
+    try:
+        res = _photon_net(q, blat, blon, tag, box)
+    except Exception:
+        with _PH_LOCK:
+            _PH_FAIL[key] = time.time()
+        raise
+    with _PH_LOCK:
+        if len(_PH_CACHE) > 600:
+            for k in sorted(_PH_CACHE, key=lambda k_: _PH_CACHE[k_][0])[:200]:
+                _PH_CACHE.pop(k, None)
+        _PH_CACHE[key] = (time.time(), res)
+    return res
+
+
+def _photon_net(q, blat, blon, tag=None, box=False):
     params = {"q": q, "limit": 12, "lang": "de"}
     if blat is not None:
         params.update(lat=blat, lon=blon)
@@ -300,7 +328,7 @@ def _photon(q, blat, blon, tag=None, box=False):
             params["bbox"] = f"{blon - dlon:.4f},{blat - dlat:.4f},{blon + dlon:.4f},{blat + dlat:.4f}"
     if tag:
         params["osm_tag"] = tag
-    r = requests.get("https://photon.komoot.io/api/", params=params, headers=UA, timeout=6)
+    r = requests.get("https://photon.komoot.io/api/", params=params, headers=UA, timeout=4)
     r.raise_for_status()
     return r.json().get("features", [])
 
@@ -759,18 +787,33 @@ def _search_places(term, free):
 
     out, seen = [], set()
     kwhits = []
-    try:
-        kwhits = keyword_places(term, bias)
-    except Exception:
-        kwhits = []
+    kw_ex = ThreadPoolExecutor(max_workers=1)  # Schlagwortsuche (Overpass) läuft neben der Adresssuche
+    kw_f = kw_ex.submit(keyword_places, term, bias)
     words = term.split()
     core = [w for w in words if w.lower().strip(".,") not in STATION_WORDS]
-    if core and len(core) < len(words):
-        for tag in STATION_TAGS:
-            _add(ask(" ".join(core), tag, True), seen, out)
     variants = query_variants(term)
     plz_in = _PLZ.search(term)
     addr_like = bool(plz_in) or bool(re.search(r"\d", term))
+    # Alle wahrscheinlichen Abfragen gleichzeitig starten (statt eine nach der anderen): die Schleifen unten finden
+    # die Antworten dann schon im Zwischenspeicher.
+    try:
+        first_box = bool(blat is not None and not free)
+        jobs = [(q, None, first_box) for q in variants[:4]]
+        if core and len(core) < len(words):
+            jobs += [(" ".join(core), tag, True) for tag in STATION_TAGS]
+        if jobs:
+            with ThreadPoolExecutor(max_workers=min(6, len(jobs))) as ex_:
+                list(ex_.map(lambda j: ask(*j), jobs))
+    except Exception:
+        pass
+    try:
+        kwhits = kw_f.result(timeout=12)
+    except Exception:
+        kwhits = []
+    kw_ex.shutdown(wait=False)
+    if core and len(core) < len(words):
+        for tag in STATION_TAGS:
+            _add(ask(" ".join(core), tag, True), seen, out)
     # 1) im 10-km-Umfeld (Spaziergänge bleiben meist nah), 2) danach ohne Gebietsgrenze
     for boxed in ((True, False) if (blat is not None and not free) else (False,)):
         for k, q in enumerate(variants[:7]):
@@ -1553,8 +1596,6 @@ def get_weather(lat, lon, wait=0.0):
 
 def dog_prefetch(start_v):
     """Wetterabruf schon anstoßen, bevor die Ladeansicht erscheint (läuft im Hintergrund)."""
-    if not _dog():
-        return
     try:
         lat, lon, _ = _unpack(start_v)
         get_weather(lat, lon, wait=0.0)
@@ -1563,12 +1604,11 @@ def dog_prefetch(start_v):
 
 
 def dog_weather(start_v):
-    """Hundemodus: Temperatur für die Pfotenwarnung am Startpunkt bestimmen (wartet kurz auf den Wetterdienst)."""
-    if not _dog():
-        return
+    """Temperatur (Pfotenwarnung, nur Hundemodus) und Windhinweis am Startpunkt bestimmen. Wartet kurz auf den
+    Wetterdienst; im normalen Modus nur kurz, damit die Berechnung nicht aufgehalten wird."""
     try:
         lat, lon, _ = _unpack(start_v)
-        w = get_weather(lat, lon, wait=3.5)
+        w = get_weather(lat, lon, wait=3.5 if _dog() else 2.0)
         st.session_state["_temp"] = None if not w else w["temp"]
         st.session_state["_windnote"] = wind_note(w)
     except Exception:
@@ -1689,6 +1729,27 @@ def water_note(area, path):
     near = float(dw[:, idx].min()) if idx else MAX_BUF
     return f" · 0 % am Wasser (nächstes Ufer ca. {near:.0f} m entfernt)" if near < MAX_BUF - 1 else \
         " · 0 % am Wasser (Ufer weiter als 400 m)"
+
+
+_PF_SEEN = set()
+
+
+def prefetch_osm(bbox):
+    """Größeres Gebiet im Hintergrund auf die Festplatte holen (nur Download, kein Aufbau). Tippt jemand in der
+    Karte auf „+“, liegen die Daten dann schon bereit."""
+    if bbox in _PF_SEEN:
+        return
+    _PF_SEEN.add(bbox)
+    if len(_PF_SEEN) > 50:
+        _PF_SEEN.clear()
+
+    def work():
+        try:
+            time.sleep(12)  # erst die Route des Nutzers fertig werden lassen (Toilettenabfrage u. a. nutzt dieselben Server)
+            fetch_osm(bbox, time.time() + 40)
+        except Exception:
+            _PF_SEEN.discard(bbox)
+    threading.Thread(target=work, daemon=True).start()
 
 
 def prefetch_water(bbox):
@@ -1953,6 +2014,17 @@ LOOP_BEARINGS = 8      # Richtungen, in die Runden probiert werden
 LOOP_TOLERANCE = 0.07  # akzeptierte Längenabweichung beim Anpassen (±7 %)
 LOOP_REUSE_PENALTY = 4.0  # Strafe für bereits gelaufene Wegstücke (vermeidet Hin-und-zurück)
 LOOP_MAX_KM = 10.0
+
+
+LOAD_TIERS = (3.5, 5.0, 6.5, 8.0, LOOP_MAX_KM)  # Gebietsgrößen (km Rundenlänge), die geladen werden
+
+
+def load_tier(km):
+    """Gebiet für eine Rundenlänge: in Stufen mit etwas Reserve, damit „+“ in der Karte selten neu laden muss."""
+    for t in LOAD_TIERS:
+        if t >= km:
+            return t
+    return LOOP_MAX_KM
 
 
 def dist_m(p1, p2):
@@ -2685,7 +2757,7 @@ function say(t) {
 }
 function fitRoute() {
   if (!coords.length) return;
-  map.fitBounds(L.latLngBounds(coords), {paddingTopLeft: [24, TOP + 24], paddingBottomRight: [24, D.dog ? 340 : 250], animate: false});
+  map.fitBounds(L.latLngBounds(coords), {paddingTopLeft: [24, TOP + 24], paddingBottomRight: [24, Math.max(D.dog ? 340 : 250, ($('sheet') ? $('sheet').offsetHeight : 0) + 24)], animate: false});
 }
 function buildList() {
   let h = '<div style="font-weight:700;margin-bottom:6px">Wegehinweise</div>';
@@ -2741,6 +2813,7 @@ function showOption(i, fit) {
     if (dg.wind) dh += '<div class="dwind">' + esc(dg.wind) + '</div>';
     dh += '<div class="dnote">Nicht jedes Verbot steht in den Kartendaten. Schilder, Leinenpflicht und Brut- und Setzzeit gehen vor.</div>';
   }
+  if (!dg && o.wind) dh += '<div class="dwind">' + esc(o.wind) + '</div>';
   $('dogbox').innerHTML = dh;
   $('rem').textContent = 'Gesamt ' + fmt(total) + ' · ca. ' + Math.max(1, Math.round(total / WALK)) + ' min';
   buildList();
@@ -3170,6 +3243,8 @@ def _option(nav, label, sub, hint, stats, area=None, path=None):
                            "Asphalt oder Pflaster und können die Pfoten verbrennen. Handrücken-Test: keine 5 Sekunden Hand auf dem Boden "
                            "halten können heißt zu heiß. Lieber früh morgens oder abends gehen.")
         extra = {"dog": info, "forbid": runs}
+    elif not _dog() and st.session_state.get("_windnote"):
+        extra = {"wind": st.session_state.get("_windnote")}
     share, segs = dup_from_coords(nav.get("coords") or [])
     if re.search(r"\d+% ohne Doppelweg", hint):
         hint = re.sub(r"\d+% ohne Doppelweg", f"{1 - share:.0%} ohne Doppelweg", hint)
@@ -3241,13 +3316,18 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
     if dist_m(p1, p2) > 0.35 * target:
         raise ValueError("Start und Ende liegen zu weit auseinander für diese Länge.")
     if area is None or bbox_km is None or km > bbox_km:
+        # Gleich etwas mehr Fläche laden, als die Wunschlänge braucht: Wer in der Karte „+“ tippt, soll nicht jedes Mal
+        # neu auf die Kartenserver warten müssen.
+        load_km = load_tier(km)
         log("🗺️ Wegenetz und Grünflächen laden")
         t0 = time.time()
-        _lb = loop_bbox(p1, p2, target)
+        _lb = loop_bbox(p1, p2, load_km * 1000)
         prefetch_water(_lb)
         area = load_area(_lb)
-        bbox_km = km
+        bbox_km = load_km
         log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
+    if bbox_km < LOOP_MAX_KM:  # nächstgrößeres Gebiet schon im Hintergrund holen
+        prefetch_osm(loop_bbox(p1, p2, next(t for t in LOAD_TIERS if t > bbox_km) * 1000))
     ensure_water(area, log)
     o, t = nearest_node(area, *p1), nearest_node(area, *p2)
     variants = find_loops(area, o, t, target, LEVELS[level], buf, progress=progress, quiet=level_quiet(level))
@@ -4138,9 +4218,10 @@ def scan_loop_view(start_v, end_v, km, level, buf=150, log=lambda *_: None, prog
 
 
 def make_loop_view_safe(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
-                        log=lambda *_: None, progress=None):
+                        log=lambda *_: None, progress=None, weather=True):
     """Ründchen mit Overpass-Daten; wenn die Server überlastet sind, per Grün-Scan."""
-    dog_weather(start_v)
+    if weather:  # beim Neuberechnen in der Karte ist das Wetter schon bekannt
+        dog_weather(start_v)
     try:
         return make_loop_view(start_v, end_v, km, level, buf, area, bbox_km, log, progress)
     except ValueError:
@@ -5023,11 +5104,27 @@ def _san_bbox(option_coords, reach):
     return la0 - pad, lo0 - padx, la1 + pad, lo1 + padx  # s, w, n, e
 
 
-def fetch_sanitary(option_coords, reach):
+_SAN_CACHE = {}
+
+
+def fetch_sanitary(option_coords, reach, region=None):
     """Toiletten und Gaststätten im Rechteck um alle Routen. Zwei kleine Abfragen parallel (Toiletten /
-    Gaststätten); die genaue Entfernung zum Weg wird danach hier berechnet. Klappt nur eine, wird sie genutzt."""
+    Gaststätten); die genaue Entfernung zum Weg wird danach hier berechnet. Klappt nur eine, wird sie genutzt.
+    Mit region (w, s, e, n; das geladene Wegenetz) wird einmal für das ganze Gebiet gefragt und gemerkt: Jede weitere
+    Route dort (z. B. beim Ändern der Länge in der Karte) braucht keine neue Abfrage mehr."""
     s_, w_, n_, e_ = _san_bbox(option_coords, reach)
+    if region:
+        try:
+            rw, rs, re_, rn = region
+            if (rs <= s_ and rw <= w_ and rn >= n_ and re_ >= e_
+                    and (rn - rs) * 110540.0 <= 6500 and (re_ - rw) * 70000.0 <= 6500):
+                s_, w_, n_, e_ = rs, rw, rn, re_
+        except Exception:
+            pass
     bb = f"({s_:.5f},{w_:.5f},{n_:.5f},{e_:.5f})"
+    hit = _SAN_CACHE.get(bb)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
     qs = (f'[out:json][timeout:20];nwr["amenity"="toilets"]{bb};out center tags 4000;',
           f'[out:json][timeout:20];nwr["amenity"~"^({SAN_GASTRO})$"]["name"]{bb};out center tags 6000;')
     res, errs = [], []
@@ -5040,7 +5137,12 @@ def fetch_sanitary(option_coords, reach):
                 errs.append(e)
     if not res:
         raise errs[0]
-    return [el for part in res for el in part]
+    out = [el for part in res for el in part]
+    if not errs:
+        if len(_SAN_CACHE) > 12:
+            _SAN_CACHE.clear()
+        _SAN_CACHE[bb] = (time.time(), out)
+    return out
 
 
 _TILE_GASTRO = {"restaurant", "cafe", "bar", "pub", "biergarten", "bakery", "ice_cream", "food_court"}
@@ -5267,7 +5369,7 @@ def add_sanitary(view, reach=150, log=lambda *_: None):
     failed_op, items, items_t = False, [], []
 
     def _op():
-        return classify_sanitary(fetch_sanitary(coords_all, SAN_WIDE + 60))
+        return classify_sanitary(fetch_sanitary(coords_all, SAN_WIDE + 60, (view.get("area") or {}).get("bbox")))
 
     def _tiles():
         return tile_pois(coords_all, SAN_WIDE + 60)
@@ -5488,6 +5590,27 @@ D.addEventListener('click',function(e){if(Date.now()-swallow<400&&e.target.close
 })();</script>"""
 
 
+# iPhone: Die Tastatur blendet über dem Suchfeld gern eigene Kontakt-Adressen ein („Arbeit …“, „Privat …“). Wer die
+# antippt, schließt nur die Tastatur, und das Suchfeld leert sich. Darum werden Autofill und Autokorrektur in den
+# Suchfeldern abgeschaltet (Suchfelder laufen in eigenen Rahmen; ein Wächter im Elternfenster erledigt das).
+SB_JS = """<script>(function(){
+try{var P=window.parent;if(P.__gwSb)return;P.__gwSb=1;
+function fix(doc){try{[].slice.call(doc.querySelectorAll('input')).forEach(function(i){
+ if(i.__gw)return;i.__gw=1;
+ i.setAttribute('autocomplete','off');i.setAttribute('autocorrect','off');i.setAttribute('autocapitalize','none');
+ i.setAttribute('spellcheck','false');i.setAttribute('enterkeyhint','search');i.setAttribute('inputmode','search');
+ i.setAttribute('name','gw'+Math.random().toString(36).slice(2,8));i.setAttribute('data-lpignore','true');i.setAttribute('data-form-type','other');
+ i.setAttribute('aria-autocomplete','list');
+})}catch(e){}}
+function scan(){try{[].slice.call(P.document.querySelectorAll('iframe')).forEach(function(f){
+ var u=(f.getAttribute('src')||'')+(f.title||'');
+ if(u.indexOf('searchbox')<0)return;
+ try{if(f.contentDocument)fix(f.contentDocument)}catch(e){}})}catch(e){}}
+setInterval(scan,500);scan();
+}catch(e){}
+})();</script>"""
+
+
 def page_icon():
     try:
         import io
@@ -5500,7 +5623,7 @@ def page_icon():
 def install_icons():
     """Setzt Tab-Ikon und Home-Bildschirm-Ikon (Apple Touch Icon) im Elternfenster."""
     try:
-        st_html(ICON_JS.replace("__FAV__", ICON_FAV_B64).replace("__TOUCH__", ICON_TOUCH_B64) + SELECT_JS, height=0)
+        st_html(ICON_JS.replace("__FAV__", ICON_FAV_B64).replace("__TOUCH__", ICON_TOUCH_B64) + SELECT_JS + SB_JS, height=0)
     except Exception:
         pass
 
@@ -6282,6 +6405,13 @@ class Overlay:
             self.stage = txt
             self.render()
 
+    def step(self, msg):
+        """Wie log, aber ohne Textzeile auf der Seite (für die Kartenansicht)."""
+        txt = re.sub(r"\s*\([^)]*\)\s*$", "", str(msg)).strip()
+        if txt and txt != self.stage and len(txt) < 140:
+            self.stage = txt
+            self.render()
+
     def empty(self):
         try:
             self.ph.empty()
@@ -6316,7 +6446,7 @@ html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stMain"],secti
 """
 st.markdown(BASE_CSS, unsafe_allow_html=True)
 
-PLACEHOLDER = "Straße, Adresse, Café, Restaurant, Geschäft …"
+PLACEHOLDER = "Wohin? Ort, Café, Park, Geschäft …"
 SEARCH_TIP = ("Tipp: Tippe mindestens 3 Buchstaben, dann erscheinen Vorschläge. "
               "Tippfehler sind okay, es werden ähnliche Orte angezeigt. "
               "Du kannst auch Adressen einfügen. Der Start lässt sich überall in Deutschland setzen (am besten mit Stadt, z. B. „Torstraße Berlin“), "
@@ -6350,6 +6480,45 @@ def bump_sb_gen():
         pass
 
 
+def _alt_pick(altk, val):
+    st.session_state[altk] = val
+
+
+def _alt_clear(altk):
+    st.session_state.pop(altk, None)
+
+
+def alt_input(key, fn):
+    """Notausgang neben dem Suchfeld: normales Textfeld (Return) und Treffer als Tasten zum Antippen. Funktioniert
+    auch dann, wenn das Suchfeld auf dem Handy zickt. Rückgabe: gewählter Ort (gepackt) oder None."""
+    altk = f"_alt_{key}"
+    sel = st.session_state.get(altk)
+    if sel:
+        try:
+            lab = _unpack(sel)[2]
+        except Exception:
+            lab = "Ort"
+        c1, c2 = st.columns([6, 1])
+        c1.markdown(f'<div style="padding:.55rem .8rem;border:1px solid #9DB38A;border-radius:12px;background:rgba(157,179,138,.18);font-size:.92rem;line-height:1.3">✅ {escape(lab)}</div>', unsafe_allow_html=True)
+        c2.button("✕", key=f"{altk}_x", on_click=_alt_clear, args=(altk,), help="Auswahl entfernen")
+        return sel
+    with st.expander("⌨️ Suche hakt? Hier eintippen und auswählen"):
+        q = st.text_input("Ort oder Adresse", key=f"g{_sb_gen()}_{key}_altq", autocomplete="off",
+                          placeholder="Eintippen, dann Return/Los auf der Tastatur",
+                          label_visibility="collapsed")
+        if q and len(q.strip()) >= 3:
+            try:
+                res = fn(q)
+            except Exception:
+                res = []
+            if not res:
+                st.caption("Keine Treffer. Bitte anders schreiben (z. B. mit Stadt).")
+            for i, (lab, val) in enumerate(res[:6]):
+                st.button(lab, key=f"g{_sb_gen()}_{key}_alt{i}", on_click=_alt_pick, args=(altk, val),
+                          use_container_width=True)
+    return None
+
+
 def place_input(label, key):
     """Ortseingabe. Die zuletzt gewählte Adresse bleibt im Feld stehen, auch nach einem Ausflug in die Karte."""
     dot = "s" if label.startswith("Start") else "z"
@@ -6374,7 +6543,12 @@ def place_input(label, key):
             v = st_searchbox(fn, **kw)
     if v:
         st.session_state[keep] = v
-    return v
+    alt = None
+    try:
+        alt = alt_input(key, fn)
+    except Exception:
+        alt = None
+    return alt or v
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -6585,6 +6759,28 @@ def _san_carry(old, new):
         pass
 
 
+@contextmanager
+def map_busy(gw):
+    """Während in der Karte neu berechnet wird: Ladeansicht mit Arbeitsstand statt stiller Wartezeit."""
+    ov = None
+    try:
+        ov = loading_overlay(gw.get("start"), bool(gw.get("water", False)))
+    except Exception:
+        ov = None
+    try:
+        yield (ov.step if ov else (lambda *_: None))
+    finally:
+        if ov:
+            ov.empty()
+
+
+VIEW_CACHE_MAX = 6
+
+
+def view_snapshot(v):
+    return {k: x for k, x in v.items() if k not in ("vcache", "recalc", "_carried")}
+
+
 def render_map_view():
     """Vollbild-Karte mit Suchfeld (Ziel ändern) bzw. Längen-Regler (Ründchen) in der Karte."""
     gw = st.session_state["gw"]
@@ -6641,22 +6837,22 @@ def render_map_view():
         except Exception as e:
             st.toast(f"⚠️ {e}"[:220])
     elif gw["mode"] == "ab" and dest_new and dest_new != gw["dest"] and dest_new != gw.get("failed"):
-        st.toast("🧭 Berechne neue Route …")
         try:
-            if gw.get("fallback") == "scan":
-                new = scan_ab_view(gw["start"], dest_new, gw["buf"])
-            elif gw.get("fallback"):
-                new = make_ab_view_safe(gw["start"], dest_new, gw["buf"])
-            else:
-                new = make_ab_view_safe(gw["start"], dest_new, gw["buf"], gw["area"], gw["bbox"])
+            with map_busy(gw) as step:
+                if gw.get("fallback") == "scan":
+                    new = scan_ab_view(gw["start"], dest_new, gw["buf"], step)
+                elif gw.get("fallback"):
+                    new = make_ab_view_safe(gw["start"], dest_new, gw["buf"], log=step)
+                else:
+                    new = make_ab_view_safe(gw["start"], dest_new, gw["buf"], gw["area"], gw["bbox"], step)
         except Exception as e:
             gw["failed"] = dest_new
             st.toast(f"⚠️ {e}"[:220])
     elif gw["mode"] == "tour" and add_new and add_new != gw.get("failed"):
-        st.toast("🛍️ Füge das Ziel hinzu und berechne neu …")
         try:
-            new = make_tour_view_safe(gw["start"], gw["stops_v"] + [add_new], gw["end_v"], gw["level"], gw["buf"],
-                                      extra_km=gw.get("extra_km", 0))
+            with map_busy(gw) as step:
+                new = make_tour_view_safe(gw["start"], gw["stops_v"] + [add_new], gw["end_v"], gw["level"], gw["buf"],
+                                          log=step, extra_km=gw.get("extra_km", 0))
             new["sid"] = gw["sid"] + 1  # neues leeres Suchfeld
             _san_carry(gw, new)
             st.session_state["gw_sid"] = max(st.session_state.get("gw_sid", 0), new["sid"])
@@ -6670,19 +6866,38 @@ def render_map_view():
             st.toast(f"⚠️ Neu berechnen nicht möglich: {e}"[:220])
     elif gw["mode"] == "loop" and gw.get("recalc"):
         gw["recalc"] = False
-        st.toast("🔄 Suche neues Ründchen …")
+        vc = gw.setdefault("vcache", {})
+        vc.setdefault(gw["km_ok"], {**view_snapshot(gw), "km": gw["km_ok"]})  # die gerade gezeigte Länge bleibt abrufbar
+        hit = vc.get(gw["km"])
+        if hit is not None:  # schon berechnet: sofort anzeigen
+            new = dict(hit)
+            new["vcache"] = vc
+            new["sid"] = gw["sid"]
+            st.session_state["gw"] = new
+            st.rerun()
         try:
-            if gw.get("fallback") == "scan":
-                new = scan_loop_view(gw["start"], gw["end"], gw["km"], gw["level"], gw["buf"])
-            else:
-                new = make_loop_view_safe(gw["start"], gw["end"], gw["km"], gw["level"], gw["buf"],
-                                          area=gw["area"], bbox_km=gw["bbox_km"])
+            with map_busy(gw) as step:
+                if gw.get("fallback") == "scan":
+                    new = scan_loop_view(gw["start"], gw["end"], gw["km"], gw["level"], gw["buf"], step)
+                else:
+                    new = make_loop_view_safe(gw["start"], gw["end"], gw["km"], gw["level"], gw["buf"],
+                                              area=gw["area"], bbox_km=gw["bbox_km"], log=step, weather=False)
+                new["sid"] = gw["sid"]
+                step("🚻 Toiletten entlang der Route suchen") if gw.get("san_reach") else None
+                _san_carry(gw, new)
+                new["_carried"] = True
+            vc[new["km"]] = view_snapshot(new)
+            while len(vc) > VIEW_CACHE_MAX:
+                vc.pop(next(iter(vc)))
+            new["vcache"] = vc
         except Exception as e:
+            new = None
             gw["km"] = gw["km_ok"]
             st.toast(f"⚠️ {e}"[:220])
     if new:
         new["sid"] = gw["sid"]
-        _san_carry(gw, new)
+        if not new.pop("_carried", False):
+            _san_carry(gw, new)
         st.session_state["gw"] = new
         st.rerun()
 
@@ -7123,6 +7338,20 @@ def dog_home_info():
     st.caption("Nicht jedes Verbot steht in den Kartendaten. Schilder vor Ort, Leinenpflicht sowie Brut- und Setzzeit gehen vor.")
 
 
+def wind_home_info():
+    """Normaler Modus: Windhinweis auf der Startseite, wenn es am Standort windig ist."""
+    try:
+        loc, b = st.session_state.get("loc_shared"), st.session_state.get("bias")
+        pt = (loc[0], loc[1]) if loc else (b[0], b[1]) if b else None
+        w = get_weather(pt[0], pt[1], wait=0.8) if pt else None
+        wn = wind_note(w)
+        if wn:
+            st.markdown(f'<div class="dogwarn" style="background:#E3F0F8;border-color:#9CC4DC;color:#1E4A66">{escape(wn)}</div>',
+                        unsafe_allow_html=True)
+    except Exception:
+        pass
+
+
 def render_home():
     restore_widgets()
     snap_widgets()
@@ -7144,6 +7373,8 @@ def render_home():
                    "(Asphalt, Pflaster, Erde) und warnt bei Hitze über 30 °C vor heißem Boden für die Pfoten.")
     if dog:
         dog_home_info()
+    else:
+        wind_home_info()
     # Nur der gewählte Reiter wird aufgebaut (st.tabs würde alle drei samt Suchfeldern laden = langsam)
     pages = {"route": "🧭 Route", "green": "🌳 Ins Grün", "loop": "🔄 Ründchen", "tour": "🛍️ Ründchen mit Zwischenziel"}
     try:
