@@ -1102,51 +1102,61 @@ def load_area(bbox):
     except Exception:
         pass
     path = fetch_osm(bbox, time.time() + LOAD_DEADLINE_S)
+    def _features():
+        parks, waters = None, None
+        try:
+            tags_all = {"leisure": GREEN_TAGS["leisure"], "landuse": GREEN_TAGS["landuse"] + ["reservoir", "basin"],
+                        "natural": GREEN_TAGS["natural"] + ["water"], "waterway": WATER_WAYS}
+            try:
+                gall = ox.features_from_xml(path, tags=tags_all)
+            except Exception:
+                # Einzelne fehlerhafte Wasser-Geometrien dürfen die Grünflächen nicht mitreißen: getrennt laden
+                parts_ = []
+                for tg in ({k: v for k, v in tags_all.items() if k != "waterway" and "water" not in v and "reservoir" not in v},
+                           {"natural": ["water"], "waterway": WATER_WAYS, "landuse": ["reservoir", "basin"]}):
+                    try:
+                        parts_.append(ox.features_from_xml(path, tags=tg))
+                    except Exception:
+                        pass
+                if not parts_:
+                    raise
+                gall = parts_[0] if len(parts_) == 1 else __import__("pandas").concat(parts_)
+            isw = np.zeros(len(gall), dtype=bool)
+            if "natural" in gall:
+                isw |= (gall["natural"] == "water").to_numpy()
+            if "landuse" in gall:
+                isw |= gall["landuse"].isin(["reservoir", "basin"]).to_numpy()
+            if "waterway" in gall:
+                isw |= gall["waterway"].notna().to_numpy()
+            gdf = gall[~isw]
+            gdf = gdf[gdf.geometry.type.isin(["Polygon", "MultiPolygon"])]
+            if len(gdf):
+                gdf = gdf.reset_index(drop=True)
+                if "name" not in gdf:
+                    gdf["name"] = None
+                gdf["name"] = gdf["name"].fillna("Grünfläche").astype(str)
+                parks = gdf[["name", "geometry"]]
+            wdf = gall[isw]
+            if len(wdf):
+                waters = wdf[["geometry"]].reset_index(drop=True)
+        except Exception:
+            parks = None  # keine Grünflächen im Gebiet: Route geht trotzdem
+        return parks, waters
+
+    _fex = ThreadPoolExecutor(max_workers=1)
+    _ffut = _fex.submit(_features)  # Grünflächen und Gewässer laufen parallel zum Wegenetz
     try:
         G0 = ox.graph_from_xml(walk_xml(path), bidirectional=True, simplify=True, retain_all=False)
     except Exception as e:
         raise ValueError(f"In diesem Gebiet habe ich keine Fußwege gefunden ({type(e).__name__}).")
     if G0.number_of_edges() == 0:
         raise ValueError("In diesem Gebiet habe ich keine Fußwege gefunden.")
-
-    parks, waters = None, None
     try:
-        tags_all = {"leisure": GREEN_TAGS["leisure"], "landuse": GREEN_TAGS["landuse"] + ["reservoir", "basin"],
-                    "natural": GREEN_TAGS["natural"] + ["water"], "waterway": WATER_WAYS}
-        try:
-            gall = ox.features_from_xml(path, tags=tags_all)
-        except Exception:
-            # Einzelne fehlerhafte Wasser-Geometrien dürfen die Grünflächen nicht mitreißen: getrennt laden
-            parts_ = []
-            for tg in ({k: v for k, v in tags_all.items() if k != "waterway" and "water" not in v and "reservoir" not in v},
-                       {"natural": ["water"], "waterway": WATER_WAYS, "landuse": ["reservoir", "basin"]}):
-                try:
-                    parts_.append(ox.features_from_xml(path, tags=tg))
-                except Exception:
-                    pass
-            if not parts_:
-                raise
-            gall = parts_[0] if len(parts_) == 1 else __import__("pandas").concat(parts_)
-        isw = np.zeros(len(gall), dtype=bool)
-        if "natural" in gall:
-            isw |= (gall["natural"] == "water").to_numpy()
-        if "landuse" in gall:
-            isw |= gall["landuse"].isin(["reservoir", "basin"]).to_numpy()
-        if "waterway" in gall:
-            isw |= gall["waterway"].notna().to_numpy()
-        gdf = gall[~isw]
-        gdf = gdf[gdf.geometry.type.isin(["Polygon", "MultiPolygon"])]
-        if len(gdf):
-            gdf = gdf.reset_index(drop=True)
-            if "name" not in gdf:
-                gdf["name"] = None
-            gdf["name"] = gdf["name"].fillna("Grünfläche").astype(str)
-            parks = gdf[["name", "geometry"]]
-        wdf = gall[isw]
-        if len(wdf):
-            waters = wdf[["geometry"]].reset_index(drop=True)
+        parks, waters = _ffut.result()
     except Exception:
-        parks = None  # keine Grünflächen im Gebiet: Route geht trotzdem
+        parks, waters = None, None
+    _fex.shutdown(wait=False)
+
 
     G = ox.project_graph(G0)
     crs = G.graph["crs"]
@@ -1172,65 +1182,80 @@ def load_area(bbox):
 
     # Hauptstraßen-Nähe je Kante (0 = ruhig, 1 = an/auf einer Hauptstraße). Grundlage sind die Mittellinien der
     # Hauptverkehrsstraßen aus den Kartendaten, nicht nur die Fußwege: Gehwege laufen oft getrennt neben der Fahrbahn.
-    noise = np.zeros(len(keys), dtype=np.float32)
-    roads_ok = False
-    try:
-        roads = main_road_lines(path, crs)
-        if roads:
-            noise = road_noise(lines, roads, NOISE_DIST)
-            roads_ok = True
-    except Exception:
+    def _calc_noise():
+        noise = np.zeros(len(keys), dtype=np.float32)
         roads_ok = False
-    if not roads_ok:  # Zusatzdatei fehlt: wie früher aus den Straßen im Wegenetz
-        wts = np.array([OSM_ROAD_W.get(best[k][4], 0.0) for k in keys], dtype=np.float32)
-        main = np.nonzero(wts > 0)[0]
-        if len(main):
-            rtree = STRtree(list(lines[main]))
-            acc = np.zeros(len(keys), dtype=np.float32)
-            for f in (np.arange(SAMPLES) + 0.5) / SAMPLES:
-                pts = shapely.line_interpolate_point(lines, f, normalized=True)
-                idx, _ = rtree.query_nearest(pts, max_distance=NOISE_DIST, return_distance=True, all_matches=False)
-                acc[idx[0]] += wts[main][idx[1]]
-            noise = acc / SAMPLES
+        try:
+            roads = main_road_lines(path, crs)
+            if roads:
+                noise = road_noise(lines, roads, NOISE_DIST)
+                roads_ok = True
+        except Exception:
+            roads_ok = False
+        if not roads_ok:  # Zusatzdatei fehlt: wie früher aus den Straßen im Wegenetz
+            wts = np.array([OSM_ROAD_W.get(best[k][4], 0.0) for k in keys], dtype=np.float32)
+            main = np.nonzero(wts > 0)[0]
+            if len(main):
+                rtree = STRtree(list(lines[main]))
+                acc = np.zeros(len(keys), dtype=np.float32)
+                for f in (np.arange(SAMPLES) + 0.5) / SAMPLES:
+                    pts = shapely.line_interpolate_point(lines, f, normalized=True)
+                    idx, _ = rtree.query_nearest(pts, max_distance=NOISE_DIST, return_distance=True, all_matches=False)
+                    acc[idx[0]] += wts[main][idx[1]]
+                noise = acc / SAMPLES
+        return noise
+
+    def _calc_D():
+        D = np.full((SAMPLES, len(keys)), MAX_BUF, dtype=np.float32)
+        parks_json, n_parks = None, 0
+        if parks is not None:
+            pg = parks.to_crs(crs)
+            pg["geometry"] = pg.geometry.simplify(2.0).make_valid()
+            pg = pg[pg.geometry.notna() & ~pg.geometry.is_empty].reset_index(drop=True)
+            n_parks = len(pg)
+            if n_parks:
+                tree = STRtree(list(pg.geometry))
+                for r, f in enumerate((np.arange(SAMPLES) + 0.5) / SAMPLES):
+                    pts = shapely.line_interpolate_point(lines, f, normalized=True)
+                    idx, dist = tree.query_nearest(pts, max_distance=MAX_BUF,
+                                                   return_distance=True, all_matches=False)
+                    D[r, idx[0]] = dist
+                parks_json = pg.to_crs(4326).to_json()
+        return D, parks_json, n_parks
+
+    def _calc_DW():
+        DW = np.full((SAMPLES, len(keys)), MAX_BUF, dtype=np.float32)
+        water_json = None
+        if waters is not None:
+            try:
+                wg = waters.to_crs(crs)
+                wg["geometry"] = wg.geometry.simplify(2.0)
+                wg = wg[wg.geometry.notna() & ~wg.geometry.is_empty].reset_index(drop=True)
+                if len(wg):
+                    wtree = STRtree(list(wg.geometry))
+                    for r, f in enumerate((np.arange(SAMPLES) + 0.5) / SAMPLES):
+                        pts = shapely.line_interpolate_point(lines, f, normalized=True)
+                        idx, dist = wtree.query_nearest(pts, max_distance=MAX_BUF, return_distance=True, all_matches=False)
+                        DW[r, idx[0]] = dist
+                    wshow = wg.copy()
+                    wshow["geometry"] = wshow.geometry.simplify(6.0)
+                    water_json = wshow.iloc[:900].to_crs(4326).to_json()
+            except Exception:
+                water_json = None
+        return DW, water_json
+
+    # Hauptstraßen-Nähe, Park-Abstand und Wasser-Abstand sind voneinander unabhängig: parallel rechnen
+    with ThreadPoolExecutor(max_workers=3) as _ex:
+        _fn, _fd, _fw = _ex.submit(_calc_noise), _ex.submit(_calc_D), _ex.submit(_calc_DW)
+        noise = _fn.result()
+        D, parks_json, n_parks = _fd.result()
+        DW, water_json = _fw.result()
 
     wide = np.array([best[k][5] for k in keys], dtype=np.float32)
     accp = np.array([best[k][6] for k in keys], dtype=np.float32)
 
-    D = np.full((SAMPLES, len(keys)), MAX_BUF, dtype=np.float32)
-    parks_json, n_parks = None, 0
-    if parks is not None:
-        pg = parks.to_crs(crs)
-        pg["geometry"] = pg.geometry.simplify(2.0).make_valid()
-        pg = pg[pg.geometry.notna() & ~pg.geometry.is_empty].reset_index(drop=True)
-        n_parks = len(pg)
-        if n_parks:
-            tree = STRtree(list(pg.geometry))
-            for r, f in enumerate((np.arange(SAMPLES) + 0.5) / SAMPLES):
-                pts = shapely.line_interpolate_point(lines, f, normalized=True)
-                idx, dist = tree.query_nearest(pts, max_distance=MAX_BUF,
-                                               return_distance=True, all_matches=False)
-                D[r, idx[0]] = dist
-            parks_json = pg.to_crs(4326).to_json()
 
     # Gewässer-Nähe je Kante (Abstand zum nächsten See, Teich oder Fluss)
-    DW = np.full((SAMPLES, len(keys)), MAX_BUF, dtype=np.float32)
-    water_json = None
-    if waters is not None:
-        try:
-            wg = waters.to_crs(crs)
-            wg["geometry"] = wg.geometry.simplify(2.0)
-            wg = wg[wg.geometry.notna() & ~wg.geometry.is_empty].reset_index(drop=True)
-            if len(wg):
-                wtree = STRtree(list(wg.geometry))
-                for r, f in enumerate((np.arange(SAMPLES) + 0.5) / SAMPLES):
-                    pts = shapely.line_interpolate_point(lines, f, normalized=True)
-                    idx, dist = wtree.query_nearest(pts, max_distance=MAX_BUF, return_distance=True, all_matches=False)
-                    DW[r, idx[0]] = dist
-                wshow = wg.copy()
-                wshow["geometry"] = wshow.geometry.simplify(6.0)
-                water_json = wshow.iloc[:900].to_crs(4326).to_json()
-        except Exception:
-            water_json = None
 
     node_list = list(pos)
     nidx = {n: i for i, n in enumerate(node_list)}
@@ -1348,6 +1373,24 @@ def water_note(area, path):
         " · 0 % am Wasser (Ufer weiter als 400 m)"
 
 
+def prefetch_water(bbox):
+    """Wassernähe aktiv: Kacheldaten schon während des Wegenetz-Ladens holen (landen im Cache von scan_area)."""
+    try:
+        if not _water():
+            return None
+    except Exception:
+        return None
+
+    def work():
+        try:
+            scan_area(bbox, True)
+        except Exception:
+            pass
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    return t
+
+
 def ensure_water(area, log=None):
     """Zweite, unabhängige Gewässerquelle: Seen und Flüsse aus den Karten-Vektorkacheln. Ergänzt die OSM-Daten,
     falls dort ein großer See (z. B. als Multipolygon) fehlt oder unvollständig ankam. Nur bei aktiver Wassernähe."""
@@ -1393,14 +1436,60 @@ def water_geo(area):
 
 
 # ------------------------------------------------------- Routing
+def _csr_struct(area):
+    """Einmal je Gebiet: Aufbau des Kantenfeldes für die schnelle Wegsuche (CSR-Struktur, Knoten-Index)."""
+    c = area.get("_csr")
+    if c is None:
+        eu, ev = np.asarray(area["eu"]), np.asarray(area["ev"])
+        nl = area["node_list"]
+        n = len(nl)
+        perm = np.lexsort((ev, eu))
+        indptr = np.zeros(n + 1, dtype=np.int32)
+        indptr[1:] = np.cumsum(np.bincount(eu, minlength=n))
+        c = (n, perm, indptr, ev[perm].astype(np.int32), {nd: i for i, nd in enumerate(nl)})
+        area["_csr"] = c
+    return c
+
+
+def fast_path(area, cost, s, t, limit=np.inf):
+    """Günstigster Weg s -> t bei Kantenkosten cost (Feld je Kantenindex; np.inf = gesperrt).
+    Ersetzt nx.shortest_path mit Python-Gewichtsfunktion (rund 20-mal schneller). Gibt Knoten-IDs zurück."""
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import dijkstra
+    n, perm, indptr, indices, nidx = _csr_struct(area)
+    if s not in nidx or t not in nidx:
+        raise nx.NodeNotFound(f"{s} / {t}")
+    if s == t:
+        return [s]
+    data = np.maximum(np.asarray(cost, dtype=np.float64), 1e-9)[perm]
+    dist, pred = dijkstra(csr_matrix((data, indices, indptr), shape=(n, n)), directed=True,
+                          indices=nidx[s], return_predecessors=True, limit=limit)
+    si, ti = nidx[s], nidx[t]
+    if not np.isfinite(dist[ti]):
+        raise nx.NetworkXNoPath(f"Kein Weg {s} -> {t}")
+    seq = [ti]
+    while seq[-1] != si:
+        seq.append(int(pred[seq[-1]]))
+    nl = area["node_list"]
+    return [nl[i] for i in reversed(seq)]
+
+
+def mark_used_both(area, usedm, path):
+    """Wie mark_used, zusätzlich die Gegenrichtung jeder Kante (bereits gelaufen heißt in beide Richtungen)."""
+    H = area["H"]
+    mark_used(area, usedm, path)
+    for a_, b_ in zip(path[:-1], path[1:]):
+        if H.has_edge(b_, a_):
+            usedm[H[b_][a_]["i"]] = True
+
+
 def solve(area, o, t, lam, buf):
     g = np.clip(1 - area["D"] / buf, 0, 1).mean(axis=0)
     L, H = area["lengths"], area["H"]
-    weights = {"short": lambda u, v, d: L[d["i"]],
-               "green": lambda u, v, d: L[d["i"]] * (1 + lam * (1 - g[d["i"]]))}
+    weights = {"short": L, "green": L * (1 + lam * (1 - g))}
     out = {}
     for name, w in weights.items():
-        path = nx.shortest_path(H, o, t, weight=w)
+        path = fast_path(area, w, o, t)
         idx = [H[a][b]["i"] for a, b in zip(path[:-1], path[1:])]
         dist = float(L[idx].sum())
         share = float((L[idx] * g[idx]).sum() / dist) if dist > 0 else 0.0
@@ -1601,21 +1690,15 @@ def build_loop_path(area, g, ng, lam, o, t, theta, rho, mu=None, wq=0.0):
         ang = theta + math.pi + math.radians(alpha)
         wps.append(pick_waypoint(area, ng, cx + rho * math.cos(ang), cy + rho * math.sin(ang), 0.3 * rho))
     seq = [o] + wps + [t]
-    used, full = set(), [o]
+    full = [o]
     usedm = np.zeros(len(L), dtype=bool)
+    base = L * (1 + lam * (1 - g) + mu * nz + wq * wd + ap)
     for s, e in zip(seq[:-1], seq[1:]):
         if s == e:
             continue
-
-        def w(u, v, d, used=used):
-            i = d["i"]
-            c = L[i] * (1 + lam * (1 - g[i]) + mu * nz[i] + wq * wd[i] + ap[i])
-            return c * LOOP_REUSE_PENALTY if (usedm[i] or (u, v) in used or (v, u) in used) else c
-
-        p = nx.shortest_path(H, s, e, weight=w)
+        p = fast_path(area, np.where(usedm, base * LOOP_REUSE_PENALTY, base), s, e)
         full += p[1:]
-        used.update(zip(p[:-1], p[1:]))
-        mark_used(area, usedm, p)
+        mark_used_both(area, usedm, p)
     return full
 
 
@@ -1660,6 +1743,10 @@ def undouble(area, path, keep=(), target=None, extra_cap=60.0):
         dA = total0 - 2 * spur
         banned = set(zip(stem[:-1], stem[1:])) | set(zip(stem[1:], stem[:-1]))
         used = edge_set(p)
+        blocked = L.astype(np.float64).copy()
+        for (u_, v_) in banned | used | {(y, x_) for (x_, y) in used}:
+            if H.has_edge(u_, v_):
+                blocked[H[u_][v_]["i"]] = np.inf
         best = None
         try:
             for x in list(H.successors(a)):
@@ -1667,13 +1754,11 @@ def undouble(area, path, keep=(), target=None, extra_cap=60.0):
                 if (a, x) in banned or ex in used:
                     continue
 
-                def w(u, v, d, x=x):
-                    if (u, v) in banned or (min(u, v), max(u, v)) in used or (u, v) == (x, a):
-                        return None
-                    return d.get("length", 1.0) if "length" in d else float(L[d["i"]])
-
+                cst = blocked.copy()
+                if H.has_edge(x, a):
+                    cst[H[x][a]["i"]] = np.inf
                 try:
-                    back = nx.shortest_path(H, x, a, weight=w)
+                    back = fast_path(area, cst, x, a, limit=2 * spur + extra_cap)
                 except (nx.NetworkXNoPath, nx.NodeNotFound):
                     continue
                 cyc = [a] + back
@@ -2442,7 +2527,7 @@ def solve_levels(area, o, t, buf):
     ap = area_accp(area)
 
     def run(w):
-        path = nx.shortest_path(H, o, t, weight=w)
+        path = fast_path(area, w, o, t)
         idx = [H[a][b]["i"] for a, b in zip(path[:-1], path[1:])]
         dist = float(L[idx].sum()) if idx else 0.0
         share = float((L[idx] * g[idx]).sum() / dist) if dist > 0 else 0.0
@@ -2451,9 +2536,9 @@ def solve_levels(area, o, t, buf):
         return {"path": path, "dist": dist, "green": share, "noise": noise, "narrow": narrow}
 
     def cost(lam, mu, wq):
-        return lambda u, v, d: L[d["i"]] * (1 + lam * (1 - g[d["i"]]) + mu * nz[d["i"]] + wq * wd[d["i"]] + ap[d["i"]])
+        return L * (1 + lam * (1 - g) + mu * nz + wq * wd + ap)
 
-    short = run(lambda u, v, d: L[d["i"]] * (1 + ap[d["i"]]))
+    short = run(L * (1 + ap))
     out = []
     for name, lam in LEVELS.items():
         mu, wq = level_quiet(name)
@@ -2523,6 +2608,7 @@ def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: 
                              f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
         log("🗺️ Wegenetz und Grünflächen laden (nur der Korridor zwischen Start und Ziel)")
         t0 = time.time()
+        prefetch_water(bbox)
         area = load_area(bbox)
         log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
     ensure_water(area, log)
@@ -2572,7 +2658,9 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
     if area is None or bbox_km is None or km > bbox_km:
         log("🗺️ Wegenetz und Grünflächen laden")
         t0 = time.time()
-        area = load_area(loop_bbox(p1, p2, target))
+        _lb = loop_bbox(p1, p2, target)
+        prefetch_water(_lb)
+        area = load_area(_lb)
         bbox_km = km
         log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
     ensure_water(area, log)
@@ -3528,18 +3616,14 @@ def tour_path(area, g, lam, mu, wq, nodes):
     wd = area.get("wide")
     wd = np.zeros(len(L)) if wd is None else wd
     ap = area_accp(area)
-    used, full, marks = set(), [nodes[0]], []
+    full, marks = [nodes[0]], []
     usedm = np.zeros(len(L), dtype=bool)
+    base = L * (1 + lam * (1 - g) + mu * nz + wq * wd + ap)
     for s_, e in zip(nodes[:-1], nodes[1:]):
         if s_ != e:
-            def w(u, v, d, used=used):
-                i = d["i"]
-                c = L[i] * (1 + lam * (1 - g[i]) + mu * nz[i] + wq * wd[i] + ap[i])
-                return c * LOOP_REUSE_PENALTY if (usedm[i] or (u, v) in used or (v, u) in used) else c
-            p = nx.shortest_path(H, s_, e, weight=w)
+            p = fast_path(area, np.where(usedm, base * LOOP_REUSE_PENALTY, base), s_, e)
             full += p[1:]
-            used.update(zip(p[:-1], p[1:]))
-            mark_used(area, usedm, p)
+            mark_used_both(area, usedm, p)
         marks.append(len(full) - 1)
     try:
         cleaned = undouble(area, full, keep=set(nodes))
@@ -3616,6 +3700,7 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
                          f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
     log("🗺️ Wegenetz und Grünflächen laden")
     t0 = time.time()
+    prefetch_water(bbox)
     area = load_area(bbox)
     log(f"✅ {fmt_m(area['n_edges'])} Wegstücke, {area['n_parks']} Grünflächen ({time.time() - t0:.0f} s)")
     ensure_water(area, log)
@@ -5264,7 +5349,7 @@ class Overlay:
                     pass
             self._bgt = threading.Thread(target=work, daemon=True)
             self._bgt.start()
-            self._bgt.join(4.0)  # kurz warten, sonst erscheint das Bild beim nächsten Schritt
+            self._bgt.join(0.3)  # kurz warten, sonst erscheint das Bild beim nächsten Schritt
         self.stage = "Ich suche den grünsten Weg" + (" am Wasser entlang" if water else "") + " …"
         self.ph = st.empty()
         self.render()
@@ -5369,38 +5454,46 @@ SEARCH_STYLE = {
 }
 
 
-def _forget_place(key):
-    st.session_state.pop(f"_keep_{key}", None)
-    st.session_state.pop(key, None)
+def _sb_gen():
+    return st.session_state.get("_sbgen", 0)
+
+
+def bump_sb_gen():
+    """Suchfelder bekommen nach jedem Neuaufbau der Startseite einen frischen Schlüssel. Sonst bleibt im Hintergrund
+    ein alter Suchzustand zurück, während das Feld im Browser neu startet. Das Feld reagiert dann nicht mehr."""
+    old = _sb_gen()
+    st.session_state["_sbgen"] = old + 1
+    try:
+        for k in [k for k in st.session_state.keys() if isinstance(k, str) and k.startswith(f"g{old}_") and k.endswith("_sb")]:
+            del st.session_state[k]
+    except Exception:
+        pass
 
 
 def place_input(label, key):
-    """Ortseingabe. Die gewählte Adresse wird gemerkt (auch wenn man in die Karte und zurück geht) und als
-    Feld mit „Ändern“ angezeigt, damit Start und Ziel nicht erneut eingegeben werden müssen."""
+    """Ortseingabe. Die zuletzt gewählte Adresse bleibt im Feld stehen, auch nach einem Ausflug in die Karte."""
     dot = "s" if label.startswith("Start") else "z"
     st.markdown(f'<div class="fld"><i class="dot {dot}"></i>{escape(label)}</div>', unsafe_allow_html=True)
     keep = f"_keep_{key}"
+    kw = dict(key=f"g{_sb_gen()}_{key}", placeholder=PLACEHOLDER, clear_on_submit=False)
     saved = st.session_state.get(keep)
     if saved:
         try:
-            lab = _unpack(saved)[2]
+            kw.update(default=saved, default_searchterm=_unpack(saved)[2])
         except Exception:
-            lab = ""
             st.session_state.pop(keep, None)
-            saved = None
-        if saved:
-            st.markdown(f'<div class="trip"><span class="pill">📍 {escape(lab)}</span></div>', unsafe_allow_html=True)
-            st.button("✏️ Ändern", key=f"{key}_chg", on_click=_forget_place, args=(key,))
-            return saved
-    kw = dict(key=key, placeholder=PLACEHOLDER, clear_on_submit=False)
     fn = search_start if label.startswith("Start") else search_places
     try:
         v = st_searchbox(fn, style_overrides=SEARCH_STYLE, **kw)
-    except TypeError:  # ältere Version ohne style_overrides
-        v = st_searchbox(fn, **kw)
+    except TypeError:  # ältere Version ohne style_overrides / default_searchterm
+        for k in ("default", "default_searchterm"):
+            kw.pop(k, None)
+        try:
+            v = st_searchbox(fn, style_overrides=SEARCH_STYLE, **kw)
+        except TypeError:
+            v = st_searchbox(fn, **kw)
     if v:
         st.session_state[keep] = v
-        st.rerun()
     return v
 
 
@@ -6107,16 +6200,22 @@ def render_home():
                         label_visibility="collapsed")
     page = page or st.session_state.get("page_last", "route")
     st.session_state["page_last"] = page
+    if st.session_state.get("_home_drawn") != page:  # Startseite oder Reiter wird neu aufgebaut: frische Suchfelder
+        bump_sb_gen()
+    st.session_state["_home_drawn"] = page
     {"route": home_route, "green": home_green, "loop": home_loop, "tour": home_tour}[page]()
     with st.expander("Datenquellen und Gewichtung"):
         st.markdown(sources_text(150, LEVELS["Ausgewogen"]))
 
 
 if st.session_state.get("gw"):
+    st.session_state.pop("_home_drawn", None)
     render_map_view()
 elif st.session_state.get("san_pending"):
+    st.session_state.pop("_home_drawn", None)
     render_san_pending()
 elif st.session_state.get("green_pending"):
+    st.session_state.pop("_home_drawn", None)
     render_green_pending()
 else:
     render_home()
