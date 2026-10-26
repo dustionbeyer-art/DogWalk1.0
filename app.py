@@ -132,6 +132,10 @@ UA = {"User-Agent": "green-walker-app/1.0 (privates Hobbyprojekt)"}
 WATER_WAYS = ["river", "canal", "stream", "riverbank"]
 WATER_BUF = 120  # Meter: bis hierher zählt „am Wasser“ (Uferweg, Blick über den See)
 WATER_NEAR = 0.4  # Wasser-Score ab dem eine Kante als „am Wasser“ gilt (= ca. 70 m Abstand)
+# Flächen, auf denen Hunde meist nicht erlaubt sind: (OSM-Schlüssel, Wert) -> Anzeigename
+DOG_ZONE_TAGS = [("landuse", "cemetery"), ("amenity", "grave_yard"), ("leisure", "playground"), ("tourism", "zoo"),
+                 ("leisure", "zoo"), ("dog", "no")]
+DOG_ZONE_LABEL = {"cemetery": "Friedhof", "grave_yard": "Friedhof", "playground": "Spielplatz", "zoo": "Zoo"}
 GREEN_TAGS = {
     "leisure": ["park", "garden", "nature_reserve", "recreation_ground"],
     "landuse": ["grass", "forest", "village_green"],
@@ -860,6 +864,8 @@ def overpass_query(bbox):
         rx = "|".join(vals)
         parts += [f'way["{k}"~"^({rx})$"]{b};', f'relation["{k}"~"^({rx})$"]{b};']
     # Gewässer: Seen/Teiche (natural=water) und Flüsse/Bäche/Kanäle
+    # Hundemodus: Flächen, auf denen Hunde meist verboten sind (Friedhof, Spielplatz, Zoo) oder per dog=no verboten
+    parts += [f'way["{k}"="{v}"]{b};' for k, v in DOG_ZONE_TAGS] + [f'relation["{k}"="{v}"]{b};' for k, v in DOG_ZONE_TAGS]
     parts += [f'way["natural"="water"]{b};', f'relation["natural"="water"]{b};',
               f'way["landuse"~"^(reservoir|basin)$"]{b};', f'relation["landuse"~"^(reservoir|basin)$"]{b};',
               f'way["waterway"~"^({"|".join(WATER_WAYS)})$"]{b};']
@@ -935,7 +941,7 @@ def fetch_osm(bbox, deadline):
     auf der Festplatte zwischengespeichert."""
     from concurrent.futures import FIRST_COMPLETED, wait
     os.makedirs(OSM_CACHE_DIR, exist_ok=True)
-    path = os.path.join(OSM_CACHE_DIR, hashlib.md5((repr(bbox) + "|v4-strassen").encode()).hexdigest() + ".osm")
+    path = os.path.join(OSM_CACHE_DIR, hashlib.md5((repr(bbox) + "|v5-hund").encode()).hexdigest() + ".osm")
     if os.path.exists(path) and time.time() - os.path.getmtime(path) < OSM_CACHE_DAYS * 86400:
         return path
     query, last = overpass_query(bbox), "keine Antwort"
@@ -1098,15 +1104,17 @@ def road_noise(lines, roads, dist):
 @st.cache_resource(show_spinner=False, max_entries=2, ttl=3600)
 def load_area(bbox):
     try:  # osmnx behält sonst nur wenige Wegtags: für Barrierefreiheit zusätzlich Belag, Steigung usw.
-        ox.settings.useful_tags_way = sorted(set(ox.settings.useful_tags_way) | {"surface", "smoothness", "wheelchair", "incline"})
+        ox.settings.useful_tags_way = sorted(set(ox.settings.useful_tags_way) | {"surface", "smoothness", "wheelchair", "incline", "dog"})
     except Exception:
         pass
     path = fetch_osm(bbox, time.time() + LOAD_DEADLINE_S)
     def _features():
-        parks, waters = None, None
+        parks, waters, dogz = None, None, None
         try:
-            tags_all = {"leisure": GREEN_TAGS["leisure"], "landuse": GREEN_TAGS["landuse"] + ["reservoir", "basin"],
-                        "natural": GREEN_TAGS["natural"] + ["water"], "waterway": WATER_WAYS}
+            tags_all = {"leisure": GREEN_TAGS["leisure"] + ["playground", "zoo"],
+                        "landuse": GREEN_TAGS["landuse"] + ["reservoir", "basin", "cemetery"],
+                        "natural": GREEN_TAGS["natural"] + ["water"], "waterway": WATER_WAYS,
+                        "amenity": ["grave_yard"], "tourism": ["zoo"], "dog": ["no"]}
             try:
                 gall = ox.features_from_xml(path, tags=tags_all)
             except Exception:
@@ -1130,6 +1138,27 @@ def load_area(bbox):
                 isw |= gall["waterway"].notna().to_numpy()
             gdf = gall[~isw]
             gdf = gdf[gdf.geometry.type.isin(["Polygon", "MultiPolygon"])]
+
+            def _in(df, col, vals):
+                return df[col].isin(vals).to_numpy() if col in df else np.zeros(len(df), dtype=bool)
+            dz_mask = (_in(gdf, "landuse", ["cemetery"]) | _in(gdf, "amenity", ["grave_yard"]) | _in(gdf, "leisure", ["playground", "zoo"])
+                       | _in(gdf, "tourism", ["zoo"]) | _in(gdf, "dog", ["no"]))
+            park_mask = (_in(gdf, "leisure", GREEN_TAGS["leisure"]) | _in(gdf, "landuse", GREEN_TAGS["landuse"])
+                         | _in(gdf, "natural", GREEN_TAGS["natural"]))
+            try:
+                dzf = gdf[dz_mask]
+                if len(dzf):
+                    lab = np.array(["Hundeverbot"] * len(dzf), dtype=object)
+                    for col in ("landuse", "amenity", "leisure", "tourism"):
+                        if col in dzf:
+                            for val, name in DOG_ZONE_LABEL.items():
+                                lab[(dzf[col] == val).to_numpy()] = name
+                    dzf = dzf[["geometry"]].reset_index(drop=True)
+                    dzf["k"] = list(lab)
+                    dogz = dzf
+            except Exception:
+                dogz = None
+            gdf = gdf[park_mask]
             if len(gdf):
                 gdf = gdf.reset_index(drop=True)
                 if "name" not in gdf:
@@ -1141,7 +1170,7 @@ def load_area(bbox):
                 waters = wdf[["geometry"]].reset_index(drop=True)
         except Exception:
             parks = None  # keine Grünflächen im Gebiet: Route geht trotzdem
-        return parks, waters
+        return parks, waters, dogz
 
     _fex = ThreadPoolExecutor(max_workers=1)
     _ffut = _fex.submit(_features)  # Grünflächen und Gewässer laufen parallel zum Wegenetz
@@ -1152,9 +1181,9 @@ def load_area(bbox):
     if G0.number_of_edges() == 0:
         raise ValueError("In diesem Gebiet habe ich keine Fußwege gefunden.")
     try:
-        parks, waters = _ffut.result()
+        parks, waters, dogz = _ffut.result()
     except Exception:
-        parks, waters = None, None
+        parks, waters, dogz = None, None, None
     _fex.shutdown(wait=False)
 
 
@@ -1168,7 +1197,7 @@ def load_area(bbox):
             hw = d.get("highway")
             hw = (hw[0] if hw else "") if isinstance(hw, (list, tuple)) else (hw or "")
             best[(u, v)] = (d["length"], d.get("geometry") or LineString([pos[u], pos[v]]), *edge_label(d), hw,
-                            edge_wide(d, hw), edge_access_pen(d, hw))
+                            edge_wide(d, hw), edge_access_pen(d, hw), *edge_surface(d, hw), edge_dogtag(d))
     keys = list(best)
     lengths = np.array([best[k][0] for k in keys], dtype=float)
     names = [best[k][2] for k in keys]
@@ -1244,15 +1273,49 @@ def load_area(bbox):
                 water_json = None
         return DW, water_json
 
-    # Hauptstraßen-Nähe, Park-Abstand und Wasser-Abstand sind voneinander unabhängig: parallel rechnen
-    with ThreadPoolExecutor(max_workers=3) as _ex:
-        _fn, _fd, _fw = _ex.submit(_calc_noise), _ex.submit(_calc_D), _ex.submit(_calc_DW)
+    def _calc_dog():
+        """Kanten in Hunde-Verbotszonen (Friedhof, Spielplatz, Zoo, dog=no) + Zonen für die Karte."""
+        mask = np.zeros(len(keys), dtype=bool)
+        zjson, nz_ = None, 0
+        if dogz is not None and len(dogz):
+            try:
+                zg = dogz.to_crs(crs)
+                zg["geometry"] = zg.geometry.make_valid()
+                zg = zg[zg.geometry.notna() & ~zg.geometry.is_empty].reset_index(drop=True)
+                nz_ = len(zg)
+                if nz_:
+                    ztree = STRtree(list(zg.geometry))
+                    cnt = np.zeros(len(keys), dtype=np.int16)
+                    for f in (0.2, 0.5, 0.8):
+                        pts = shapely.line_interpolate_point(lines, f, normalized=True)
+                        hit = ztree.query(pts, predicate="intersects")
+                        cnt += np.bincount(hit[0], minlength=len(keys)).clip(0, 1).astype(np.int16)
+                    mask = cnt >= 2  # mindestens zwei von drei Stichpunkten liegen in der Zone
+                    zs = zg.copy()
+                    zs["geometry"] = zs.geometry.simplify(3.0)
+                    zjson = zs[["k", "geometry"]].iloc[:500].to_crs(4326).to_json()
+            except Exception:
+                mask, zjson, nz_ = np.zeros(len(keys), dtype=bool), None, 0
+        return mask, zjson, nz_
+
+    # Hauptstraßen-Nähe, Park-Abstand, Wasser-Abstand und Hundezonen sind voneinander unabhängig: parallel rechnen
+    with ThreadPoolExecutor(max_workers=4) as _ex:
+        _fn, _fd, _fw, _fz = _ex.submit(_calc_noise), _ex.submit(_calc_D), _ex.submit(_calc_DW), _ex.submit(_calc_dog)
         noise = _fn.result()
         D, parks_json, n_parks = _fd.result()
         DW, water_json = _fw.result()
+        zone_mask, dogz_json, n_dogz = _fz.result()
+    dogno = zone_mask | (dogtag == 1)
+    # Belag: ohne Eintrag in den Kartendaten innerhalb von Parks eher Kies/Erde als Asphalt (Schätzung)
+    inside_ = (D <= 0.5).mean(axis=0) >= 0.7
+    surf_est = np.where(~surf_known & inside_ & (surf == 0), 2, surf).astype(np.int8)
+    hard = surf_est < 2
 
     wide = np.array([best[k][5] for k in keys], dtype=np.float32)
     accp = np.array([best[k][6] for k in keys], dtype=np.float32)
+    surf = np.array([best[k][7] for k in keys], dtype=np.int8)
+    surf_known = np.array([best[k][8] for k in keys], dtype=bool)
+    dogtag = np.array([best[k][9] for k in keys], dtype=np.int8)
 
 
     # Gewässer-Nähe je Kante (Abstand zum nächsten See, Teich oder Fluss)
@@ -1264,6 +1327,8 @@ def load_area(bbox):
             "node_list": node_list, "xy": np.array([pos[n] for n in node_list]),
             "eu": np.array([nidx[u] for u, v in keys]), "ev": np.array([nidx[v] for u, v in keys]),
             "names": names, "kinds": kinds, "noise": noise, "wide": wide, "accp": accp,
+            "surf": surf_est, "surf_known": surf_known, "hard": hard, "dogno": dogno, "dogtag": dogtag,
+            "dogz_json": dogz_json, "n_dogz": n_dogz,
             "parks_json": parks_json, "n_parks": n_parks, "n_edges": len(keys)}
 
 
@@ -1323,10 +1388,240 @@ def edge_access_pen(d, hw):
     return min(pen, 60.0)
 
 
+# ------------------------------------------------------- Hundemodus
+HOT_C = 30.0           # ab dieser Außentemperatur: Pfotenwarnung auf Asphalt und Pflaster
+DOG_NO_PEN = 40.0      # Kostenzuschlag für Wege in Hunde-Verbotszonen (praktisch gesperrt)
+_S_ASPHALT = {"asphalt", "concrete", "paved", "chipseal", "bitumen", "metal", "tartan", "rubber", "concrete:lanes"}
+_S_STONE = {"paving_stones", "sett", "cobblestone", "unhewn_cobblestone", "cobblestone:flattened", "concrete:plates",
+            "bricks", "brick", "stone", "pebblestone:paved", "cement", "tiles"}
+_S_SOFT = _UNPAVED | {"wood", "gravel;ground", "dirt/sand", "salt", "grass_paver", "fine_gravel", "compacted", "gravel"}
+SURF_NAMES = ["Asphalt", "Pflaster", "Erde/Kies/Gras"]
+
+
+def _tag1(d, k):
+    v = d.get(k)
+    return str((v[0] if isinstance(v, (list, tuple)) and v else v) or "").strip().lower()
+
+
+def edge_surface(d, hw):
+    """(Belagsklasse, bekannt) einer Kante: 0 Asphalt/Beton, 1 Pflaster/Platten, 2 Erde/Kies/Gras.
+    Steht kein Belag in den Kartendaten, wird er aus der Wegart geschätzt (bekannt = False)."""
+    sf = _tag1(d, "surface").split(";")[0]
+    if sf:
+        if sf in _S_SOFT:
+            return 2, True
+        if sf in _S_ASPHALT:
+            return 0, True
+        if sf in _S_STONE or sf.startswith("paving_stones"):
+            return 1, True
+    if hw in ("path", "track", "bridleway"):
+        return 2, False
+    if hw in ("pedestrian", "steps"):
+        return 1, False
+    return 0, False
+
+
+def edge_dogtag(d):
+    """0 = nichts bekannt / erlaubt, 1 = Hunde verboten (dog=no), 2 = Leinenpflicht (dog=leashed)."""
+    v = _tag1(d, "dog")
+    if v in ("no", "prohibited", "forbidden"):
+        return 1
+    if v in ("leashed", "on_leash", "lead"):
+        return 2
+    return 0
+
+
+def _dog():
+    try:
+        return bool(st.session_state.get("_dog", False))
+    except Exception:
+        return False
+
+
+def _hot():
+    """Ist es heiß genug für die Pfotenwarnung? (Temperatur wird beim Berechnen aus dem Wetter übernommen.)"""
+    try:
+        t = st.session_state.get("_temp")
+        return t is not None and float(t) >= HOT_C
+    except Exception:
+        return False
+
+
 def area_accp(area):
-    """Kostenzuschlag je Kante für Barrierefreiheit (Nullen, wenn der Schalter aus ist)."""
+    """Kostenzuschlag je Kante: Barrierefreiheit (wenn aktiv) und Hundemodus (Verbotszonen praktisch gesperrt,
+    harter Belag etwas teurer, bei Hitze deutlich)."""
+    n = len(area["lengths"])
+    acc, dog, hot = _access(), _dog(), _hot()
+    cache = area.setdefault("_accp_c", {})
+    key = (acc, dog, hot)
+    if key in cache:
+        return cache[key]
     a = area.get("accp")
-    return a if (a is not None and _access()) else np.zeros(len(area["lengths"]), dtype=np.float32)
+    pen = np.array(a, dtype=np.float32) if (a is not None and acc) else np.zeros(n, dtype=np.float32)
+    if dog:
+        dn = area.get("dogno")
+        if dn is not None:
+            pen = pen + DOG_NO_PEN * np.asarray(dn, dtype=np.float32)
+        hard = area.get("hard")
+        if hard is not None:
+            pen = pen + (0.45 if hot else 0.06) * np.asarray(hard, dtype=np.float32)
+    cache[key] = pen
+    return pen
+
+# ---- Wetter (Open-Meteo, ohne Schlüssel): Temperatur für die Pfotenwarnung, Wetter für den Ladehund
+_WX_CACHE, _WX_PEND, _WX_LOCK = {}, {}, threading.Lock()
+
+
+def _wx_fetch(lat, lon):
+    r = requests.get("https://api.open-meteo.com/v1/forecast", headers=UA, timeout=4,
+                     params={"latitude": round(lat, 3), "longitude": round(lon, 3), "timezone": "auto",
+                             "current": "temperature_2m,weather_code,is_day"})
+    c = r.json()["current"]
+    return {"temp": float(c["temperature_2m"]), "code": int(c["weather_code"]), "day": bool(c.get("is_day", 1))}
+
+
+def wx_kind(code, temp, day=True):
+    """Grobe Wetterlage aus dem WMO-Code: sun, rain, snow, cloud."""
+    if code in (71, 73, 75, 77, 85, 86):
+        return "snow"
+    if 51 <= code <= 67 or 80 <= code <= 82 or code >= 95:
+        return "rain"
+    if code in (0, 1) and day:
+        return "sun"
+    return "cloud"
+
+
+def get_weather(lat, lon, wait=0.0):
+    """Aktuelles Wetter am Ort oder None. Wird 10 Minuten gemerkt; der Abruf läuft im Hintergrund und kann
+    abgewartet werden (wait Sekunden). Zum Testen: ?temp=33&wx=sun|rain|snow|cloud in der Adresszeile."""
+    ov = {}
+    try:
+        qp = st.query_params
+        if qp.get("temp") or qp.get("wx"):
+            codes = {"sun": 0, "cloud": 3, "rain": 63, "snow": 73}
+            ov = {"temp": float(str(qp.get("temp", 20)).replace(",", ".")), "code": codes.get(str(qp.get("wx", "sun")), 0), "day": True}
+    except Exception:
+        ov = {}
+    if ov:
+        return ov
+    key = (round(lat, 1), round(lon, 1))
+    now = time.time()
+    with _WX_LOCK:
+        hit = _WX_CACHE.get(key)
+        if hit and now - hit[0] < 600:
+            return hit[1]
+        th = _WX_PEND.get(key)
+        if th is None or not th.is_alive():
+            def work(key=key, lat=lat, lon=lon):
+                try:
+                    w = _wx_fetch(lat, lon)
+                    with _WX_LOCK:
+                        _WX_CACHE[key] = (time.time(), w)
+                except Exception:
+                    with _WX_LOCK:
+                        _WX_CACHE.setdefault(key, (time.time() - 540, None))  # Fehlschlag: nach ~1 Minute neu versuchen
+            th = threading.Thread(target=work, daemon=True)
+            _WX_PEND[key] = th
+            th.start()
+    if wait > 0:
+        th.join(wait)
+    with _WX_LOCK:
+        hit = _WX_CACHE.get(key)
+    return hit[1] if hit else None
+
+
+def dog_prefetch(start_v):
+    """Wetterabruf schon anstoßen, bevor die Ladeansicht erscheint (läuft im Hintergrund)."""
+    if not _dog():
+        return
+    try:
+        lat, lon, _ = _unpack(start_v)
+        get_weather(lat, lon, wait=0.0)
+    except Exception:
+        pass
+
+
+def dog_weather(start_v):
+    """Hundemodus: Temperatur für die Pfotenwarnung am Startpunkt bestimmen (wartet kurz auf den Wetterdienst)."""
+    if not _dog():
+        return
+    try:
+        lat, lon, _ = _unpack(start_v)
+        w = get_weather(lat, lon, wait=3.5)
+        st.session_state["_temp"] = None if not w else w["temp"]
+    except Exception:
+        st.session_state["_temp"] = None
+
+
+def _seg_runs(area, path, mask, limit=80):
+    """Zusammenhängende Wegstücke (mask je Kante des Pfades) als Linien in Breite/Länge für die Karte."""
+    n = len(mask)
+    if not n or not mask.any():
+        return []
+    coords, node_idx = route_geom(area, path)
+    runs, i = [], 0
+    while i < n:
+        if mask[i]:
+            j = i
+            while j + 1 < n and mask[j + 1]:
+                j += 1
+            seg = coords[node_idx[i]:node_idx[j + 1] + 1]
+            if len(seg) >= 2:
+                runs.append(seg)
+            i = j + 1
+        else:
+            i += 1
+    runs = runs[:limit]
+    if not runs:
+        return []
+    ll = gpd.GeoSeries([LineString(r) for r in runs], crs=area["crs"]).to_crs(4326)
+    return [[[round(y, 5), round(x, 5)] for x, y in g.coords] for g in ll]
+
+
+SURF_COL = ["#6B6B6B", "#9A7B5B", "#7C9F4A"]
+
+
+def dog_info(area, path, temp=None):
+    """Hundemodus-Angaben zu einer Route: Belag, Verbotszonen, Leinenpflicht, Pfotenwarnung (+ Karten-Linien)."""
+    H, L = area["H"], area["lengths"]
+    idx = np.array([H[a][b]["i"] for a, b in zip(path[:-1], path[1:])], dtype=int)
+    if not len(idx) or area.get("surf") is None:
+        return None
+    li = L[idx]
+    tot = float(li.sum())
+    if tot <= 0:
+        return None
+    surf = area["surf"][idx]
+    known = area["surf_known"][idx]
+    share = [float(li[surf == k].sum() / tot) for k in range(3)]
+    est = float(li[~known].sum() / tot)
+    forb = np.asarray(area["dogno"])[idx]
+    leash = np.asarray(area["dogtag"])[idx] == 2
+    hard = surf < 2
+    hot = temp is not None and temp >= HOT_C
+    hard_m = float(li[hard].sum())
+    info = {"surf": [[SURF_NAMES[k], round(share[k] * 100), SURF_COL[k]] for k in range(3) if share[k] >= 0.01],
+            "est": round(est * 100), "forb": round(float(li[forb].sum())), "leash": round(float(li[leash].sum())),
+            "temp": None if temp is None else round(temp), "paw": ""}
+    if hot:
+        if hard_m / tot >= 0.05:
+            info["paw"] = (f"🐾 Pfotenwarnung bei {temp:.0f} °C: {hard_m / tot:.0%} der Strecke ({hard_m:.0f} m) sind Asphalt oder Pflaster "
+                           "(rot gepunktet). Der Boden wird viel heißer als die Luft und kann die Pfoten verbrennen. "
+                           "Handrücken-Test: Hältst du ihn keine 5 Sekunden auf den Boden, ist es für Pfoten zu heiß. "
+                           "Lieber früh morgens oder abends gehen.")
+        else:
+            info["paw"] = (f"🐾 Es hat {temp:.0f} °C. Diese Strecke führt fast nur über weichen Boden, das ist gut für die Pfoten. "
+                           "Nimm trotzdem Wasser mit und plane Schattenpausen ein.")
+    segs = {}
+    try:
+        if hot:
+            segs["hot"] = _seg_runs(area, path, hard)
+        if forb.any():
+            segs["forbid"] = _seg_runs(area, path, forb)
+    except Exception:
+        pass
+    return info, segs
+
 
 
 def edge_water(area):
@@ -2135,6 +2430,21 @@ button{transition:transform .15s,background .25s,box-shadow .25s}button:active{t
 #stats b{font-size:1.05rem}
 #hint{font-size:.8rem;opacity:.7;min-height:1em}
 #hint.warn{opacity:1;color:#8A5A1E;font-weight:600}
+#dogbox{max-height:24vh;overflow:auto;-webkit-overflow-scrolling:touch}
+#dogbox:empty{display:none}
+#dogbox .dsurf{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:.82rem;font-weight:600;margin:6px 0 2px}
+#dogbox .dsurf i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+#dogbox .dnote,#dogbox .dok,#dogbox .dbad{font-size:.76rem;margin-top:3px;opacity:.82}
+#dogbox .dok{color:#2E6B3A;opacity:1;font-weight:600}
+#dogbox .dbad{color:#B3261E;opacity:1;font-weight:700}
+#dogbox .dpaw{margin-top:6px;padding:8px 10px;border-radius:12px;background:#FDE6DD;border:1px solid #E9A58E;color:#8A2A12;font-size:.78rem;line-height:1.35;font-weight:600}
+body.dog{--moss:#B8571A;--sage:#E3A96B;--sand:#F3E2C8;--paper:#FFF8EE;--line:#E8CFAA}
+body.dog #go{background:#C8661E}
+body.dog #thxb{background:#C8661E}
+body.dog .chip.on,body.dog .sq.on{background:#FBE3C4;border-color:#E3A96B;box-shadow:0 3px 10px rgba(184,87,26,.25)}
+body.dog #prog>div{background:linear-gradient(90deg,#F0C48A,#B8571A)}
+body.dog #stats div{background:#F8EAD3}
+body.dog #sheet:before{content:"🐾 Hundemodus";display:block;font-size:.68rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#B8571A;margin:-2px 0 4px}
 #navbox{display:none}
 body.nav #navbox{display:block}body.nav #pre{display:none}
 #rem{font-weight:600;font-size:.98rem}
@@ -2165,7 +2475,7 @@ body.nav #navbox{display:block}body.nav #pre{display:none}
 <div id="side"><button id="layers" title="Kartenstil wechseln">🗺️</button><button id="sat" title="Satellit / Luftbild">🛰️</button><button id="fit" title="Ganze Route zeigen">⤢</button><button id="wcbtn" title="Toiletten ein-/ausblenden" style="display:none">🚻</button></div>
 <div id="sheet">
  <div id="ttl"></div>
- <div id="pre"><div id="chips"></div><div id="stats"></div><div id="hint"></div></div>
+ <div id="pre"><div id="chips"></div><div id="stats"></div><div id="hint"></div><div id="dogbox"></div></div>
  <div id="navbox"><div id="rem"></div><div id="prog"><div></div></div></div>
  <div id="btns"><button id="go">▶ Navigation starten</button><button class="sq on" id="vbtn" title="Sprachansagen">🔊</button><button class="sq on" id="fbtn" title="Karte folgt mir">🎯</button><button class="sq" id="lbtn" title="Alle Anweisungen">📋</button><button class="sq" id="demo" title="Demo ohne Gehen">🧪</button></div>
 </div>
@@ -2179,6 +2489,8 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':
 const WALK = D.speed || 80, TOP = D.topPad || 0, ky = 110540;
 const GO = D.mode === 'ab' ? '▶ Route starten' : '▶ Ründchen starten';
 document.documentElement.style.setProperty('--top', TOP + 'px');
+if (D.dog) document.body.classList.add('dog');
+const RC = D.dog ? '#B8571A' : '#3F6B3A', RDONE = D.dog ? '#EBCBA3' : '#B9C9A8', RDOT = D.dog ? '#B8571A' : '#4E6E45';
 
 // Übergang: Wolkendecke, die aufbricht und zur Seite zieht, dahinter zoomt die Karte heran
 (function () {
@@ -2251,6 +2563,10 @@ if (D.water) {
 if (D.parks) {
   L.geoJSON(D.parks, {style: {color: '#7C9F69', weight: 1, fillColor: '#B5CDA0', fillOpacity: .5},
     onEachFeature: (f, l) => { if (f.properties && f.properties.name) l.bindTooltip(f.properties.name, {sticky: true}); }}).addTo(map);
+}
+if (D.dogz) {
+  L.geoJSON(D.dogz, {style: {color: '#C0392B', weight: 1.6, dashArray: '5 4', fillColor: '#E8836F', fillOpacity: .28},
+    onEachFeature: (f, l) => l.bindTooltip('🚫 Hunde: ' + ((f.properties && f.properties.k) || 'Verbot'), {sticky: true})}).addTo(map);
 }
 const pin = e => L.divIcon({html: '<div style="font-size:30px;line-height:30px;filter:drop-shadow(0 2px 3px rgba(0,0,0,.45))">' + e + '</div>',
   className: '', iconSize: [32, 32], iconAnchor: [16, 28]});
@@ -2345,7 +2661,7 @@ function say(t) {
 }
 function fitRoute() {
   if (!coords.length) return;
-  map.fitBounds(L.latLngBounds(coords), {paddingTopLeft: [24, TOP + 24], paddingBottomRight: [24, 250], animate: false});
+  map.fitBounds(L.latLngBounds(coords), {paddingTopLeft: [24, TOP + 24], paddingBottomRight: [24, D.dog ? 340 : 250], animate: false});
 }
 function buildList() {
   let h = '<div style="font-weight:700;margin-bottom:6px">Wegehinweise</div>';
@@ -2378,16 +2694,29 @@ function showOption(i, fit) {
   const showShort = D.mode === 'ab' && i !== 0;
   if (showShort) add(L.polyline(D.options[0].coords, {color: '#C08A47', weight: 4, opacity: .95, dashArray: '8 8'}));
   add(L.polyline(coords, {color: '#fff', weight: 11, opacity: .9}));
-  const mainLine = add(L.polyline(coords, {color: '#3F6B3A', weight: 7, opacity: 1}));
+  const mainLine = add(L.polyline(coords, {color: RC, weight: 7, opacity: 1}));
   drawIn(mainLine, (window.INTRO && !INTRO_DONE) ? 1900 : 0);
-  done = add(L.polyline([], {color: '#B9C9A8', weight: 7, opacity: 1}));
+  done = add(L.polyline([], {color: RDONE, weight: 7, opacity: 1}));
   (o.dups || []).forEach(sg => add(L.polyline(sg, {color: '#E08A1E', weight: 5, opacity: .95, dashArray: '1 9', lineCap: 'round'})));
   steps.forEach((s, k) => { if (k > 0 && k < steps.length - 1)
-    add(L.circleMarker([s.lat, s.lon], {radius: 5, color: '#fff', weight: 2, fillColor: '#4E6E45', fillOpacity: 1})); });
+    add(L.circleMarker([s.lat, s.lon], {radius: 5, color: '#fff', weight: 2, fillColor: RDOT, fillOpacity: 1})); });
+  (o.hot || []).forEach(sg => add(L.polyline(sg, {color: '#E2341D', weight: 5, opacity: .95, dashArray: '1 8', lineCap: 'round'})));
+  (o.forbid || []).forEach(sg => add(L.polyline(sg, {color: '#C0392B', weight: 9, opacity: .8})));
   document.querySelectorAll('.chip').forEach((c, k) => c.classList.toggle('on', k === i));
   $('stats').innerHTML = o.stats.map(s => '<div><span>' + esc(s[0]) + '</span><b>' + esc(s[1]) + '</b></div>').join('');
   $('hint').textContent = (o.hint || '') + (showShort ? ' · gestrichelt: kürzeste Route' : '');
   $('hint').className = o.warn ? 'warn' : '';
+  const dg = o.dog; let dh = '';
+  if (dg) {
+    dh += '<div class="dsurf">' + (dg.surf || []).map(s => '<span><i style="background:' + s[2] + '"></i>' + esc(s[0]) + ' ' + s[1] + ' %</span>').join('') + '</div>';
+    if (dg.est >= 10) dh += '<div class="dnote">Belag zu ' + dg.est + ' % aus der Wegart geschätzt (kein Eintrag in den Kartendaten).</div>';
+    dh += dg.nocheck ? '<div class="dnote">Verbotszonen konnten gerade nicht geprüft werden.</div>' : dg.forb > 0 ? '<div class="dbad">⚠️ ' + dg.forb + ' m führen durch eine Hunde-Verbotszone, die sich nicht umgehen ließ. Bitte Schilder beachten.</div>'
+                      : '<div class="dok">✅ Keine bekannten Hunde-Verbotszonen auf dieser Route</div>';
+    if (dg.leash > 0) dh += '<div class="dnote">🦮 Leinenpflicht auf ' + dg.leash + ' m laut Kartendaten.</div>';
+    if (dg.paw) dh += '<div class="dpaw">' + esc(dg.paw) + '</div>';
+    dh += '<div class="dnote">Nicht jedes Verbot steht in den Kartendaten. Schilder, Leinenpflicht und Brut- und Setzzeit gehen vor.</div>';
+  }
+  $('dogbox').innerHTML = dh;
   $('rem').textContent = 'Gesamt ' + fmt(total) + ' · ca. ' + Math.max(1, Math.round(total / WALK)) + ' min';
   buildList();
   if (fit) fitRoute();
@@ -2415,6 +2744,12 @@ const THX_WALK = [
   'Danke fürs Grünwandern! Jeder Schritt zwischen Bäumen tut dir gut.',
   'Gut gemacht. Der Weg war grün, jetzt darfst du auf dem Sofa angeben.',
   'Schon ein paar Minuten im Grünen entspannen messbar. Du hast mehr geschafft.'];
+const THX_DOG = [
+  'Geschafft! Dein Hund sagt Wuff, das heißt Danke. Wasser und ein Leckerli verdient er sich jetzt.',
+  'Schöne Runde! Pfoten kurz checken, dann darf er auf dem Sofa schnarchen.',
+  'Ziel erreicht. Schwanzwedeln im Dauerbetrieb: Das war ein Spaziergang nach seinem Geschmack.',
+  'Gut gelaufen! Frische Luft, viele Schnuppermomente und ein zufriedener Hund.',
+  'Angekommen. Nasenarbeit erledigt, Laune bestens. Danke fürs Gassigehen!'];
 const THX_GREEN = [
   'Angekommen! Jetzt viel Spaß im Grün. Schuhe aus, wenn der Rasen es erlaubt.',
   'Da bist du. Hier darf getrödelt, getobt und gestaunt werden.',
@@ -2431,7 +2766,7 @@ function doneFlag(on) {  // merkt sich im Adressfeld der App: Strecke beendet (P
 }
 function showThanks() {
   document.body.classList.add('fin', 'thx'); doneFlag(true);
-  const list = D.kind === 'green' ? THX_GREEN : THX_WALK;
+  const list = D.dog ? THX_DOG : (D.kind === 'green' ? THX_GREEN : THX_WALK);
   let i = Math.floor(Math.random() * list.length), last = -1;
   try { last = +(localStorage.getItem('gw_thx_' + (D.kind || 'walk')) || -1); } catch (e) {}
   if (i === last) i = (i + 1) % list.length;
@@ -2693,12 +3028,123 @@ def parks_geo(area):
     return geo
 
 
+def dogz_geo(area):
+    """Hunde-Verbotszonen als GeoJSON für die Karte (nur im Hundemodus)."""
+    if not _dog() or not area or not area.get("dogz_json"):
+        return None
+    g = area.get("_dogz")
+    if g is None:
+        try:
+            g = json.loads(area["dogz_json"])
+        except Exception:
+            g = {}
+        area["_dogz"] = g
+    return g or None
+
+
 def map_html(payload):
+    if _dog():
+        payload["dog"] = True
+        if payload.get("dogz") is None:
+            payload.pop("dogz", None)
     data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
     return MAP_TEMPLATE.replace("__DATA__", data)
 
 
-def _option(nav, label, sub, hint, stats):
+def dog_forbidden_tags(t):
+    """OSM-Tags einer Fläche: ist sie für Hunde (meist) verboten?"""
+    return (t.get("landuse") == "cemetery" or t.get("amenity") == "grave_yard" or t.get("leisure") in ("playground", "zoo")
+            or t.get("tourism") == "zoo" or str(t.get("dog", "")).lower() in ("no", "prohibited"))
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def dog_zone_rings(s, w, n, e):
+    """Hunde-Verbotszonen in einem Rechteck als [(Name, Ring [(lon, lat), ...])] (Overpass, mit Geometrie)."""
+    b = f"({s},{w},{n},{e})"
+    q = ("[out:json][timeout:20];(" + "".join(f'way["{k}"="{v}"]{b};relation["{k}"="{v}"]{b};' for k, v in DOG_ZONE_TAGS) + ");out geom;")
+    data = _overpass_race(q, 22.0, _ranked_mirrors()[:4])
+    rings = []
+    for el in data.get("elements", []):
+        t = el.get("tags", {})
+        name = next((DOG_ZONE_LABEL[v] for k, v in DOG_ZONE_TAGS if t.get(k) == v and v in DOG_ZONE_LABEL), "Hundeverbot")
+        geoms = []
+        if el.get("type") == "way" and el.get("geometry"):
+            geoms.append(el["geometry"])
+        for m in el.get("members", []) or []:
+            if m.get("role") == "outer" and m.get("geometry"):
+                geoms.append(m["geometry"])
+        for g in geoms:
+            ring = [(p["lon"], p["lat"]) for p in g]
+            if len(ring) >= 4:
+                rings.append((name, ring))
+    return rings
+
+
+def dog_osrm_check(coords):
+    """Läuft eine Route (Liste [lat, lon]) durch eine bekannte Hunde-Verbotszone? -> (Meter, Linien, Namen)."""
+    if not coords or len(coords) < 2:
+        return 0.0, [], []
+    la = [c[0] for c in coords]
+    lo = [c[1] for c in coords]
+    pad = 0.0015
+    s, w = math.floor((min(la) - pad) * 100) / 100, math.floor((min(lo) - pad) * 100) / 100
+    n, e = math.ceil((max(la) + pad) * 100) / 100, math.ceil((max(lo) + pad) * 100) / 100
+    rings = dog_zone_rings(round(s, 2), round(w, 2), round(n, 2), round(e, 2))
+    if not rings:
+        return 0.0, [], []
+    boxes = [(min(p[0] for p in r), min(p[1] for p in r), max(p[0] for p in r), max(p[1] for p in r)) for _, r in rings]
+    flag, names = [], set()
+    for lat, lon in coords:
+        hit = None
+        for (nm, r), (x0, y0, x1, y1) in zip(rings, boxes):
+            if x0 <= lon <= x1 and y0 <= lat <= y1 and _in_poly(lon, lat, r):
+                hit = nm
+                break
+        flag.append(hit)
+        if hit:
+            names.add(hit)
+    runs, meters, i = [], 0.0, 0
+    ky = 110540.0
+    while i < len(coords):
+        if flag[i]:
+            j = i
+            while j + 1 < len(coords) and flag[j + 1]:
+                j += 1
+            seg = [list(c) for c in coords[max(0, i - 1):min(len(coords), j + 2)]]
+            if len(seg) >= 2:
+                runs.append(seg)
+                kx = 111320.0 * math.cos(math.radians(seg[0][0]))
+                meters += sum(math.hypot((q[0] - p[0]) * ky, (q[1] - p[1]) * kx) for p, q in zip(seg[:-1], seg[1:]))
+            i = j + 1
+        else:
+            i += 1
+    return meters, runs[:60], sorted(names)
+
+
+def _option(nav, label, sub, hint, stats, area=None, path=None):
+    extra = {}
+    if _dog() and area is not None and path:
+        try:
+            di = dog_info(area, path, st.session_state.get("_temp"))
+            if di:
+                info, segs_ = di
+                extra = {"dog": info, "hot": segs_.get("hot", []), "forbid": segs_.get("forbid", [])}
+        except Exception:
+            extra = {}
+    elif _dog() and area is None:
+        # Routen ohne eigenes Wegenetz (Kartenserver-Routing): Verbotszonen nachträglich prüfen, Belag ist unbekannt
+        try:
+            m, runs, names = dog_osrm_check(nav.get("coords") or [])
+        except Exception:
+            m, runs, names = None, [], []
+        info = {"surf": [], "est": 0, "forb": round(m or 0), "leash": 0, "temp": None, "paw": "",
+                "nocheck": m is None}
+        t_ = st.session_state.get("_temp")
+        if t_ is not None and t_ >= HOT_C:
+            info["paw"] = (f"🐾 Pfotenwarnung bei {t_:.0f} °C: Der Belag dieser Route ist nicht bekannt. In der Stadt sind Wege meist "
+                           "Asphalt oder Pflaster und können die Pfoten verbrennen. Handrücken-Test: keine 5 Sekunden Hand auf dem Boden "
+                           "halten können heißt zu heiß. Lieber früh morgens oder abends gehen.")
+        extra = {"dog": info, "forbid": runs}
     share, segs = dup_from_coords(nav.get("coords") or [])
     if re.search(r"\d+% ohne Doppelweg", hint):
         hint = re.sub(r"\d+% ohne Doppelweg", f"{1 - share:.0%} ohne Doppelweg", hint)
@@ -2706,7 +3152,7 @@ def _option(nav, label, sub, hint, stats):
         hint += f" · {share:.0%} Doppelweg"
     if segs and share >= 0.02:
         hint += " · orange markiert = doppelt gelaufen"
-    return {**nav, "label": label, "sub": sub, "hint": hint, "stats": stats, "dups": segs}
+    return {**nav, "label": label, "sub": sub, "hint": hint, "stats": stats, "dups": segs, **extra}
 
 
 def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: None):
@@ -2745,14 +3191,15 @@ def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: 
             + (f" · {r['narrow']:.0%} kleine Wege" if LEVELS[name] >= 12 else "")
             + (water_note(area, r['path']) if _water() else ""),
             [["Länge", fmt_km(r["dist"])], ["Dauer", f"{mins} min"],
-             ["Grünanteil", f"{r['green']:.0%}"], ["Hauptstraße", f"{r['noise']:.0%}"]]))
+             ["Grünanteil", f"{r['green']:.0%}"], ["Hauptstraße", f"{r['noise']:.0%}"]],
+            area=area, path=r["path"]))
     if not options:
         raise ValueError("Start und Ziel liegen zu nah beieinander.")
     default = next((i for i, o_ in enumerate(options) if o_["label"] == "Ausgewogen"), 0)
-    payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=parks_geo(area), water=water_geo(area),
+    payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=parks_geo(area), water=water_geo(area), dogz=dogz_geo(area),
                    options=options, default=default, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
-            "start": start_v, "dest": dest_v, "area": area, "bbox": bbox, "buf": buf, "water": _water()}
+            "start": start_v, "dest": dest_v, "area": area, "bbox": bbox, "buf": buf, "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp")}
 
 
 def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
@@ -2792,15 +3239,16 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
             f"Wunschlänge {fmt_km(target)} ({diff:+.0%}) · {1 - v['rep']:.0%} ohne Doppelweg"
             + (water_note(area, v['path']) if _water() else ""),
             [["Länge", fmt_km(v["dist"])], ["Dauer", f"{mins} min"],
-             ["Grünanteil", f"{v['green']:.0%}"], ["Hauptstraße", f"{v.get('noise', 0):.0%}"]]))
+             ["Grünanteil", f"{v['green']:.0%}"], ["Hauptstraße", f"{v.get('noise', 0):.0%}"]],
+            area=area, path=v["path"]))
     if not options:
         raise ValueError("Hier konnte ich keine passende Runde finden. Versuche eine andere Länge "
                          "oder einen anderen Startpunkt.")
-    payload = dict(mode="loop", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=parks_geo(area), water=water_geo(area),
+    payload = dict(mode="loop", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=parks_geo(area), water=water_geo(area), dogz=dogz_geo(area),
                    options=options, default=0, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "loop", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
             "start": start_v, "end": end_v, "km": km, "km_ok": km, "level": level, "buf": buf,
-            "area": area, "bbox_km": bbox_km, "water": _water()}
+            "area": area, "bbox_km": bbox_km, "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp")}
 
 
 # ------------------------------------------------------- Auffangnetz ohne Overpass
@@ -2905,11 +3353,13 @@ def osrm_view(start_v, dest_v):
     payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=None,
                    options=[opt], default=0, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
-            "start": start_v, "dest": dest_v, "area": None, "bbox": None, "buf": 150, "fallback": True}
+            "start": start_v, "dest": dest_v, "area": None, "bbox": None, "buf": 150, "fallback": True,
+            "dog": _dog(), "temp": st.session_state.get("_temp")}
 
 
 def make_ab_view_safe(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: None):
     """Grüne Route; wenn die Kartenserver überlastet sind, automatisch die einfache Fußroute."""
+    dog_weather(start_v)
     try:
         return make_ab_view(start_v, dest_v, buf, area, bbox, log)
     except ValueError:
@@ -3184,7 +3634,7 @@ def _edt(mask, cell):
 
 
 @st.cache_resource(show_spinner=False, max_entries=2, ttl=3600)
-def scan_area(bbox, water=False):
+def scan_area(bbox, water=False, dog=False):
     """Lädt die Vektorkacheln für das Gebiet und baut die Abstandskarten."""
     if ndimage is None:
         raise RuntimeError("scipy fehlt (requirements.txt aktualisieren)")
@@ -3218,7 +3668,7 @@ def scan_area(bbox, water=False):
         for lname, feats in layers.items():
             for extent, gtype, parts, props in feats:
                 cls, sub = props.get("class"), props.get("subclass")
-                if gtype == 3 and _is_green(lname, cls, sub):
+                if gtype == 3 and _is_green(lname, cls, sub) and not (dog and lname == "landuse" and cls in ("cemetery", "playground")):
                     for ring in parts:
                         if len(ring) < 4:
                             continue
@@ -3566,7 +4016,7 @@ def scan_ab_view(start_v, dest_v, buf=150, log=lambda *_: None):
                          f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
     log("🛰️ Grün-Scan: Grünflächen und Hauptstraßen aus Kartenkacheln laden")
     t0 = time.time()
-    sa = scan_area(bbox, _water())
+    sa = scan_area(bbox, _water(), _dog())
     log(f"✅ {sa['n_green']} Grünflächen erkannt, {sa['green_share']:.0%} des Gebiets grün "
         f"({time.time() - t0:.0f} s)")
     log("🧭 Wegvarianten vergleichen (direkt, durch Parks, seitliche Umwege)")
@@ -3600,7 +4050,7 @@ def scan_ab_view(start_v, dest_v, buf=150, log=lambda *_: None):
     payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=sa["geo"], water=sa.get("wgeo"),
                    options=options, default=default, speed=M_PER_MIN, topPad=TOP_PAD, attrib=SCAN_ATTRIB)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
-            "start": start_v, "dest": dest_v, "area": None, "bbox": None, "buf": buf, "fallback": "scan", "water": _water()}
+            "start": start_v, "dest": dest_v, "area": None, "bbox": None, "buf": buf, "fallback": "scan", "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp")}
 
 
 def scan_loop_view(start_v, end_v, km, level, buf=150, log=lambda *_: None, progress=None):
@@ -3617,7 +4067,7 @@ def scan_loop_view(start_v, end_v, km, level, buf=150, log=lambda *_: None, prog
         raise ValueError("Start und Ende liegen zu weit auseinander für diese Länge.")
     log("🛰️ Grün-Scan: Grünflächen und Hauptstraßen aus Kartenkacheln laden")
     t0 = time.time()
-    sa = scan_area(loop_bbox(p1, p2, target), _water())
+    sa = scan_area(loop_bbox(p1, p2, target), _water(), _dog())
     log(f"✅ {sa['n_green']} Grünflächen erkannt, {sa['green_share']:.0%} des Gebiets grün "
         f"({time.time() - t0:.0f} s)")
     log("🔄 Runden in verschiedene Richtungen probieren (ca. 10 s)")
@@ -3659,12 +4109,13 @@ def scan_loop_view(start_v, end_v, km, level, buf=150, log=lambda *_: None, prog
                    options=options, default=0, speed=M_PER_MIN, topPad=TOP_PAD, attrib=SCAN_ATTRIB)
     return {"mode": "loop", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
             "start": start_v, "end": end_v, "km": km, "km_ok": km, "level": level, "buf": buf,
-            "area": None, "bbox_km": None, "fallback": "scan", "water": _water()}
+            "area": None, "bbox_km": None, "fallback": "scan", "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp")}
 
 
 def make_loop_view_safe(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
                         log=lambda *_: None, progress=None):
     """Ründchen mit Overpass-Daten; wenn die Server überlastet sind, per Grün-Scan."""
+    dog_weather(start_v)
     try:
         return make_loop_view(start_v, end_v, km, level, buf, area, bbox_km, log, progress)
     except ValueError:
@@ -3793,8 +4244,8 @@ def tour_extra_variants(area, g, lam, mu, wq, nodes, extra_m):
     return picked
 
 
-def _tour_payload(mode_extra, p1, pe, t1, t2, stops, options, parks, default, attrib=None, water=None):
-    payload = dict(mode="tour", p1=list(p1), p2=list(pe), t1=t1, t2=t2, parks=parks, options=options,
+def _tour_payload(mode_extra, p1, pe, t1, t2, stops, options, parks, default, attrib=None, water=None, dogz=None):
+    payload = dict(mode="tour", dogz=dogz, p1=list(p1), p2=list(pe), t1=t1, t2=t2, parks=parks, options=options,
                    default=default, speed=M_PER_MIN, topPad=TOP_PAD,
                    stops=[[a, b, _short(lab)] for a, b, lab in stops])
     if attrib:
@@ -3863,15 +4314,15 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
             f"{pre}{1 - rep:.0%} ohne Doppelweg" + (f" · {narrow:.0%} kleine Wege" if LEVELS[level if extra_m > 0 else name] >= 12 else "")
             + (water_note(area, path) if _water() else ""),
             [["Länge", fmt_km(dist)], ["Dauer", f"{mins} min"], ["Grünanteil", f"{green:.0%}"],
-             ["Hauptstraße", f"{noise:.0%}"]]))
+             ["Hauptstraße", f"{noise:.0%}"]], area=area, path=path))
     if not options:
         raise ValueError("Ich konnte keine Runde mit diesen Zwischenzielen finden.")
     default = next((i for i, o_ in enumerate(options) if o_["label"] == level), 0)
     payload = _tour_payload(None, pts[0], pts[-1], names[0], names[-1], stops, options, parks_geo(area), default,
-                            water=water_geo(area))
+                            water=water_geo(area), dogz=dogz_geo(area))
     return {"mode": "tour", "html": map_html(payload), "p1": pts[0], "p2": pts[-1], "t1": names[0],
             "t2": names[-1], "stops": names[1:-1], "start": start_v, "buf": buf, "stops_v": list(stops_v),
-            "end_v": end_v, "level": level, "extra_km": extra_km, "water": _water()}
+            "end_v": end_v, "level": level, "extra_km": extra_km, "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp")}
 
 
 def _merge_routes(routes):
@@ -3958,7 +4409,7 @@ def scan_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
         raise ValueError(f"Die Punkte liegen {span / 1000:.1f} km auseinander. "
                          f"Bitte höchstens {MAX_SPAN_M // 1000} km wählen.")
     log("🛰️ Grün-Scan: Grünflächen und Hauptstraßen aus Kartenkacheln laden")
-    sa = scan_area(bbox, _water())
+    sa = scan_area(bbox, _water(), _dog())
     legs = []
     for k, (a, b) in enumerate(zip(pts[:-1], pts[1:])):
         log(f"🧭 Teilstrecke {k + 1} von {len(pts) - 1} prüfen")
@@ -4025,10 +4476,11 @@ def scan_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
                             attrib=SCAN_ATTRIB, water=sa.get("wgeo"))
     return {"mode": "tour", "html": map_html(payload), "p1": pts[0], "p2": pts[-1], "t1": names[0],
             "t2": names[-1], "stops": names[1:-1], "start": start_v, "buf": buf, "fallback": "scan",
-            "stops_v": list(stops_v), "end_v": end_v, "level": level, "extra_km": extra_km, "water": _water()}
+            "stops_v": list(stops_v), "end_v": end_v, "level": level, "extra_km": extra_km, "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp")}
 
 
 def make_tour_view_safe(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None, extra_km=0):
+    dog_weather(start_v)
     try:
         return make_tour_view(start_v, stops_v, end_v, level, buf, log, extra_km)
     except ValueError:
@@ -4185,6 +4637,8 @@ def rank_greens(greens, feats, prefer, avoid, size_range, pos, min_ha=0.2, min_d
     lo_ha, hi_ha = size_range
     out = []
     for e in greens:
+        if _dog() and dog_forbidden_tags(e.get("tags", {})):
+            continue  # Hundemodus: Friedhöfe, Spielplätze, Zoos und dog=no kommen nicht als Ziel infrage
         b = _bounds(e)
         if not b:
             continue
@@ -4264,6 +4718,7 @@ def fmt_ha(ha):
 
 def green_view(start_v, g, prefer, avoid):
     """Schnellster Fußweg zur gewählten Grünfläche, in der Kartenansicht mit Begründung."""
+    dog_weather(start_v)
     lat1, lon1, lab1 = _unpack(start_v)
     p1, p2 = (lat1, lon1), g["target"]
     t1 = lab1.split(" · ")[0]
@@ -4291,7 +4746,8 @@ def green_view(start_v, g, prefer, avoid):
     payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=None, kind="green",
                    options=[opt], default=0, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
-            "start": start_v, "dest": _pack(p2[0], p2[1], t2), "area": None, "bbox": None, "buf": 150}
+            "start": start_v, "dest": _pack(p2[0], p2[1], t2), "area": None, "bbox": None, "buf": 150,
+            "dog": _dog(), "temp": st.session_state.get("_temp")}
 
 
 def _poly_centroid(pts):
@@ -5020,6 +5476,33 @@ st.set_page_config(page_title="GreenWalker", page_icon=page_icon(), layout="cent
                    initial_sidebar_state="collapsed")
 install_icons()
 
+# Hundemodus: eigener Look (warme Orange- und Cremetöne, Pfotenmuster), damit der Modus auf einen Blick erkennbar ist
+DOG_CSS = """
+<style>
+.stApp,[data-testid="stAppViewContainer"],[data-testid="stMain"]{background-color:#FCEBD3!important;
+ background-image:url("data:image/svg+xml,__PAW__")!important}
+.stApp .hero{background:linear-gradient(135deg,#B8571A,#E58F3E)!important;box-shadow:0 6px 18px rgba(140,70,20,.35)}
+.stApp .hero .ico{font-size:40px}
+.stApp [data-testid="stToggle"] input:checked+div,.stApp [data-testid="stToggle"] [aria-checked="true"]{background-color:#D2782A!important}
+.stApp .stButton>button[kind="primary"]{background:#D2782A!important;border-color:#D2782A!important}
+.stApp .stButton>button[kind="primary"]:hover{background:#B8571A!important;border-color:#B8571A!important;box-shadow:0 6px 18px rgba(184,87,26,.4)}
+.stApp .stButton>button{border-color:#E8CFAA!important}
+.stApp [data-testid="stButtonGroup"] button[aria-checked="true"],.stApp [data-testid="stButtonGroup"] button[kind*="Active"]{background:#FBE3C4!important;border-color:#E3A96B!important}
+.st-key-card_route,.st-key-card_green,.st-key-card_loop,.st-key-card_tour{background:rgba(255,250,242,.98)!important;border-color:#EBCBA0!important;box-shadow:0 8px 28px rgba(140,70,20,.18)}
+.pill{background:#FBE3C4;border-color:#E3A96B}
+.fld .dot.s{background:#B8571A;box-shadow:0 0 0 3px rgba(184,87,26,.18)}
+.stApp [data-baseweb="select"] > div,.stApp [data-baseweb="input"],.stApp [data-baseweb="base-input"]{background:#FFF8EE!important}
+.st-key-dog_mode{border-color:#E3A96B!important;background:#FFF1DD!important}
+</style>
+""".replace("__PAW__", "%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140' viewBox='0 0 140 140'%3E%3Cg fill='%23B8571A' fill-opacity='.07'%3E%3Cg transform='translate(34 36) rotate(-18)'%3E%3Cellipse cx='0' cy='6' rx='9' ry='7.5'/%3E%3Cellipse cx='-11' cy='-7' rx='3.8' ry='5'/%3E%3Cellipse cx='-4' cy='-12' rx='3.8' ry='5'/%3E%3Cellipse cx='4' cy='-12' rx='3.8' ry='5'/%3E%3Cellipse cx='11' cy='-7' rx='3.8' ry='5'/%3E%3C/g%3E%3Cg transform='translate(100 104) rotate(14)'%3E%3Cellipse cx='0' cy='6' rx='9' ry='7.5'/%3E%3Cellipse cx='-11' cy='-7' rx='3.8' ry='5'/%3E%3Cellipse cx='-4' cy='-12' rx='3.8' ry='5'/%3E%3Cellipse cx='4' cy='-12' rx='3.8' ry='5'/%3E%3Cellipse cx='11' cy='-7' rx='3.8' ry='5'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E")
+DOG_BASE_CSS = """<style>
+.st-key-dog_mode{background:rgba(251,248,241,.98);border:1px solid #D9CFBC;border-radius:16px;padding:8px 14px 4px;margin:0 0 10px;
+ box-shadow:0 4px 14px rgba(60,50,30,.12)}
+.dogchip{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center;font-size:.86rem;font-weight:600;padding:8px 12px;margin:0 0 10px;
+ border-radius:14px;background:#FFF1DD;border:1px solid #E3A96B;color:#5A3513}
+.dogwarn{padding:10px 12px;border-radius:14px;background:#FDE6DD;border:1px solid #E9A58E;color:#8A2A12;font-size:.88rem;font-weight:600;margin:0 0 10px;line-height:1.4}
+</style>"""
+
 BASE_CSS = """
 <style>
 :root{--moss:#4E6E45;--sage:#9DB38A;--sand:#E9E1D2;--paper:#FBF8F1;--line:#D9CFBC;--text:#3B3A33}
@@ -5087,6 +5570,217 @@ html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp 
 @media (prefers-reduced-motion:reduce){.st-key-card_route,.st-key-card_green,.st-key-card_loop,.st-key-card_tour,.hero{animation:none}}
 </style>
 """
+
+
+# ---- Ladehund (Hundemodus): kleiner animierter Hund je Jahreszeit und Wetter
+DOG_SCENE_CSS = """
+#gwload .dogscene{position:relative;width:min(70vw,260px);filter:drop-shadow(0 8px 14px rgba(90,50,20,.18))}
+#gwload .dogscene svg{display:block;width:100%;height:auto;overflow:visible}
+#gwload .dogscene .tail{transform-origin:150px 126px;animation:gwd-wag .45s ease-in-out infinite alternate}
+#gwload .dogscene .ear.l{transform-origin:94px 66px;animation:gwd-earl 1.6s ease-in-out infinite}
+#gwload .dogscene .ear.r{transform-origin:146px 66px;animation:gwd-earr 1.6s ease-in-out infinite}
+#gwload .dogscene .eye{transform-origin:120px 76px;animation:gwd-blink 3.4s infinite}
+#gwload .dogscene .tongue{transform-origin:120px 98px;animation:gwd-tongue .7s ease-in-out infinite alternate}
+#gwload .dogscene .sweat{animation:gwd-sweat 1.6s ease-in infinite}
+#gwload .dogscene .fl{animation:gwd-fall 3.6s linear infinite}
+#gwload .dogscene .lf{animation:gwd-leaf 4.2s ease-in-out infinite}
+#gwload .dogscene .pop{animation:gwd-pop 1.3s ease-out infinite}
+#gwload .dogscene .puff{transform-origin:center;transform-box:fill-box;animation:gwd-puff 1.1s ease-out infinite}
+#gwload .dogscene .jet{animation:gwd-jet .5s linear infinite}
+#gwload .dogscene .dp{animation:gwd-drop 1s ease-in infinite}
+#gwload .dogscene .dirt{animation:gwd-dirt .7s ease-out infinite}
+#gwload .dogscene .flw{animation:gwd-sway 2.6s ease-in-out infinite alternate}
+#gwload .dogscene .bfly{animation:gwd-fly 7s ease-in-out infinite}
+#gwload .dogscene .wing{transform-origin:0 0;animation:gwd-flap .25s ease-in-out infinite alternate}
+#gwload .dogscene .ripple{transform-origin:center;transform-box:fill-box;animation:gwd-ripple 1.4s ease-out infinite}
+#gwload .sc-winter .dog{animation:gwd-hop 1s ease-in-out infinite}
+#gwload .sc-autumn .dog{animation:gwd-peek 1.7s ease-in-out infinite}
+#gwload .sc-summer .dog{animation:gwd-jump 1.2s ease-in-out infinite}
+#gwload .sc-spring .dog{animation:gwd-lean 1s ease-in-out infinite;transform-origin:120px 150px}
+#gwload .sc-spring .paw.l{transform-origin:104px 140px;animation:gwd-dig .36s ease-in-out infinite alternate}
+#gwload .sc-spring .paw.r{transform-origin:136px 140px;animation:gwd-dig .36s .18s ease-in-out infinite alternate}
+#gwload .sc-summer .head{transform-origin:120px 100px;animation:gwd-look 1.2s ease-in-out infinite}
+#gwload .sc-winter .head{transform-origin:120px 100px;animation:gwd-tilt 2s ease-in-out infinite}
+@keyframes gwd-wag{from{transform:rotate(-16deg)}to{transform:rotate(18deg)}}
+@keyframes gwd-earl{0%,100%{transform:rotate(0)}50%{transform:rotate(-7deg)}}
+@keyframes gwd-earr{0%,100%{transform:rotate(0)}50%{transform:rotate(7deg)}}
+@keyframes gwd-blink{0%,92%,100%{transform:scaleY(1)}96%{transform:scaleY(.1)}}
+@keyframes gwd-tongue{from{transform:scaleY(.8)}to{transform:scaleY(1.25)}}
+@keyframes gwd-sweat{0%{opacity:0;transform:translateY(-6px)}25%{opacity:1}100%{opacity:0;transform:translateY(22px)}}
+@keyframes gwd-fall{from{transform:translateY(-30px)}to{transform:translateY(190px)}}
+@keyframes gwd-leaf{0%{transform:translate(0,-30px) rotate(0)}50%{transform:translate(14px,70px) rotate(150deg)}100%{transform:translate(-6px,170px) rotate(320deg)}}
+@keyframes gwd-pop{0%{opacity:0;transform:translateY(8px) scale(.6)}25%{opacity:1}100%{opacity:0;transform:translateY(-34px) rotate(40deg) scale(1)}}
+@keyframes gwd-puff{0%{opacity:.9;transform:scale(.4)}100%{opacity:0;transform:scale(2.2)}}
+@keyframes gwd-jet{to{stroke-dashoffset:-14}}
+@keyframes gwd-drop{0%{opacity:0;transform:translateY(-10px)}20%{opacity:1}100%{opacity:0;transform:translateY(34px)}}
+@keyframes gwd-dirt{0%{opacity:1;transform:translate(0,0)}100%{opacity:0;transform:translate(var(--dx),-52px)}}
+@keyframes gwd-sway{from{transform:rotate(-4deg)}to{transform:rotate(4deg)}}
+@keyframes gwd-fly{0%{transform:translate(20px,50px)}25%{transform:translate(70px,20px)}50%{transform:translate(150px,44px)}75%{transform:translate(200px,16px)}100%{transform:translate(20px,50px)}}
+@keyframes gwd-flap{from{transform:scaleX(1)}to{transform:scaleX(.25)}}
+@keyframes gwd-ripple{0%{opacity:.7;transform:scale(.3)}100%{opacity:0;transform:scale(1.6)}}
+@keyframes gwd-hop{0%,100%{transform:translateY(0)}45%{transform:translateY(-12px)}}
+@keyframes gwd-peek{0%,100%{transform:translateY(14px)}50%{transform:translateY(-4px)}}
+@keyframes gwd-jump{0%,100%{transform:translateY(0) rotate(0)}40%{transform:translateY(-16px) rotate(-3deg)}70%{transform:translateY(-4px) rotate(2deg)}}
+@keyframes gwd-lean{0%,100%{transform:rotate(-4deg)}50%{transform:rotate(-1deg) translateY(2px)}}
+@keyframes gwd-dig{from{transform:translateY(0) rotate(0)}to{transform:translateY(-9px) rotate(-18deg)}}
+@keyframes gwd-look{0%,100%{transform:rotate(4deg)}50%{transform:rotate(-7deg)}}
+@keyframes gwd-tilt{0%,100%{transform:rotate(-4deg)}50%{transform:rotate(5deg)}}
+@media (prefers-reduced-motion:reduce){#gwload .dogscene *{animation:none!important}}
+"""
+
+
+def _dog_body(acc):
+    """Der Hund (Vorderansicht). acc: Zubehör {'sun','rain','scarf','hot'}."""
+    coat = ""
+    hood = ""
+    if "rain" in acc:
+        coat = ('<path d="M88 118 Q120 100 152 118 L158 148 Q120 158 82 148Z" fill="#F2C230" stroke="#D9A81F" stroke-width="2"/>'
+                '<circle cx="120" cy="124" r="2.6" fill="#B8861A"/><circle cx="120" cy="136" r="2.6" fill="#B8861A"/>')
+        hood = ('<path d="M86 84 Q84 44 120 44 Q156 44 154 84 Q148 62 120 61 Q92 62 86 84Z" fill="#F2C230" stroke="#D9A81F" stroke-width="2"/>')
+    scarf = ""
+    if "scarf" in acc and "rain" not in acc:
+        scarf = ('<path d="M92 106 Q120 120 148 106 L150 116 Q120 130 90 116Z" fill="#C8433A"/>'
+                 '<rect x="138" y="112" width="10" height="24" rx="3.5" fill="#C8433A" transform="rotate(-8 140 112)"/>'
+                 '<path d="M138 124 l9 -2 M139 130 l9 -2" stroke="#E9786F" stroke-width="2"/>')
+    glasses = ""
+    if "sun" in acc:
+        glasses = ('<rect x="95" y="68" width="22" height="15" rx="6.5" fill="#1b1b20"/><rect x="123" y="68" width="22" height="15" rx="6.5" fill="#1b1b20"/>'
+                   '<path d="M117 73 h6" stroke="#1b1b20" stroke-width="3"/><path d="M99 72 l6 -1 M127 72 l6 -1" stroke="#fff" stroke-opacity=".55" stroke-width="2" stroke-linecap="round"/>')
+    sweat = '<path class="sweat" d="M158 64 q-6 10 0 13 q6 -3 0 -13z" fill="#7FD0F5"/>' if "hot" in acc else ""
+    return (
+        '<g class="dog">'
+        '<ellipse class="shadow" cx="120" cy="153" rx="42" ry="6" fill="#000" fill-opacity=".13"/>'
+        '<path class="tail" d="M150 128 Q178 116 172 88" stroke="#B97D45" stroke-width="11" fill="none" stroke-linecap="round"/>'
+        '<ellipse cx="120" cy="126" rx="35" ry="28" fill="#D9A066"/><ellipse cx="120" cy="132" rx="18" ry="19" fill="#F3DDB8"/>'
+        + coat + scarf +
+        '<ellipse cx="97" cy="151" rx="12" ry="6.5" fill="#F3DDB8"/><ellipse cx="143" cy="151" rx="12" ry="6.5" fill="#F3DDB8"/>'
+        '<ellipse class="paw l" cx="104" cy="148" rx="11" ry="7.5" fill="#F7E6C8" stroke="#D9A066" stroke-width="1.5"/>'
+        '<ellipse class="paw r" cx="136" cy="148" rx="11" ry="7.5" fill="#F7E6C8" stroke="#D9A066" stroke-width="1.5"/>'
+        '<g class="head">'
+        '<ellipse class="ear l" cx="92" cy="80" rx="11" ry="23" fill="#8A5A33" transform="rotate(14 92 80)"/>'
+        '<ellipse class="ear r" cx="148" cy="80" rx="11" ry="23" fill="#8A5A33" transform="rotate(-14 148 80)"/>'
+        '<circle cx="120" cy="82" r="30" fill="#D9A066"/><circle cx="106" cy="76" r="10" fill="#B97D45"/>'
+        '<ellipse cx="120" cy="94" rx="16" ry="12" fill="#F3DDB8"/>'
+        '<g class="eye"><circle cx="107" cy="76" r="4.8" fill="#2B2018"/><circle cx="133" cy="76" r="4.8" fill="#2B2018"/>'
+        '<circle cx="108.7" cy="74.3" r="1.6" fill="#fff"/><circle cx="134.7" cy="74.3" r="1.6" fill="#fff"/></g>'
+        '<path d="M99 66 q7 -5 14 -1 M127 65 q7 -4 14 1" stroke="#7A4A25" stroke-width="2" fill="none" stroke-linecap="round"/>'
+        + glasses +
+        '<ellipse cx="120" cy="88.5" rx="6.8" ry="4.8" fill="#3A2A22"/><ellipse cx="118" cy="87" rx="2" ry="1.2" fill="#fff" fill-opacity=".6"/>'
+        '<path d="M120 93 v4 M120 97 q-6 5 -11 .5 M120 97 q6 5 11 .5" stroke="#3A2A22" stroke-width="1.8" fill="none" stroke-linecap="round"/>'
+        '<path class="tongue" d="M115 99 q5 14 10 0z" fill="#F08A9A"/>'
+        + hood + sweat +
+        '</g></g>')
+
+
+def _flakes():
+    xs = [14, 38, 62, 88, 110, 136, 160, 184, 208, 226, 50, 150]
+    out = []
+    for i, x in enumerate(xs):
+        out.append(f'<circle class="fl" cx="{x}" cy="0" r="{2 + (i % 3) * .6:.1f}" fill="#fff" stroke="#BFD6E8" stroke-width=".6" '
+                   f'style="animation-delay:-{(i * 0.37) % 3.6:.2f}s;animation-duration:{3.2 + (i % 4) * .5:.1f}s"/>')
+    return "".join(out)
+
+
+def _leaves():
+    cols = ["#D9731F", "#B8381F", "#E8B534", "#9A5B22"]
+    out = []
+    for i, x in enumerate([22, 58, 96, 140, 178, 212]):
+        c = cols[i % 4]
+        out.append(f'<g transform="translate({x} 0)"><path class="lf" d="M0 0 q7 -9 14 0 q-7 9 -14 0z" fill="{c}" '
+                   f'style="animation-delay:-{i * 0.7:.1f}s;animation-duration:{3.6 + (i % 3) * .6:.1f}s"/></g>')
+    return "".join(out)
+
+
+def _pile():
+    cols = ["#D9731F", "#B8381F", "#E8B534", "#9A5B22", "#C9501F", "#EFC24A"]
+    blobs = [(70, 152, 34, 14), (100, 156, 36, 15), (130, 156, 38, 15), (160, 152, 34, 14), (86, 144, 30, 12), (118, 146, 34, 13),
+             (150, 144, 30, 12), (104, 138, 24, 9), (136, 139, 24, 9)]
+    out = [f'<ellipse cx="{x}" cy="{y}" rx="{rx}" ry="{ry}" fill="{cols[i % 6]}"/>' for i, (x, y, rx, ry) in enumerate(blobs)]
+    for i, x in enumerate([92, 120, 148, 108, 134]):
+        out.append(f'<path class="pop" d="M{x} 140 q6 -8 12 0 q-6 8 -12 0z" fill="{cols[(i + 2) % 6]}" style="animation-delay:-{i * .27:.2f}s"/>')
+    return "".join(out)
+
+
+def dog_scene_html(scene="spring", acc=()):
+    """Animierte Ladeszene: Hund im Schnee, im Laubhaufen, mit Wasserschlauch oder im Blumenbeet (je Jahreszeit)."""
+    acc = set(acc)
+    dog = _dog_body(acc)
+    if scene == "winter":
+        bg = ('<ellipse cx="120" cy="160" rx="114" ry="24" fill="#F6FAFD"/><ellipse cx="50" cy="152" rx="40" ry="12" fill="#fff"/>'
+              '<ellipse cx="192" cy="153" rx="38" ry="11" fill="#fff"/><g>' + _flakes() + '</g>')
+        fg = ('<ellipse cx="82" cy="156" rx="30" ry="9" fill="#fff"/><ellipse cx="160" cy="157" rx="30" ry="9" fill="#fff"/>'
+              '<circle class="puff" cx="100" cy="150" r="7" fill="#fff" stroke="#CFE0EE"/><circle class="puff" cx="140" cy="150" r="6" fill="#fff" stroke="#CFE0EE" style="animation-delay:-.4s"/>'
+              '<circle class="puff" cx="120" cy="154" r="5" fill="#fff" stroke="#CFE0EE" style="animation-delay:-.8s"/>'
+              '<circle cx="120" cy="86" r="0" fill="#fff"/>')
+    elif scene == "autumn":
+        bg = '<ellipse cx="120" cy="160" rx="114" ry="22" fill="#E7C48B"/><g>' + _leaves() + '</g>'
+        fg = _pile()
+    elif scene == "summer":
+        jets = "".join(
+            f'<path class="jet" d="M206 96 Q{q} {qy} {ex} {ey}" stroke="#69C3F2" stroke-width="{w}" fill="none" stroke-dasharray="7 7" stroke-linecap="round" style="animation-delay:-{d}s"/>'
+            for q, qy, ex, ey, w, d in ((178, 62, 148, 118, 3.5, 0), (182, 70, 160, 126, 3, .15), (172, 58, 134, 112, 2.6, .3)))
+        drops = "".join(f'<circle class="dp" cx="{x}" cy="{y}" r="2.4" fill="#8AD3F7" style="animation-delay:-{d}s"/>'
+                        for x, y, d in ((150, 112, 0), (158, 118, .3), (140, 108, .55), (164, 124, .8), (132, 104, .15)))
+        bg = ('<ellipse cx="120" cy="160" rx="114" ry="22" fill="#A5D274"/>'
+              '<path d="M150 118 a46 46 0 0 1 80 -8" stroke="#F4A3A3" stroke-width="3" fill="none" opacity=".4"/>'
+              '<path d="M154 118 a42 42 0 0 1 72 -8" stroke="#F6D36B" stroke-width="3" fill="none" opacity=".4"/>'
+              '<path d="M158 118 a38 38 0 0 1 64 -8" stroke="#8AD3A3" stroke-width="3" fill="none" opacity=".4"/>')
+        fg = ('<ellipse cx="128" cy="156" rx="46" ry="8" fill="#9ED5F2" fill-opacity=".55"/><ellipse class="ripple" cx="128" cy="156" rx="30" ry="5" fill="none" stroke="#fff" stroke-width="2"/>'
+              '<rect x="198" y="92" width="14" height="9" rx="3" fill="#F2B632" transform="rotate(-18 205 96)"/>'
+              '<path d="M210 99 Q228 104 226 124 Q224 142 204 152" stroke="#2F8F5B" stroke-width="6" fill="none" stroke-linecap="round"/>'
+              + jets + drops)
+    else:  # spring
+        flowers = ""
+        for i, (x, col) in enumerate(((34, "#F26B8A"), (56, "#F6C945"), (186, "#B77BE0"), (210, "#F26B6B"), (20, "#FFFFFF"))):
+            y0 = 150 - (i % 2) * 4
+            flowers += (f'<g class="flw" style="transform-origin:{x}px {y0}px;animation-delay:-{i * .5}s">'
+                        f'<path d="M{x} {y0} v-34" stroke="#4E8F3A" stroke-width="3" stroke-linecap="round"/>'
+                        f'<path d="M{x} {y0 - 12} q-9 -4 -11 -12 q8 0 11 12z M{x} {y0 - 14} q9 -4 11 -12 q-8 0 -11 12z" fill="#5FA449"/>'
+                        f'<path d="M{x - 8} {y0 - 36} q8 -16 16 0 q-2 11 -8 12 q-6 -1 -8 -12z" fill="{col}"/></g>')
+        bg = ('<ellipse cx="120" cy="160" rx="114" ry="22" fill="#B9DD87"/><ellipse cx="120" cy="153" rx="84" ry="14" fill="#8B5E3C"/>'
+              '<ellipse cx="96" cy="154" rx="14" ry="3" fill="#6F4A2E"/><ellipse cx="146" cy="152" rx="16" ry="3" fill="#6F4A2E"/>' + flowers +
+              '<g class="bfly"><g class="wing"><ellipse cx="-5" cy="0" rx="6" ry="4" fill="#F6C945"/></g><g class="wing" style="transform:scaleX(-1)"><ellipse cx="-5" cy="0" rx="6" ry="4" fill="#F6C945"/></g></g>')
+        fg = "".join(f'<circle class="dirt" cx="{x}" cy="150" r="{r}" fill="#7A5232" style="--dx:{dx}px;animation-delay:-{d}s"/>'
+                     for x, r, dx, d in ((108, 3.2, -26, 0), (116, 2.6, -12, .15), (124, 3, 12, .3), (132, 3.4, 28, .45), (112, 2.2, -40, .55), (128, 2.2, 38, .1)))
+    return (f'<div class="dogscene sc-{scene}"><svg viewBox="0 0 240 172" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'
+            + bg + dog + fg + '</svg></div>')
+
+
+def dog_scene_for(wx, temp, month):
+    """(Szene, Zubehör) aus Wetterlage (sun/rain/snow/cloud/None), Temperatur und Monat."""
+    season = ("winter", "winter", "spring", "spring", "spring", "summer", "summer", "summer", "autumn", "autumn", "autumn", "winter")[month - 1]
+    scene = season
+    if wx == "snow" or (temp is not None and temp <= 0):
+        scene = "winter"
+    acc = []
+    if wx == "rain":
+        acc.append("rain")
+    elif wx == "sun" and (temp is None or temp >= 10):
+        acc.append("sun")
+    if (scene == "winter" or (temp is not None and temp <= 4)) and "rain" not in acc:
+        acc.append("scarf")
+    if temp is not None and temp >= 30:
+        acc.append("hot")
+    return scene, acc
+
+
+DOG_OVERLAY_CSS = """
+#gwload{background:#FCEBD3}
+#gwload .bar{background:rgba(184,87,26,.18)}
+#gwload .bar:after{background:#C8661E}
+#gwload .fact small{color:#B8571A}
+#gwload .fact{border-color:#E8CFAA;background:rgba(255,248,238,.85)}
+"""
+DOG_FACTS = [
+    "Hunde haben bis zu 300 Millionen Riechzellen, Menschen nur etwa 6 Millionen. Beim Schnüffeln liest dein Hund die Nachrichten der Nachbarschaft.",
+    "Hunde kühlen sich vor allem durch Hecheln und über die Pfotenballen. Zum Schwitzen taugt ihre Haut kaum, deshalb sind heiße Tage so anstrengend.",
+    "Asphalt kann an einem Sommertag deutlich heißer als 50 °C werden, auch wenn die Luft nur 30 °C hat. Der Handrücken-Test hilft: Fünf Sekunden müssen auszuhalten sein.",
+    "Schnüffeln ist für Hunde Arbeit: Zehn Minuten Nasenspaziergang machen oft müder und zufriedener als reines Laufen.",
+    "Zecken sind von März bis Oktober aktiv. Nach Spaziergängen durch hohes Gras lohnt sich ein kurzer Blick ins Fell.",
+    "Schokolade, Weintrauben und Zwiebeln sind für Hunde giftig. Beim Picknick im Park also nichts davon abgeben.",
+    "Auf Friedhöfen, Spielplätzen und in vielen Zoos sind Hunde verboten. In Grünanlagen gilt oft Leinenpflicht, besonders zur Brut- und Setzzeit.",
+    "Hunde erkennen die Stimmung ihrer Menschen an Tonfall und Körpersprache. Ein entspannter Spaziergang tut beiden gut.",
+]
 
 
 # Ladeansicht beim Berechnen: Wolken ziehen, Logo atmet, Sprüche wechseln. Gleiche Farbe wie die Wolkendecke der
@@ -5451,6 +6145,15 @@ class Overlay:
         except Exception:
             seen = None
         self.facts = pick_facts(lat, lon, water, seen=seen)
+        self.dog = _dog()
+        self.pos = (lat, lon) if lat is not None else None
+        if self.dog:
+            self.facts = random.sample(DOG_FACTS, 3) + self.facts[:5]
+            if self.pos:
+                try:
+                    get_weather(lat, lon, wait=0.3)
+                except Exception:
+                    pass
         self.bg = ""
         self.city = ""
         self._bgt = None
@@ -5482,9 +6185,25 @@ class Overlay:
                     .replace("__STAGE__", escape(self.stage)).replace("__FACTS__", facts)
                     .replace("__LABEL__", "Wusstest du?")
                     .replace("__CITYBG__", self._bg_html()).replace("__BGCLS__", "hasbg"))
+            if self.dog:
+                html = html.replace('<div class="logo"><img src="data:image/svg+xml;base64,' + logo + '" alt=""></div>', self._dog_scene())
+                html = html.replace("</style>", DOG_SCENE_CSS + DOG_OVERLAY_CSS + "</style>", 1)
             self.ph.markdown(html, unsafe_allow_html=True)
         except Exception:
             pass
+
+    def _dog_scene(self):
+        """Ladehund passend zu Jahreszeit und aktuellem Wetter (Sonnenbrille, Regencape, Schal, Schweißtropfen)."""
+        w = None
+        if self.pos:
+            try:
+                w = get_weather(self.pos[0], self.pos[1])
+            except Exception:
+                w = None
+        temp = w["temp"] if w else None
+        wx = wx_kind(w["code"], w["temp"], w["day"]) if w else None
+        scene, acc = dog_scene_for(wx, temp, time.localtime().tm_mon)
+        return dog_scene_html(scene, acc)
 
     def _photo(self):
         u = self.bg or ""
@@ -5699,7 +6418,9 @@ def sources_text(buf, lam):
         f"- Kosten: Länge × (1 + λ × (1 − Grünscore) + {QUIET:g} × Hauptstraßen-Nähe), λ je Grünstufe: "
         + ", ".join(f"{k} {v:g}" for k, v in LEVELS.items())
         + f"\n- Hauptstraßen (Bundes-, Haupt-, Neben-, Kreisstraßen) zählen bis {NOISE_DIST:g} m Abstand als laut "
-        "(bei „Schnellste“ ignoriert)"
+        "(bei „Schnellste“ ignoriert)\n"
+        "- Hundemodus: Verbotszonen (Friedhof, Spielplatz, Zoo, dog=no) und Belag (surface) aus OpenStreetMap; "
+        "Wetter für Pfotenwarnung (ab 30 °C) und Ladehund von Open-Meteo (open-meteo.com, nicht kommerziell)"
     )
 
 
@@ -5742,7 +6463,7 @@ def close_map():
 # den Zustand von Widgets, die in einem Durchlauf nicht gezeichnet werden).
 _KEEP_KEYS = ("page_sel", "water_", "acc_", "san_", "green_prefer", "green_avoid", "green_size", "level_", "loop_km",
               "loop_same", "tour_same", "tour_extra", "n_stops", "start_sb_useloc", "green_sb_useloc", "loop_a_sb_useloc",
-              "tour_a_sb_useloc")
+              "tour_a_sb_useloc", "dog_mode")
 
 
 _BUTTON_KEYS = {"san_plan", "san_show", "san_cancel"}
@@ -5823,6 +6544,8 @@ def render_map_view():
     st.session_state["bias"] = gw["p1"]
     st.session_state["_water"] = bool(gw.get("water", False))
     st.session_state["_access"] = bool(gw.get("access", False))
+    st.session_state["_dog"] = bool(gw.get("dog", False))
+    st.session_state["_temp"] = gw.get("temp")
     dest_new = add_new = None
     with st.container(key="gwtop"):
         if gw["mode"] == "ab":
@@ -6030,6 +6753,8 @@ def replan_with_stops(view, cands):
     stops_new = [_pack(c["lat"], c["lon"], "🚻 " + c["name"] + ("" if c.get("kind") == "pub" else " (Gäste-WC)")) for c in cands]
     st.session_state["_water"] = bool(view.get("water"))
     st.session_state["_access"] = bool(view.get("access"))
+    st.session_state["_dog"] = bool(view.get("dog"))
+    st.session_state["_temp"] = view.get("temp")
     reach = view.get("san_reach")
     lvl = view.get("level") if view.get("level") in TOUR_LEVELS else "Sehr grün"
     if view["mode"] == "ab":
@@ -6082,6 +6807,9 @@ def home_green():
     pos = _unpack(start_v)[:2]
     pc, ac = [GREEN_CAT[x] for x in prefer], [GREEN_CAT[x] for x in avoid]
     view = None
+    st.session_state["_dog"] = bool(st.session_state.get("dog_mode", False))
+    st.session_state["_temp"] = None
+    dog_prefetch(start_v)
     ov = loading_overlay(start_v, "Wassernähe" in prefer)
     with st.status("Grün wird gesucht …", expanded=True) as status:
         try:
@@ -6181,6 +6909,9 @@ def home_route():
     view = None
     st.session_state["_water"] = bool(water_on)
     st.session_state["_access"] = bool(acc_on)
+    st.session_state["_dog"] = bool(st.session_state.get("dog_mode", False))
+    st.session_state["_temp"] = None
+    dog_prefetch(start_v)
     ov = loading_overlay(start_v, water_on)
     with st.status("Route wird vorbereitet …", expanded=True) as status:
         try:
@@ -6220,6 +6951,9 @@ def home_loop():
     view, holder = None, {}
     st.session_state["_water"] = bool(water_on)
     st.session_state["_access"] = bool(acc_on)
+    st.session_state["_dog"] = bool(st.session_state.get("dog_mode", False))
+    st.session_state["_temp"] = None
+    dog_prefetch(a_v)
 
     def prog(f):
         txt = "🔄 Runden in verschiedene Richtungen probieren …"
@@ -6280,6 +7014,9 @@ def home_tour():
     view = None
     st.session_state["_water"] = bool(water_on)
     st.session_state["_access"] = bool(acc_on)
+    st.session_state["_dog"] = bool(st.session_state.get("dog_mode", False))
+    st.session_state["_temp"] = None
+    dog_prefetch(a_v)
     ov = loading_overlay(a_v, water_on)
     with st.status("Runde mit Zwischenzielen wird berechnet …", expanded=True) as status:
         try:
@@ -6293,15 +7030,55 @@ def home_tour():
     ov.empty()
 
 
+def dog_home_info():
+    """Hundemodus auf der Startseite: Wetter am Standort, Pfotenwarnung bei Hitze, Hinweis zu den Regeln."""
+    lat = lon = None
+    try:
+        loc = st.session_state.get("loc_shared")
+        b = st.session_state.get("bias")
+        if loc:
+            lat, lon = loc[0], loc[1]
+        elif b:
+            lat, lon = b[0], b[1]
+    except Exception:
+        pass
+    w = get_weather(lat, lon, wait=1.5) if lat is not None else None
+    parts = []
+    if w:
+        icon = {"sun": "☀️", "rain": "🌧️", "snow": "❄️", "cloud": "☁️"}[wx_kind(w["code"], w["temp"], w["day"])]
+        parts.append(f"{icon} {w['temp']:.0f} °C am Standort")
+    parts.append("🚫 Friedhöfe, Spielplätze und Verbotszonen werden gemieden")
+    parts.append("🐾 Belag wird angezeigt")
+    st.markdown('<div class="dogchip">' + "".join(f"<span>{escape(p)}</span>" for p in parts) + "</div>", unsafe_allow_html=True)
+    if w and w["temp"] >= HOT_C:
+        st.markdown(f'<div class="dogwarn">🐾 Pfotenwarnung: Bei {w["temp"]:.0f} °C heizen Asphalt und Pflaster stark auf '
+                    "und können die Pfoten verbrennen. Die Routen meiden harten Boden, wo es geht, und markieren ihn rot gepunktet. "
+                    "Handrücken-Test: Hältst du ihn keine 5 Sekunden auf den Boden, ist es zu heiß. Besser früh morgens oder abends gehen.</div>",
+                    unsafe_allow_html=True)
+    st.caption("Nicht jedes Verbot steht in den Kartendaten. Schilder vor Ort, Leinenpflicht sowie Brut- und Setzzeit gehen vor.")
+
+
 def render_home():
     restore_widgets()
     snap_widgets()
     back_fx()
+    dog = bool(st.session_state.get("dog_mode", False))
+    st.markdown(DOG_BASE_CSS + (DOG_CSS if dog else ""), unsafe_allow_html=True)
     logo = base64.b64encode(LOGO_SVG.encode()).decode()
-    st.markdown('<div class="hero"><div class="ico"><img src="data:image/svg+xml;base64,' + logo +
-                '" width="46" height="46" alt=""></div><div><h1>GreenWalker</h1>'
-                '<p>Der grüne Weg statt nur der kürzeste.</p></div></div>',
-                unsafe_allow_html=True)
+    if dog:
+        st.markdown('<div class="hero"><div class="ico">🐕</div><div><h1>GreenWalker · Hundemodus</h1>'
+                    '<p>Gassi-Runden im Grünen, ohne Verbotszonen und mit Pfotenschutz.</p></div></div>',
+                    unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="hero"><div class="ico"><img src="data:image/svg+xml;base64,' + logo +
+                    '" width="46" height="46" alt=""></div><div><h1>GreenWalker</h1>'
+                    '<p>Der grüne Weg statt nur der kürzeste.</p></div></div>',
+                    unsafe_allow_html=True)
+    st.toggle("🐕 Hundemodus", key="dog_mode", value=False,
+              help="Für Spaziergänge mit Hund: meidet Friedhöfe, Spielplätze und Hunde-Verbotszonen, zeigt den Belag "
+                   "(Asphalt, Pflaster, Erde) und warnt bei Hitze über 30 °C vor heißem Boden für die Pfoten.")
+    if dog:
+        dog_home_info()
     # Nur der gewählte Reiter wird aufgebaut (st.tabs würde alle drei samt Suchfeldern laden = langsam)
     pages = {"route": "🧭 Route", "green": "🌳 Ins Grün", "loop": "🔄 Ründchen", "tour": "🛍️ Ründchen mit Zwischenziel"}
     try:
