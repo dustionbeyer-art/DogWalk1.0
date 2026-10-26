@@ -1475,9 +1475,28 @@ _WX_CACHE, _WX_PEND, _WX_LOCK = {}, {}, threading.Lock()
 def _wx_fetch(lat, lon):
     r = requests.get("https://api.open-meteo.com/v1/forecast", headers=UA, timeout=4,
                      params={"latitude": round(lat, 3), "longitude": round(lon, 3), "timezone": "auto",
-                             "current": "temperature_2m,weather_code,is_day"})
+                             "current": "temperature_2m,weather_code,is_day,wind_speed_10m,wind_gusts_10m"})
     c = r.json()["current"]
-    return {"temp": float(c["temperature_2m"]), "code": int(c["weather_code"]), "day": bool(c.get("is_day", 1))}
+    return {"temp": float(c["temperature_2m"]), "code": int(c["weather_code"]), "day": bool(c.get("is_day", 1)),
+            "wind": float(c.get("wind_speed_10m") or 0.0), "gust": float(c.get("wind_gusts_10m") or 0.0)}
+
+
+WIND_BREEZY = 30.0   # km/h: spürbar windig
+WIND_STORM = 60.0    # km/h Böen: Sturmböen, Astbruchgefahr
+
+
+def wind_note(w):
+    """Hinweistext zum Wind (leer, wenn es ruhig ist)."""
+    if not w:
+        return ""
+    wind, gust = float(w.get("wind") or 0), float(w.get("gust") or 0)
+    if gust >= WIND_STORM:
+        return (f"💨 Sturmböen bis {gust:.0f} km/h: Wald und Parks mit alten Bäumen heute lieber meiden (Astbruch). "
+                "Hund gut sichern, am besten kurz an der Leine bleiben.")
+    if wind >= WIND_BREEZY or gust >= 45:
+        return (f"💨 Es ist windig ({wind:.0f} km/h, Böen bis {gust:.0f} km/h). Unter großen Bäumen aufpassen, "
+                "und der Hund kann durch aufgewirbelte Dinge schreckhaft sein.")
+    return ""
 
 
 def wx_kind(code, temp, day=True):
@@ -1499,7 +1518,9 @@ def get_weather(lat, lon, wait=0.0):
         qp = st.query_params
         if qp.get("temp") or qp.get("wx"):
             codes = {"sun": 0, "cloud": 3, "rain": 63, "snow": 73}
-            ov = {"temp": float(str(qp.get("temp", 20)).replace(",", ".")), "code": codes.get(str(qp.get("wx", "sun")), 0), "day": True}
+            wd = float(str(qp.get("wind", 10)).replace(",", "."))
+            ov = {"temp": float(str(qp.get("temp", 20)).replace(",", ".")), "code": codes.get(str(qp.get("wx", "sun")), 0), "day": True,
+                  "wind": wd, "gust": wd * 1.4}
     except Exception:
         ov = {}
     if ov:
@@ -1549,8 +1570,10 @@ def dog_weather(start_v):
         lat, lon, _ = _unpack(start_v)
         w = get_weather(lat, lon, wait=3.5)
         st.session_state["_temp"] = None if not w else w["temp"]
+        st.session_state["_windnote"] = wind_note(w)
     except Exception:
         st.session_state["_temp"] = None
+        st.session_state["_windnote"] = ""
 
 
 def _seg_runs(area, path, mask, limit=80):
@@ -1602,7 +1625,7 @@ def dog_info(area, path, temp=None):
     hard_m = float(li[hard].sum())
     info = {"surf": [[SURF_NAMES[k], round(share[k] * 100), SURF_COL[k]] for k in range(3) if share[k] >= 0.01],
             "est": round(est * 100), "forb": round(float(li[forb].sum())), "leash": round(float(li[leash].sum())),
-            "temp": None if temp is None else round(temp), "paw": ""}
+            "temp": None if temp is None else round(temp), "paw": "", "wind": st.session_state.get("_windnote", "") or ""}
     if hot:
         if hard_m / tot >= 0.05:
             info["paw"] = (f"🐾 Pfotenwarnung bei {temp:.0f} °C: {hard_m / tot:.0%} der Strecke ({hard_m:.0f} m) sind Asphalt oder Pflaster "
@@ -2437,6 +2460,7 @@ button{transition:transform .15s,background .25s,box-shadow .25s}button:active{t
 #dogbox .dnote,#dogbox .dok,#dogbox .dbad{font-size:.76rem;margin-top:3px;opacity:.82}
 #dogbox .dok{color:#2E6B3A;opacity:1;font-weight:600}
 #dogbox .dbad{color:#B3261E;opacity:1;font-weight:700}
+#dogbox .dwind{margin-top:6px;padding:8px 10px;border-radius:12px;background:#E3F0F8;border:1px solid #9CC4DC;color:#1E4A66;font-size:.78rem;line-height:1.35;font-weight:600}
 #dogbox .dpaw{margin-top:6px;padding:8px 10px;border-radius:12px;background:#FDE6DD;border:1px solid #E9A58E;color:#8A2A12;font-size:.78rem;line-height:1.35;font-weight:600}
 body.dog{--moss:#B8571A;--sage:#E3A96B;--sand:#F3E2C8;--paper:#FFF8EE;--line:#E8CFAA}
 body.dog #go{background:#C8661E}
@@ -2714,6 +2738,7 @@ function showOption(i, fit) {
                       : '<div class="dok">✅ Keine bekannten Hunde-Verbotszonen auf dieser Route</div>';
     if (dg.leash > 0) dh += '<div class="dnote">🦮 Leinenpflicht auf ' + dg.leash + ' m laut Kartendaten.</div>';
     if (dg.paw) dh += '<div class="dpaw">' + esc(dg.paw) + '</div>';
+    if (dg.wind) dh += '<div class="dwind">' + esc(dg.wind) + '</div>';
     dh += '<div class="dnote">Nicht jedes Verbot steht in den Kartendaten. Schilder, Leinenpflicht und Brut- und Setzzeit gehen vor.</div>';
   }
   $('dogbox').innerHTML = dh;
@@ -3138,7 +3163,7 @@ def _option(nav, label, sub, hint, stats, area=None, path=None):
         except Exception:
             m, runs, names = None, [], []
         info = {"surf": [], "est": 0, "forb": round(m or 0), "leash": 0, "temp": None, "paw": "",
-                "nocheck": m is None}
+                "nocheck": m is None, "wind": st.session_state.get("_windnote", "") or ""}
         t_ = st.session_state.get("_temp")
         if t_ is not None and t_ >= HOT_C:
             info["paw"] = (f"🐾 Pfotenwarnung bei {t_:.0f} °C: Der Belag dieser Route ist nicht bekannt. In der Stadt sind Wege meist "
@@ -3199,7 +3224,7 @@ def make_ab_view(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: 
     payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=parks_geo(area), water=water_geo(area), dogz=dogz_geo(area),
                    options=options, default=default, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
-            "start": start_v, "dest": dest_v, "area": area, "bbox": bbox, "buf": buf, "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp")}
+            "start": start_v, "dest": dest_v, "area": area, "bbox": bbox, "buf": buf, "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp"), "wnote": st.session_state.get("_windnote", "")}
 
 
 def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
@@ -3248,7 +3273,7 @@ def make_loop_view(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
                    options=options, default=0, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "loop", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
             "start": start_v, "end": end_v, "km": km, "km_ok": km, "level": level, "buf": buf,
-            "area": area, "bbox_km": bbox_km, "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp")}
+            "area": area, "bbox_km": bbox_km, "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp"), "wnote": st.session_state.get("_windnote", "")}
 
 
 # ------------------------------------------------------- Auffangnetz ohne Overpass
@@ -3354,7 +3379,7 @@ def osrm_view(start_v, dest_v):
                    options=[opt], default=0, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
             "start": start_v, "dest": dest_v, "area": None, "bbox": None, "buf": 150, "fallback": True,
-            "dog": _dog(), "temp": st.session_state.get("_temp")}
+            "dog": _dog(), "temp": st.session_state.get("_temp"), "wnote": st.session_state.get("_windnote", "")}
 
 
 def make_ab_view_safe(start_v, dest_v, buf=150, area=None, bbox=None, log=lambda *_: None):
@@ -4050,7 +4075,7 @@ def scan_ab_view(start_v, dest_v, buf=150, log=lambda *_: None):
     payload = dict(mode="ab", p1=list(p1), p2=list(p2), t1=t1, t2=t2, parks=sa["geo"], water=sa.get("wgeo"),
                    options=options, default=default, speed=M_PER_MIN, topPad=TOP_PAD, attrib=SCAN_ATTRIB)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
-            "start": start_v, "dest": dest_v, "area": None, "bbox": None, "buf": buf, "fallback": "scan", "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp")}
+            "start": start_v, "dest": dest_v, "area": None, "bbox": None, "buf": buf, "fallback": "scan", "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp"), "wnote": st.session_state.get("_windnote", "")}
 
 
 def scan_loop_view(start_v, end_v, km, level, buf=150, log=lambda *_: None, progress=None):
@@ -4109,7 +4134,7 @@ def scan_loop_view(start_v, end_v, km, level, buf=150, log=lambda *_: None, prog
                    options=options, default=0, speed=M_PER_MIN, topPad=TOP_PAD, attrib=SCAN_ATTRIB)
     return {"mode": "loop", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
             "start": start_v, "end": end_v, "km": km, "km_ok": km, "level": level, "buf": buf,
-            "area": None, "bbox_km": None, "fallback": "scan", "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp")}
+            "area": None, "bbox_km": None, "fallback": "scan", "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp"), "wnote": st.session_state.get("_windnote", "")}
 
 
 def make_loop_view_safe(start_v, end_v, km, level, buf=150, area=None, bbox_km=None,
@@ -4322,7 +4347,7 @@ def make_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
                             water=water_geo(area), dogz=dogz_geo(area))
     return {"mode": "tour", "html": map_html(payload), "p1": pts[0], "p2": pts[-1], "t1": names[0],
             "t2": names[-1], "stops": names[1:-1], "start": start_v, "buf": buf, "stops_v": list(stops_v),
-            "end_v": end_v, "level": level, "extra_km": extra_km, "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp")}
+            "end_v": end_v, "level": level, "extra_km": extra_km, "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp"), "wnote": st.session_state.get("_windnote", "")}
 
 
 def _merge_routes(routes):
@@ -4476,7 +4501,7 @@ def scan_tour_view(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None,
                             attrib=SCAN_ATTRIB, water=sa.get("wgeo"))
     return {"mode": "tour", "html": map_html(payload), "p1": pts[0], "p2": pts[-1], "t1": names[0],
             "t2": names[-1], "stops": names[1:-1], "start": start_v, "buf": buf, "fallback": "scan",
-            "stops_v": list(stops_v), "end_v": end_v, "level": level, "extra_km": extra_km, "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp")}
+            "stops_v": list(stops_v), "end_v": end_v, "level": level, "extra_km": extra_km, "water": _water(), "dog": _dog(), "temp": st.session_state.get("_temp"), "wnote": st.session_state.get("_windnote", "")}
 
 
 def make_tour_view_safe(start_v, stops_v, end_v, level, buf=150, log=lambda *_: None, extra_km=0):
@@ -4499,9 +4524,13 @@ def make_tour_view_safe(start_v, stops_v, end_v, level, buf=150, log=lambda *_: 
 GREEN_RADIUS = 10000
 GREEN_PREFS = ["Wassernähe", "Sanitäroption", "Sportangebote", "Spielplätze aller Art", "Sehenswürdigkeiten"]
 GREEN_PREFS_PREFER = GREEN_PREFS + ["Barrierefreiheit"]
+# Hundemodus: Spielplätze sind für Hunde tabu, dafür gibt es Hundefreilaufflächen
+GREEN_PREFS_DOG = [("Hundefreilaufflächen" if p == "Spielplätze aller Art" else p) for p in GREEN_PREFS]
+GREEN_PREFS_PREFER_DOG = GREEN_PREFS_DOG + ["Barrierefreiheit"]
 GREEN_CAT = {"Wassernähe": "water", "Sanitäroption": "san", "Sportangebote": "sport",
-             "Spielplätze aller Art": "play", "Sehenswürdigkeiten": "sight", "Barrierefreiheit": "access"}
-GREEN_ICON = {"water": "💧", "san": "🚻", "sport": "⚽", "play": "🛝", "sight": "🏛️", "access": "♿"}
+             "Spielplätze aller Art": "play", "Sehenswürdigkeiten": "sight", "Barrierefreiheit": "access",
+             "Hundefreilaufflächen": "dogrun"}
+GREEN_ICON = {"water": "💧", "san": "🚻", "sport": "⚽", "play": "🛝", "sight": "🏛️", "access": "♿", "dogrun": "🐕"}
 GREEN_SIZES = {"Klein (bis 2 ha)": (0.2, 2.0), "Mittel (2–15 ha)": (2.0, 15.0),
                "Groß (15–100 ha)": (15.0, 100.0), "Sehr groß (ab 100 ha)": (100.0, 1e9)}
 SPORT_SPORTS = ("basketball|table_tennis|skateboard|soccer|volleyball|tennis|climbing|bmx|handball|"
@@ -4522,6 +4551,8 @@ GREEN_QUERIES = {
 FEAT_QUERIES = {
     "san": 'nwr["amenity"="toilets"]',
     "play": 'nwr["leisure"="playground"]',
+    "dogrun": ('nwr["leisure"="dog_park"];nwr["dog"="off_leash"];'
+               'nwr["leisure"]["name"~"Hundewiese|Hundeauslauf|Hundefreilauf|Freilauffläche|Hundespielwiese",i]'),
     "sport": 'nwr["leisure"~"^(pitch|fitness_station|sports_centre|skate_park|dog_park|track)$"];nwr["amenity"="boat_rental"]',
     "water": 'wr["natural"="water"];wr["landuse"~"^(reservoir|basin)$"];wr["waterway"~"^(river|canal|riverbank)$"]',
     "access": 'nwr["amenity"="toilets"]["wheelchair"~"^(yes|designated)$"];wr["highway"~"^(footway|path|pedestrian|cycleway)$"]["wheelchair"~"^(yes|designated)$"];nwr["leisure"~"^(park|playground|garden)$"]["wheelchair"~"^(yes|designated)$"]',
@@ -4608,6 +4639,9 @@ def feature_cat(t):
         return None if t.get("access") in ("private", "no", "customers") else "san"
     if t.get("leisure") == "playground":
         return "play"
+    if _dog() and (t.get("leisure") == "dog_park" or t.get("dog") == "off_leash"
+                   or re.search(r"hundewiese|hundeauslauf|hundefreilauf|freilauffläche|hundespielwiese", str(t.get("name", "")), re.I)):
+        return "dogrun"
     if t.get("leisure") in ("pitch", "fitness_station", "sports_centre", "skate_park", "dog_park", "track") \
             or t.get("amenity") == "boat_rental" or (t.get("leisure") and t.get("sport")):
         return "sport"
@@ -4747,7 +4781,7 @@ def green_view(start_v, g, prefer, avoid):
                    options=[opt], default=0, speed=M_PER_MIN, topPad=TOP_PAD)
     return {"mode": "ab", "html": map_html(payload), "p1": p1, "p2": p2, "t1": t1, "t2": t2,
             "start": start_v, "dest": _pack(p2[0], p2[1], t2), "area": None, "bbox": None, "buf": 150,
-            "dog": _dog(), "temp": st.session_state.get("_temp")}
+            "dog": _dog(), "temp": st.session_state.get("_temp"), "wnote": st.session_state.get("_windnote", "")}
 
 
 def _poly_centroid(pts):
@@ -4825,7 +4859,7 @@ def green_inside_point(g, pos):
 
 
 CAT_NAME = {"water": "Wasser", "san": "Toilette", "sport": "Sportangebot", "play": "Spielplatz",
-            "sight": "Sehenswürdigkeit", "access": "Barrierefreiheit"}
+            "sight": "Sehenswürdigkeit", "access": "Barrierefreiheit", "dogrun": "Hundefreilauf"}
 SIZE_WORD = {"Klein (bis 2 ha)": "klein", "Mittel (2–15 ha)": "mittel", "Groß (15–100 ha)": "groß",
              "Sehr groß (ab 100 ha)": "sehr groß"}
 
@@ -5601,6 +5635,13 @@ DOG_SCENE_CSS = """
 #gwload .sc-spring .paw.r{transform-origin:136px 140px;animation:gwd-dig .36s .18s ease-in-out infinite alternate}
 #gwload .sc-summer .head{transform-origin:120px 100px;animation:gwd-look 1.2s ease-in-out infinite}
 #gwload .sc-winter .head{transform-origin:120px 100px;animation:gwd-tilt 2s ease-in-out infinite}
+#gwload .dogscene .wl{stroke-dasharray:26 18;animation:gwd-wind .7s linear infinite}
+#gwload .dogscene.windy .ear.l{animation:gwd-earwl .22s ease-in-out infinite alternate}
+#gwload .dogscene.windy .ear.r{animation:gwd-earwr .22s ease-in-out infinite alternate}
+#gwload .dogscene.windy .tail{animation-duration:.3s}
+@keyframes gwd-wind{to{stroke-dashoffset:-44}}
+@keyframes gwd-earwl{from{transform:rotate(6deg)}to{transform:rotate(-14deg)}}
+@keyframes gwd-earwr{from{transform:rotate(-6deg)}to{transform:rotate(14deg)}}
 @keyframes gwd-wag{from{transform:rotate(-16deg)}to{transform:rotate(18deg)}}
 @keyframes gwd-earl{0%,100%{transform:rotate(0)}50%{transform:rotate(-7deg)}}
 @keyframes gwd-earr{0%,100%{transform:rotate(0)}50%{transform:rotate(7deg)}}
@@ -5742,11 +5783,16 @@ def dog_scene_html(scene="spring", acc=()):
               '<g class="bfly"><g class="wing"><ellipse cx="-5" cy="0" rx="6" ry="4" fill="#F6C945"/></g><g class="wing" style="transform:scaleX(-1)"><ellipse cx="-5" cy="0" rx="6" ry="4" fill="#F6C945"/></g></g>')
         fg = "".join(f'<circle class="dirt" cx="{x}" cy="150" r="{r}" fill="#7A5232" style="--dx:{dx}px;animation-delay:-{d}s"/>'
                      for x, r, dx, d in ((108, 3.2, -26, 0), (116, 2.6, -12, .15), (124, 3, 12, .3), (132, 3.4, 28, .45), (112, 2.2, -40, .55), (128, 2.2, 38, .1)))
-    return (f'<div class="dogscene sc-{scene}"><svg viewBox="0 0 240 172" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'
+    if "wind" in acc:
+        bg += ('<g fill="none" stroke="#9CC4DC" stroke-width="3" stroke-linecap="round" opacity=".75">'
+               '<path class="wl" d="M4 60 q40 -10 80 0 t70 0" style="animation-delay:-.1s"/>'
+               '<path class="wl" d="M20 100 q36 -9 70 0 t60 0" style="animation-delay:-.35s"/>'
+               '<path class="wl" d="M120 40 q30 -8 60 0 t52 0" style="animation-delay:-.5s"/></g>')
+    return (f'<div class="dogscene sc-{scene}{" windy" if "wind" in acc else ""}"><svg viewBox="0 0 240 172" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'
             + bg + dog + fg + '</svg></div>')
 
 
-def dog_scene_for(wx, temp, month):
+def dog_scene_for(wx, temp, month, wind=None):
     """(Szene, Zubehör) aus Wetterlage (sun/rain/snow/cloud/None), Temperatur und Monat."""
     season = ("winter", "winter", "spring", "spring", "spring", "summer", "summer", "summer", "autumn", "autumn", "autumn", "winter")[month - 1]
     scene = season
@@ -5761,6 +5807,8 @@ def dog_scene_for(wx, temp, month):
         acc.append("scarf")
     if temp is not None and temp >= 30:
         acc.append("hot")
+    if wind is not None and wind >= 30:
+        acc.append("wind")
     return scene, acc
 
 
@@ -6202,7 +6250,7 @@ class Overlay:
                 w = None
         temp = w["temp"] if w else None
         wx = wx_kind(w["code"], w["temp"], w["day"]) if w else None
-        scene, acc = dog_scene_for(wx, temp, time.localtime().tm_mon)
+        scene, acc = dog_scene_for(wx, temp, time.localtime().tm_mon, (w or {}).get("wind"))
         return dog_scene_html(scene, acc)
 
     def _photo(self):
@@ -6546,6 +6594,7 @@ def render_map_view():
     st.session_state["_access"] = bool(gw.get("access", False))
     st.session_state["_dog"] = bool(gw.get("dog", False))
     st.session_state["_temp"] = gw.get("temp")
+    st.session_state["_windnote"] = gw.get("wnote", "")
     dest_new = add_new = None
     with st.container(key="gwtop"):
         if gw["mode"] == "ab":
@@ -6755,6 +6804,7 @@ def replan_with_stops(view, cands):
     st.session_state["_access"] = bool(view.get("access"))
     st.session_state["_dog"] = bool(view.get("dog"))
     st.session_state["_temp"] = view.get("temp")
+    st.session_state["_windnote"] = view.get("wnote", "")
     reach = view.get("san_reach")
     lvl = view.get("level") if view.get("level") in TOUR_LEVELS else "Sehr grün"
     if view["mode"] == "ab":
@@ -6788,10 +6838,20 @@ def home_green():
         st.markdown("Ich suche vom Standort aus die Grünfläche im Umkreis von 10 km, die am besten passt, "
                     "und zeige den schnellsten Weg dorthin.")
         start_v = start_input("Startpunkt", "green_sb")
-        prefer = st.multiselect("Bevorzugt", GREEN_PREFS_PREFER, key="green_prefer", placeholder="Auswählen …",
-                                help="Sportangebote: Fußball, Basketball, Tischtennis, Outdoor-Fitness, Skatepark, "
-                                     "Hundepark, Tretboot u. a. (als Suchabfrage im Umkreis).")
-        avoid = st.multiselect("Vermeiden", GREEN_PREFS, key="green_avoid", placeholder="Auswählen …")
+        dogm = bool(st.session_state.get("dog_mode", False))
+        opts_p, opts_a = (GREEN_PREFS_PREFER_DOG, GREEN_PREFS_DOG) if dogm else (GREEN_PREFS_PREFER, GREEN_PREFS)
+        for k_, o_ in (("green_prefer", opts_p), ("green_avoid", opts_a)):  # beim Moduswechsel ungültige Auswahl entfernen
+            try:
+                if st.session_state.get(k_):
+                    st.session_state[k_] = [v for v in st.session_state[k_] if v in o_]
+            except Exception:
+                pass
+        prefer = st.multiselect("Bevorzugt", opts_p, key="green_prefer", placeholder="Auswählen …",
+                                help=("Hundefreilaufflächen: Wiesen und Plätze, auf denen Hunde ohne Leine laufen dürfen (aus den Kartendaten). "
+                                      "Sportangebote: Outdoor-Fitness, Skatepark, Tretboot u. a." if dogm else
+                                      "Sportangebote: Fußball, Basketball, Tischtennis, Outdoor-Fitness, Skatepark, "
+                                      "Hundepark, Tretboot u. a. (als Suchabfrage im Umkreis)."))
+        avoid = st.multiselect("Vermeiden", opts_a, key="green_avoid", placeholder="Auswählen …")
         size = st.select_slider("Bevorzugte Grünflächengröße", options=list(GREEN_SIZES), value="Mittel (2–15 ha)",
                                 key="green_size")
         go = st.button("Los, das Grün finden", type="primary", use_container_width=True, key="go_green")
@@ -7047,6 +7107,8 @@ def dog_home_info():
     if w:
         icon = {"sun": "☀️", "rain": "🌧️", "snow": "❄️", "cloud": "☁️"}[wx_kind(w["code"], w["temp"], w["day"])]
         parts.append(f"{icon} {w['temp']:.0f} °C am Standort")
+        if w.get("wind") is not None:
+            parts.append(f"💨 Wind {w['wind']:.0f} km/h" + (f" (Böen {w['gust']:.0f})" if w.get("gust", 0) >= w["wind"] + 8 else ""))
     parts.append("🚫 Friedhöfe, Spielplätze und Verbotszonen werden gemieden")
     parts.append("🐾 Belag wird angezeigt")
     st.markdown('<div class="dogchip">' + "".join(f"<span>{escape(p)}</span>" for p in parts) + "</div>", unsafe_allow_html=True)
@@ -7055,6 +7117,9 @@ def dog_home_info():
                     "und können die Pfoten verbrennen. Die Routen meiden harten Boden, wo es geht, und markieren ihn rot gepunktet. "
                     "Handrücken-Test: Hältst du ihn keine 5 Sekunden auf den Boden, ist es zu heiß. Besser früh morgens oder abends gehen.</div>",
                     unsafe_allow_html=True)
+    wn = wind_note(w)
+    if wn:
+        st.markdown(f'<div class="dogwarn" style="background:#E3F0F8;border-color:#9CC4DC;color:#1E4A66">{escape(wn)}</div>', unsafe_allow_html=True)
     st.caption("Nicht jedes Verbot steht in den Kartendaten. Schilder vor Ort, Leinenpflicht sowie Brut- und Setzzeit gehen vor.")
 
 
