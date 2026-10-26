@@ -2837,7 +2837,7 @@ body.dog #thxb{background:#C8661E}
 body.dog .chip.on,body.dog .sq.on{background:#FBE3C4;border-color:#E3A96B;box-shadow:0 3px 10px rgba(184,87,26,.25)}
 body.dog #prog>div{background:linear-gradient(90deg,#F0C48A,#B8571A)}
 body.dog #stats div{background:#F8EAD3}
-body.dog #sheet:before{content:"🐾 Hundemodus";display:block;font-size:.68rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#B8571A;margin:-2px 0 4px}
+body.dog #sheet:before{content:"Hundemodus · Chay ist dabei";padding-left:26px;min-height:20px;line-height:20px;background:var(--chay) no-repeat left center/20px;display:block;font-size:.68rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#B8571A;margin:-2px 0 4px}
 #navbox{display:none}
 body.nav #navbox{display:block}body.nav #pre{display:none}
 #rem{font-weight:600;font-size:.98rem}
@@ -2882,7 +2882,7 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':
 const WALK = D.speed || 80, TOP = D.topPad || 0, ky = 110540;
 const GO = D.mode === 'ab' ? '▶ Route starten' : '▶ Ründchen starten';
 document.documentElement.style.setProperty('--top', TOP + 'px');
-if (D.dog) document.body.classList.add('dog');
+if (D.dog) { document.body.classList.add('dog'); if (D.chay) document.documentElement.style.setProperty('--chay', 'url(' + D.chay + ')'); }
 const RC = D.dog ? '#B8571A' : '#3F6B3A', RDONE = D.dog ? '#EBCBA3' : '#B9C9A8', RDOT = D.dog ? '#B8571A' : '#4E6E45';
 
 // Übergang: Wolkendecke, die aufbricht und zur Seite zieht, dahinter zoomt die Karte heran
@@ -2963,7 +2963,11 @@ if (D.dogz) {
 }
 const pin = e => L.divIcon({html: '<div style="font-size:30px;line-height:30px;filter:drop-shadow(0 2px 3px rgba(0,0,0,.45))">' + e + '</div>',
   className: '', iconSize: [32, 32], iconAnchor: [16, 28]});
+const chayIcon = () => L.divIcon({html: '<img src="' + D.chay + '" width="34" height="34" style="display:block;filter:drop-shadow(0 2px 3px rgba(0,0,0,.4))" alt="">',
+  className: '', iconSize: [34, 34], iconAnchor: [-4, 32]});  // etwas rechts neben dem Standort: Chay läuft mit
+const chayMk = D.dog && D.chay ? L.marker(D.p1, {icon: chayIcon(), interactive: false, keyboard: false, zIndexOffset: 700}) : null;
 const startPin = L.marker(D.p1, {icon: pin('🚶')}).addTo(map);  // nur vor dem Start sichtbar (in der Navigation wäre er doppelt zum Standortpunkt)
+if (chayMk) chayMk.addTo(map);
 if (D.p1[0] !== D.p2[0] || D.p1[1] !== D.p2[1]) L.marker(D.p2, {icon: pin('🏁')}).addTo(map);
 (D.stops || []).forEach(s => L.marker([s[0], s[1]], {icon: pin('📍')}).addTo(map).bindTooltip(s[2], {direction: 'top'}));
 const userDot = L.circleMarker([0, 0], {radius: 9, color: '#fff', weight: 3, fillColor: '#2F6F8F', fillOpacity: 1});
@@ -3200,6 +3204,7 @@ function showThanks() {
   if (i === last) i = (i + 1) % list.length;
   try { localStorage.setItem(lk, String(i)); } catch (e) {}
   $('thx').textContent = list[i];
+  if (D.dog && D.chay && !$('thxc')) { const im = document.createElement('img'); im.id = 'thxc'; im.src = D.chay; im.width = 64; im.height = 64; im.alt = D.chayName || ''; im.style.cssText = 'display:block;margin:-46px auto 8px;filter:drop-shadow(0 3px 5px rgba(0,0,0,.3))'; $('thanks').insertBefore(im, $('thx')); }
   $('thxb').textContent = D.dog ? 'Bis zum nächsten Gassi 🐾' : 'Bis zum nächsten Spaziergang 🌿';
   $('thanks').classList.add('on');
 }
@@ -3226,6 +3231,7 @@ function onFix(lat, lon, acc, gpsHeading, speed) {
   if (s.off > 60) { const g = snap(xy, 0, false); if (g.off < s.off * 0.6) s = g; }
   lastIdx = s.i; along = s.along;
   userDot.setLatLng(lastPos); if (!map.hasLayer(userDot)) userDot.addTo(map);
+  if (chayMk) { chayMk.setLatLng(lastPos); if (!map.hasLayer(chayMk)) chayMk.addTo(map); }  // Chay läuft mit
   // Richtung: GPS-Kurs (nur in Bewegung), sonst aus den letzten Positionen, sonst Kompass (onOrient)
   let h = null;
   if (typeof gpsHeading === 'number' && !isNaN(gpsHeading) && (speed || 0) > 0.7) h = gpsHeading;
@@ -3278,6 +3284,7 @@ function enterNav() {
   navOn = true; finished = false; said = {}; hadFix = false; lastIdx = 0; along = 0; offCount = 0;
   document.body.classList.add('nav'); $('go').textContent = '⏹ Beenden';
   if (map.hasLayer(startPin)) map.removeLayer(startPin);
+  if (chayMk && map.hasLayer(chayMk)) map.removeLayer(chayMk);
   try { if (navigator.wakeLock) navigator.wakeLock.request('screen').then(l => { wake = l; }).catch(() => {}); } catch (e) {}
   say('Navigation gestartet.');
   banner('', '📡', '…', 'Standort wird gesucht');
@@ -3287,6 +3294,7 @@ function exitNav() {
   document.body.classList.remove('fin', 'thx'); doneFlag(false);
   document.body.classList.remove('nav'); $('go').textContent = GO;
   if (!map.hasLayer(startPin)) startPin.addTo(map);
+  if (chayMk) { chayMk.setLatLng(D.p1); if (!map.hasLayer(chayMk)) chayMk.addTo(map); }
   [userDot, userAcc, userCone].forEach(l => { if (map.hasLayer(l)) map.removeLayer(l); });
   if (done) done.setLatLngs([]);
   showOption(cur, true);
@@ -3474,6 +3482,8 @@ def dogz_geo(area):
 def map_html(payload):
     if _dog():
         payload["dog"] = True
+        payload["chay"] = chay_icon_uri(72)
+        payload["chayName"] = DOG_NAME
         if payload.get("dogz") is None:
             payload.pop("dogz", None)
     data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
@@ -6165,6 +6175,7 @@ DOG_CSS = """
  background-image:url("data:image/svg+xml,__PAW__")!important}
 .stApp .hero{background:linear-gradient(135deg,#B8571A,#E58F3E)!important;box-shadow:0 6px 18px rgba(140,70,20,.35)}
 .stApp .hero .ico{font-size:40px}
+.stApp .hero .ico img{display:block;width:52px;height:52px;margin:-3px 0 -3px -3px}
 .stApp [data-testid="stToggle"] input:checked+div,.stApp [data-testid="stToggle"] [aria-checked="true"]{background-color:#D2782A!important}
 .stApp .stButton>button[kind="primary"]{background:#D2782A!important;border-color:#D2782A!important}
 .stApp .stButton>button[kind="primary"]:hover{background:#B8571A!important;border-color:#B8571A!important;box-shadow:0 6px 18px rgba(184,87,26,.4)}
@@ -6267,15 +6278,96 @@ html,body,.stApp,.stApp input,.stApp textarea,.stApp button,.stApp label,.stApp 
 """
 
 
+# ---- Chay: Black Tri Australian Shepherd (schwarz, weißer Blesse/Brust/Pfoten, kupferfarbene Abzeichen)
+DOG_NAME = "Chay"
+CH_BLACK, CH_WHITE, CH_TAN, CH_EYE = "#202026", "#F8F5EE", "#B5651D", "#C98A2B"
+
+
+def _sp(d, dx, dy):
+    """Absolute Koordinaten eines Pfads (M/L/Q/C) verschieben; relative Befehle bleiben."""
+    out, cmd, nums = [], None, []
+    for tok in re.findall(r"[MLQCZmlqczvVhH]|-?\d+\.?\d*", d):
+        if tok.isalpha():
+            cmd = tok
+            out.append(tok)
+        elif cmd in ("M", "L", "Q", "C"):
+            nums.append(float(tok))
+            if len(nums) == 2:
+                out.append(f"{nums[0] + dx:g} {nums[1] + dy:g}")
+                nums = []
+        else:
+            out.append(tok)
+    return " ".join(out)
+
+
+def chay_head(dx=0.0, dy=0.0, anim=False, glasses=""):
+    """Chays Kopf (Vorderansicht) mit Mittelpunkt (50+dx, 52+dy), nach Fotos von Chayton: schwarzes, struppiges Fell,
+    kleine, vorn geknickte Ohren, schmale weiße Blesse, kupferfarbene Wangen und Brauen, offenes Maul.
+    anim: Klassen für die Ladeanimation (Ohren, Augen, Zunge)."""
+    def E(cx, cy, rx, ry, fill, rot=0, cls="", extra=""):
+        t = f' transform="rotate({rot} {cx + dx:g} {cy + dy:g})"' if rot else ""
+        c = f' class="{cls}"' if cls else ""
+        return f'<ellipse{c} cx="{cx + dx:g}" cy="{cy + dy:g}" rx="{rx:g}" ry="{ry:g}" fill="{fill}"{extra}{t}/>'
+
+    def Pa(d, fill="none", cls="", stroke=""):
+        c = f' class="{cls}"' if cls else ""
+        return f'<path{c} d="{_sp(d, dx, dy)}" fill="{fill}"{stroke}/>'
+    dark_line = ' stroke="#15151A" stroke-width="1.5" stroke-linecap="round"'
+    ear_l = Pa("M31 24 Q14 18 7 38 Q9 46 20 44 Q31 42 38 32 Z", CH_BLACK, "ear l" if anim else "")
+    ear_r = Pa("M69 24 Q86 18 93 38 Q91 46 80 44 Q69 42 62 32 Z", CH_BLACK, "ear r" if anim else "")
+    px_, py_ = 37.5 + dx, 47 + dy
+    eyes = ('<g class="eye">' if anim else "<g>") + (
+        f'<circle cx="{px_:g}" cy="{py_:g}" r="4.8" fill="{CH_EYE}"/><circle cx="{62.5 + dx:g}" cy="{py_:g}" r="4.8" fill="{CH_EYE}"/>'
+        f'<circle cx="{px_:g}" cy="{py_:g}" r="2.6" fill="#15110D"/><circle cx="{62.5 + dx:g}" cy="{py_:g}" r="2.6" fill="#15110D"/>'
+        f'<circle cx="{px_ + 1.2:g}" cy="{py_ - 1.4:g}" r="1.1" fill="#fff"/><circle cx="{63.7 + dx:g}" cy="{py_ - 1.4:g}" r="1.1" fill="#fff"/></g>')
+    tongue = Pa("M43.5 72 Q50 90 56.5 72 Z", "#F08A9A", "tongue" if anim else "")
+    tufts = E(37, 25, 7, 6, CH_BLACK) + E(50, 22, 7, 6, CH_BLACK) + E(63, 25, 7, 6, CH_BLACK) + E(27, 36, 6, 8, CH_BLACK) + E(73, 36, 6, 8, CH_BLACK)
+    return (ear_l + ear_r
+            + E(50, 51, 29, 28, CH_BLACK) + tufts
+            + E(25, 60, 8, 12, CH_BLACK, 12) + E(75, 60, 8, 12, CH_BLACK, -12)
+            + Pa("M46.5 24 Q50 21 53.5 24 L55 48 Q56 58 59 68 L41 68 Q44 58 45 48 Z", CH_WHITE)
+            + E(50, 67, 15, 12.5, CH_WHITE)
+            + E(31, 62, 8, 10.5, CH_TAN, 12) + E(69, 62, 8, 10.5, CH_TAN, -12)
+            + E(38.5, 67, 8, 9, CH_WHITE) + E(61.5, 67, 8, 9, CH_WHITE) + E(50, 72, 8, 6, CH_WHITE)
+            + E(36, 37.5, 4.2, 3, CH_TAN, -14) + E(64, 37.5, 4.2, 3, CH_TAN, 14)
+            + eyes + glasses
+            + Pa("M40 71 Q50 69 60 71 Q58 82 50 83 Q42 82 40 71 Z", "#3A1A20")
+            + tongue
+            + Pa("M43 61.5 Q50 58 57 61.5 Q56 68 50 69 Q44 68 43 61.5 Z", "#15151A")
+            + E(48, 61, 2.6, 1.0, "#fff", 0, "", ' fill-opacity=".45"'))
+
+
+def _chay_chest():
+    """Schultern, kupferfarbene Krause und helle Brust (für das Symbol, unter dem Kopf)."""
+    return (f'<ellipse cx="50" cy="108" rx="40" ry="21" fill="{CH_BLACK}"/>'
+            f'<ellipse cx="50" cy="91" rx="23" ry="12" fill="{CH_TAN}"/>'
+            f'<ellipse cx="50" cy="102" rx="14" ry="15" fill="{CH_WHITE}"/>')
+
+
+def chay_icon_svg(px=46, bg=True):
+    """Kleines Chay-Symbol (Kopf, Brust). bg: heller Kreis dahinter."""
+    if bg:
+        body = ('<clipPath id="chc"><circle cx="50" cy="52" r="49"/></clipPath><g clip-path="url(#chc)">'
+                '<circle cx="50" cy="52" r="49" fill="#FFF4E2"/><g transform="translate(7 6) scale(.86)">'
+                + _chay_chest() + chay_head() + "</g></g>")
+    else:
+        body = _chay_chest() + chay_head()
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 104" width="{px}" height="{px}" role="img" aria-label="{DOG_NAME}">{body}</svg>')
+
+
+def chay_icon_uri(px=46, bg=True):
+    return "data:image/svg+xml;base64," + base64.b64encode(chay_icon_svg(px, bg).encode()).decode()
+
+
 # ---- Ladehund (Hundemodus): kleiner animierter Hund je Jahreszeit und Wetter
 DOG_SCENE_CSS = """
 #gwload .dogscene{position:relative;width:min(70vw,260px);filter:drop-shadow(0 8px 14px rgba(90,50,20,.18))}
 #gwload .dogscene svg{display:block;width:100%;height:auto;overflow:visible}
 #gwload .dogscene .tail{transform-origin:150px 126px;animation:gwd-wag .45s ease-in-out infinite alternate}
-#gwload .dogscene .ear.l{transform-origin:94px 66px;animation:gwd-earl 1.6s ease-in-out infinite}
-#gwload .dogscene .ear.r{transform-origin:146px 66px;animation:gwd-earr 1.6s ease-in-out infinite}
-#gwload .dogscene .eye{transform-origin:120px 76px;animation:gwd-blink 3.4s infinite}
-#gwload .dogscene .tongue{transform-origin:120px 98px;animation:gwd-tongue .7s ease-in-out infinite alternate}
+#gwload .dogscene .ear.l{transform-box:fill-box;transform-origin:85% 10%;animation:gwd-earl 1.6s ease-in-out infinite}
+#gwload .dogscene .ear.r{transform-box:fill-box;transform-origin:15% 10%;animation:gwd-earr 1.6s ease-in-out infinite}
+#gwload .dogscene .eye{transform-origin:120px 78px;animation:gwd-blink 3.4s infinite}
+#gwload .dogscene .tongue{transform-origin:120px 102px;animation:gwd-tongue .7s ease-in-out infinite alternate}
 #gwload .dogscene .sweat{animation:gwd-sweat 1.6s ease-in infinite}
 #gwload .dogscene .fl{animation:gwd-fall 3.6s linear infinite}
 #gwload .dogscene .lf{animation:gwd-leaf 4.2s ease-in-out infinite}
@@ -6352,25 +6444,15 @@ def _dog_body(acc):
     return (
         '<g class="dog">'
         '<ellipse class="shadow" cx="120" cy="153" rx="42" ry="6" fill="#000" fill-opacity=".13"/>'
-        '<path class="tail" d="M150 128 Q178 116 172 88" stroke="#B97D45" stroke-width="11" fill="none" stroke-linecap="round"/>'
-        '<ellipse cx="120" cy="126" rx="35" ry="28" fill="#D9A066"/><ellipse cx="120" cy="132" rx="18" ry="19" fill="#F3DDB8"/>'
+        f'<path class="tail" d="M150 128 Q178 116 172 88" stroke="{CH_BLACK}" stroke-width="12" fill="none" stroke-linecap="round"/>'
+        f'<ellipse cx="120" cy="126" rx="35" ry="28" fill="{CH_BLACK}"/><ellipse cx="120" cy="114" rx="24" ry="11" fill="{CH_TAN}"/>'
+        f'<ellipse cx="120" cy="132" rx="16" ry="19" fill="{CH_WHITE}"/>'
+        f'<ellipse cx="95" cy="134" rx="6" ry="9" fill="{CH_TAN}" fill-opacity=".8"/><ellipse cx="145" cy="134" rx="6" ry="9" fill="{CH_TAN}" fill-opacity=".8"/>'
         + coat + scarf +
-        '<ellipse cx="97" cy="151" rx="12" ry="6.5" fill="#F3DDB8"/><ellipse cx="143" cy="151" rx="12" ry="6.5" fill="#F3DDB8"/>'
-        '<ellipse class="paw l" cx="104" cy="148" rx="11" ry="7.5" fill="#F7E6C8" stroke="#D9A066" stroke-width="1.5"/>'
-        '<ellipse class="paw r" cx="136" cy="148" rx="11" ry="7.5" fill="#F7E6C8" stroke="#D9A066" stroke-width="1.5"/>'
-        '<g class="head">'
-        '<ellipse class="ear l" cx="92" cy="80" rx="11" ry="23" fill="#8A5A33" transform="rotate(14 92 80)"/>'
-        '<ellipse class="ear r" cx="148" cy="80" rx="11" ry="23" fill="#8A5A33" transform="rotate(-14 148 80)"/>'
-        '<circle cx="120" cy="82" r="30" fill="#D9A066"/><circle cx="106" cy="76" r="10" fill="#B97D45"/>'
-        '<ellipse cx="120" cy="94" rx="16" ry="12" fill="#F3DDB8"/>'
-        '<g class="eye"><circle cx="107" cy="76" r="4.8" fill="#2B2018"/><circle cx="133" cy="76" r="4.8" fill="#2B2018"/>'
-        '<circle cx="108.7" cy="74.3" r="1.6" fill="#fff"/><circle cx="134.7" cy="74.3" r="1.6" fill="#fff"/></g>'
-        '<path d="M99 66 q7 -5 14 -1 M127 65 q7 -4 14 1" stroke="#7A4A25" stroke-width="2" fill="none" stroke-linecap="round"/>'
-        + glasses +
-        '<ellipse cx="120" cy="88.5" rx="6.8" ry="4.8" fill="#3A2A22"/><ellipse cx="118" cy="87" rx="2" ry="1.2" fill="#fff" fill-opacity=".6"/>'
-        '<path d="M120 93 v4 M120 97 q-6 5 -11 .5 M120 97 q6 5 11 .5" stroke="#3A2A22" stroke-width="1.8" fill="none" stroke-linecap="round"/>'
-        '<path class="tongue" d="M115 99 q5 14 10 0z" fill="#F08A9A"/>'
-        + hood + sweat +
+        f'<ellipse cx="97" cy="151" rx="12" ry="6.5" fill="{CH_WHITE}"/><ellipse cx="143" cy="151" rx="12" ry="6.5" fill="{CH_WHITE}"/>'
+        f'<ellipse class="paw l" cx="104" cy="148" rx="11" ry="7.5" fill="{CH_WHITE}" stroke="#D8D2C6" stroke-width="1.5"/>'
+        f'<ellipse class="paw r" cx="136" cy="148" rx="11" ry="7.5" fill="{CH_WHITE}" stroke="#D8D2C6" stroke-width="1.5"/>'
+        '<g class="head">' + chay_head(70, 30, True, glasses) + hood + sweat +
         '</g></g>')
 
 
@@ -7883,7 +7965,8 @@ def dog_home_info():
             parts.append(f"💨 Wind {w['wind']:.0f} km/h" + (f" (Böen {w['gust']:.0f})" if w.get("gust", 0) >= w["wind"] + 8 else ""))
     parts.append("🚫 Friedhöfe, Spielplätze und Verbotszonen werden gemieden")
     parts.append("🐾 Belag wird angezeigt")
-    st.markdown('<div class="dogchip">' + "".join(f"<span>{escape(p)}</span>" for p in parts) + "</div>", unsafe_allow_html=True)
+    st.markdown('<div class="dogchip"><span><img src="' + chay_icon_uri(22) + '" width="22" height="22" alt="" style="vertical-align:-6px;margin-right:6px">'
+                f'{DOG_NAME} ist dabei</span>' + "".join(f"<span>{escape(p)}</span>" for p in parts) + "</div>", unsafe_allow_html=True)
     if w and w["temp"] >= HOT_C:
         st.markdown(f'<div class="dogwarn">🐾 Pfotenwarnung: Bei {w["temp"]:.0f} °C heizen Asphalt und Pflaster stark auf '
                     "und können die Pfoten verbrennen. Die Routen meiden harten Boden, wo es geht, und markieren ihn rot gepunktet. "
@@ -7917,8 +8000,9 @@ def render_home():
     st.markdown(DOG_BASE_CSS + (DOG_CSS if dog else ""), unsafe_allow_html=True)
     logo = base64.b64encode(LOGO_SVG.encode()).decode()
     if dog:
-        st.markdown('<div class="hero"><div class="ico">🐕</div><div><h1>GreenWalker · Hundemodus</h1>'
-                    '<p>Gassi-Runden im Grünen, ohne Verbotszonen und mit Pfotenschutz.</p></div></div>',
+        st.markdown('<div class="hero"><div class="ico"><img src="' + chay_icon_uri(52) + '" width="52" height="52" alt="' + DOG_NAME + '"></div>'
+                    '<div><h1>GreenWalker · Hundemodus</h1>'
+                    f'<p>Gassi-Runden im Grünen mit {DOG_NAME}: ohne Verbotszonen und mit Pfotenschutz.</p></div></div>',
                     unsafe_allow_html=True)
     else:
         st.markdown('<div class="hero"><div class="ico"><img src="data:image/svg+xml;base64,' + logo +
